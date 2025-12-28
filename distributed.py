@@ -36,6 +36,7 @@ from .utils.image import tensor_to_pil, pil_to_tensor, ensure_contiguous
 from .utils.process import is_process_alive, terminate_process, get_python_executable
 from .utils.network import handle_api_error, get_server_port, get_server_loop, get_client_session, cleanup_client_session
 from .utils.async_helpers import run_async_in_server_loop
+from .utils.cloudflare import cloudflare_tunnel_manager
 from .utils.constants import (
     WORKER_JOB_TIMEOUT, PROCESS_TERMINATION_TIMEOUT, WORKER_CHECK_INTERVAL, 
     STATUS_CHECK_INTERVAL, CHUNK_SIZE, LOG_TAIL_BYTES, WORKER_LOG_PATTERN, 
@@ -268,6 +269,49 @@ async def get_network_info_endpoint(request):
             "all_ips": [],
             "recommended_ip": None
         })
+
+@server.PromptServer.instance.routes.get("/distributed/tunnel/status")
+async def tunnel_status_endpoint(request):
+    """Return Cloudflare tunnel status and last known details."""
+    try:
+        status = cloudflare_tunnel_manager.get_status()
+        config = load_config()
+        master_host = (config.get("master") or {}).get("host")
+        return web.json_response({
+            "status": "success",
+            "tunnel": status,
+            "master_host": master_host
+        })
+    except Exception as e:
+        return await handle_api_error(request, e, 500)
+
+@server.PromptServer.instance.routes.post("/distributed/tunnel/start")
+async def tunnel_start_endpoint(request):
+    """Start a Cloudflare tunnel pointing at the current ComfyUI server."""
+    try:
+        result = await cloudflare_tunnel_manager.start_tunnel()
+        config = load_config()
+        return web.json_response({
+            "status": "success",
+            "tunnel": result,
+            "master_host": (config.get("master") or {}).get("host")
+        })
+    except Exception as e:
+        return await handle_api_error(request, e, 500)
+
+@server.PromptServer.instance.routes.post("/distributed/tunnel/stop")
+async def tunnel_stop_endpoint(request):
+    """Stop the managed Cloudflare tunnel if running."""
+    try:
+        result = await cloudflare_tunnel_manager.stop_tunnel()
+        config = load_config()
+        return web.json_response({
+            "status": "success",
+            "tunnel": result,
+            "master_host": (config.get("master") or {}).get("host")
+        })
+    except Exception as e:
+        return await handle_api_error(request, e, 500)
 
 @server.PromptServer.instance.routes.get("/distributed/system_info")
 async def get_system_info_endpoint(request):
@@ -1445,6 +1489,10 @@ async def async_cleanup_and_exit(signum=None):
         else:
             print("\n[Distributed] Master shutting down, workers will continue running")
             worker_manager.save_processes()
+        try:
+            await cloudflare_tunnel_manager.stop_tunnel()
+        except Exception as tunnel_error:
+            debug_log(f"Error stopping Cloudflare tunnel during shutdown: {tunnel_error}")
     except Exception as e:
         print(f"[Distributed] Error during cleanup: {e}")
     
@@ -1503,6 +1551,17 @@ def sync_cleanup():
         else:
             print("\n[Distributed] Master shutting down, workers will continue running")
             worker_manager.save_processes()
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(cloudflare_tunnel_manager.stop_tunnel())
+            else:
+                loop.run_until_complete(cloudflare_tunnel_manager.stop_tunnel())
+        except RuntimeError:
+            # No running loop; create a temporary one
+            asyncio.run(cloudflare_tunnel_manager.stop_tunnel())
+        except Exception as tunnel_error:
+            debug_log(f"Error stopping Cloudflare tunnel during sync cleanup: {tunnel_error}")
     except Exception as e:
         print(f"[Distributed] Error during cleanup: {e}")
 
@@ -1525,6 +1584,10 @@ if not os.environ.get('COMFYUI_MASTER_PID'):
                     worker_manager.cleanup_all()
                 else:
                     worker_manager.save_processes()
+                try:
+                    asyncio.run(cloudflare_tunnel_manager.stop_tunnel())
+                except Exception as tunnel_error:
+                    print(f"[Distributed] Error stopping Cloudflare tunnel: {tunnel_error}")
             except Exception as cleanup_error:
                 print(f"[Distributed] Error during cleanup: {cleanup_error}")
             sys.exit(0)

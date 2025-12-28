@@ -17,6 +17,8 @@ class DistributedExtension {
         this.logAutoRefreshInterval = null;
         this.masterSettingsExpanded = false;
         this.app = app; // Store app reference for toast notifications
+        this.tunnelStatus = { status: "unknown" };
+        this.tunnelElements = {};
         
         // Initialize centralized state
         this.state = createStateManager();
@@ -143,6 +145,144 @@ class DistributedExtension {
         } catch (error) {
             this.log("Failed to load config: " + error.message, "error");
             this.config = { workers: [], settings: { has_auto_populated_workers: false } };
+        }
+    }
+
+    _applyMasterHost(host) {
+        if (!host || !this.config) return;
+        if (!this.config.master) this.config.master = {};
+        this.config.master.host = host;
+        const hostInput = document.getElementById('master-host');
+        if (hostInput) {
+            hostInput.value = host;
+        }
+    }
+
+    updateTunnelUIElements() {
+        const elements = this.tunnelElements || {};
+        const status = (this.tunnelStatus?.status || "stopped").toLowerCase();
+        const enableColor = "#665533"; // requested yellow/brown tone
+        const disableColor = "#7c4a4a"; // match worker delete button
+        const colors = {
+            running: disableColor,
+            starting: enableColor,
+            stopped: enableColor,
+            error: disableColor,
+            unknown: enableColor,
+            stopping: disableColor
+        };
+
+        if (elements.button) {
+            elements.button.disabled = status === "starting" || status === "stopping";
+            if (status === "starting") {
+                elements.button.innerHTML = `<span class="tunnel-spinner"></span> Starting...`;
+                elements.button.style.backgroundColor = enableColor;
+            } else if (status === "running") {
+                elements.button.textContent = "Disable Cloudflare Tunnel";
+                elements.button.style.backgroundColor = disableColor;
+            } else if (status === "error") {
+                elements.button.textContent = "Retry Cloudflare Tunnel";
+                elements.button.style.backgroundColor = disableColor;
+            } else {
+                elements.button.textContent = "Enable Cloudflare Tunnel";
+                elements.button.style.backgroundColor = enableColor;
+            }
+        }
+
+        if (elements.status) {
+            elements.status.textContent = status.toUpperCase();
+            elements.status.style.backgroundColor = colors[status] || colors.stopped;
+        }
+
+        if (elements.url) {
+            const url = this.tunnelStatus?.public_url;
+            if (url) {
+                elements.url.innerHTML = `<a href="${url}" target="_blank" style="color: #eee; text-decoration: none;">${url}</a>`;
+            } else {
+                elements.url.textContent = status === "starting" ? "Requesting public URL..." : "No tunnel active";
+            }
+        }
+
+        if (elements.copyBtn) {
+            const hasUrl = Boolean(this.tunnelStatus?.public_url);
+            elements.copyBtn.disabled = !hasUrl;
+            elements.copyBtn.style.opacity = hasUrl ? "1" : "0.5";
+        }
+    }
+
+    async refreshTunnelStatus() {
+        try {
+            const data = await this.api.getTunnelStatus();
+            this.tunnelStatus = data.tunnel || { status: "stopped" };
+            if (data.master_host !== undefined) {
+                this._applyMasterHost(data.master_host);
+            }
+            return this.tunnelStatus;
+        } catch (error) {
+            this.tunnelStatus = { status: "error", last_error: error.message };
+            this.log("Failed to fetch tunnel status: " + error.message, "error");
+            return this.tunnelStatus;
+        } finally {
+            this.updateTunnelUIElements();
+        }
+    }
+
+    async handleTunnelToggle(button) {
+        const currentStatus = (this.tunnelStatus?.status || "stopped").toLowerCase();
+        if (currentStatus === "starting" || currentStatus === "stopping") {
+            return;
+        }
+
+        const setStatus = (status) => {
+            this.tunnelStatus = { ...(this.tunnelStatus || {}), status };
+            this.updateTunnelUIElements();
+        };
+
+        if (currentStatus === "running") {
+            setStatus("stopping");
+            try {
+                if (button) {
+                    button.innerHTML = `<span class="tunnel-spinner"></span> Stopping...`;
+                    button.disabled = true;
+                }
+                const data = await this.api.stopTunnel();
+                this.tunnelStatus = data.tunnel || { status: "stopped" };
+                if (data.master_host !== undefined) {
+                    this._applyMasterHost(data.master_host);
+                }
+                this.updateTunnelUIElements();
+                this.ui.showToast(this.app, "info", "Cloudflare Tunnel Disabled", "Master address restored", 4000);
+            } catch (error) {
+                this.tunnelStatus = { status: "error", last_error: error.message };
+                this.updateTunnelUIElements();
+                this.ui.showToast(this.app, "error", "Failed to stop tunnel", error.message, 5000);
+            } finally {
+                if (button) button.disabled = false;
+            }
+            return;
+        }
+
+        // Start tunnel
+        setStatus("starting");
+        if (button) {
+            button.innerHTML = `<span class="tunnel-spinner"></span> Starting...`;
+            button.disabled = true;
+        }
+        try {
+            const data = await this.api.startTunnel();
+            this.tunnelStatus = data.tunnel || { status: "running" };
+            if (data.master_host !== undefined) {
+                this._applyMasterHost(data.master_host);
+            }
+            this.updateTunnelUIElements();
+            const url = data.tunnel?.public_url || data.master_host;
+            this.ui.showToast(this.app, "success", "Cloudflare Tunnel Ready", url || "Public URL created", 4500);
+        } catch (error) {
+            this.tunnelStatus = { status: "error", last_error: error.message };
+            this.updateTunnelUIElements();
+            this.ui.showToast(this.app, "error", "Failed to start tunnel", error.message, 5000);
+        } finally {
+            if (button) button.disabled = false;
         }
     }
 

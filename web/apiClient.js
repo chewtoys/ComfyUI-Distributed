@@ -141,6 +141,25 @@ export function createApiClient(baseUrl) {
             return Promise.allSettled(
                 urls.map(url => this.checkStatus(url))
             );
+        },
+
+        // Cloudflare tunnel management
+        async startTunnel() {
+            return request('/distributed/tunnel/start', {
+                method: 'POST',
+                body: JSON.stringify({})
+            });
+        },
+
+        async stopTunnel() {
+            return request('/distributed/tunnel/stop', {
+                method: 'POST',
+                body: JSON.stringify({})
+            });
+        },
+
+        async getTunnelStatus() {
+            return request('/distributed/tunnel/status');
         }
     };
 }

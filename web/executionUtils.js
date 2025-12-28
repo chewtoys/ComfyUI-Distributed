@@ -96,13 +96,14 @@ export async function executeParallelDistributed(extension, promptWrapper) {
         extension.log(`Pre-flight check: ${activeWorkers.length} of ${enabledWorkers.length} workers are active`, "debug");
         
         // Check if master host might be unreachable by workers (cloudflare tunnel down)
-        const masterHost = extension.config?.master?.host || '';
-        const isCloudflareHost = /\.(trycloudflare\.com|cloudflare\.dev)$/i.test(masterHost);
-        
+        const masterUrl = extension.getMasterUrl();
+        const masterHostForCheck = masterUrl.replace(/^https?:\/\//i, "").split("/")[0];
+        const isCloudflareHost = /\.(trycloudflare\.com|cloudflare\.dev)$/i.test(masterHostForCheck);
+
         if (isCloudflareHost && activeWorkers.length > 0) {
             // Try to verify if the cloudflare tunnel is actually up
             try {
-                const testUrl = `${window.location.protocol}//${masterHost}/prompt`;
+                const testUrl = masterUrl.endsWith("/prompt") ? masterUrl : `${masterUrl.replace(/\/$/, '')}/prompt`;
                 const response = await fetch(testUrl, {
                     method: 'GET',
                     mode: 'cors',
@@ -115,10 +116,10 @@ export async function executeParallelDistributed(extension, promptWrapper) {
                 }
             } catch (error) {
                 // Cloudflare tunnel appears to be down
-                extension.log(`Master host ${masterHost} is not reachable - cloudflare tunnel may be down`, "error");
+                extension.log(`Master host ${masterUrl} is not reachable - cloudflare tunnel may be down`, "error");
                 
                 if (extension.ui?.showCloudflareWarning) {
-                    extension.ui.showCloudflareWarning(extension, masterHost);
+                    extension.ui.showCloudflareWarning(extension, masterUrl);
                 }
                 
                 // Stop execution - workers won't be able to send results back

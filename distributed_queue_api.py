@@ -229,6 +229,8 @@ def _resolve_master_url():
             ".ngrok-free.app",
             ".ngrok-free.dev",
             ".ngrok.io",
+            ".trycloudflare.com",
+            ".cloudflare.dev",
         )
         return any(hostname.endswith(suffix) for suffix in https_domains)
 

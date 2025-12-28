@@ -20,6 +20,13 @@ def get_default_config():
             "auto_launch_workers": False,
             "stop_workers_on_master_exit": True,
             "master_delegate_only": False
+        },
+        "tunnel": {
+            "status": "stopped",
+            "public_url": "",
+            "pid": None,
+            "log_file": "",
+            "previous_master_host": ""
         }
     }
 
@@ -28,7 +35,12 @@ def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r') as f:
-                return json.load(f)
+                data = json.load(f)
+                defaults = get_default_config()
+                for key, value in defaults.items():
+                    if key not in data:
+                        data[key] = value
+                return data
         except Exception as e:
             log(f"Error loading config, using defaults: {e}")
     return get_default_config()
