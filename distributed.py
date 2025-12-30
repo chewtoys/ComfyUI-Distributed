@@ -4,6 +4,7 @@ from PIL import Image
 import folder_paths
 import os
 import json
+import re
 import asyncio
 import aiohttp
 from aiohttp import web
@@ -59,6 +60,17 @@ def cleanup():
     loop.close()
 
 atexit.register(cleanup)
+
+def normalize_host(value):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return value
+    host = value.strip()
+    if not host:
+        return host
+    host = re.sub(r"^https?://", "", host, flags=re.IGNORECASE)
+    return host.split("/")[0]
 
 # --- API Endpoints ---
 @server.PromptServer.instance.routes.get("/distributed/config")
@@ -367,7 +379,7 @@ async def update_worker_endpoint(request):
                     if data["host"] is None:
                         worker.pop("host", None)
                     else:
-                        worker["host"] = data["host"]
+                        worker["host"] = normalize_host(data["host"])
                         
                 # Handle cuda_device field - remove it if None
                 if "cuda_device" in data:
@@ -396,7 +408,7 @@ async def update_worker_endpoint(request):
                 new_worker = {
                     "id": worker_id,
                     "name": data["name"],
-                    "host": data.get("host", "localhost"),
+                    "host": normalize_host(data.get("host", "localhost")),
                     "port": data["port"],
                     "cuda_device": data["cuda_device"],
                     "enabled": data.get("enabled", False),
@@ -673,7 +685,8 @@ async def get_local_worker_status_endpoint(request):
         
         for worker in config.get("workers", []):
             # Only check local workers
-            if not worker.get("host") or worker.get("host") in ["localhost", "127.0.0.1"]:
+            host = normalize_host(worker.get("host")) or ""
+            if not host or host in ["localhost", "127.0.0.1"]:
                 worker_id = worker["id"]
                 port = worker["port"]
                 
@@ -1324,7 +1337,7 @@ async def get_client_session():
 # Local worker detection functions
 async def is_local_worker(worker_config):
     """Check if a worker is running on the same machine as the master."""
-    host = worker_config.get('host', 'localhost')
+    host = normalize_host(worker_config.get('host', 'localhost')) or 'localhost'
     if host in ['localhost', '127.0.0.1', '0.0.0.0', ''] or worker_config.get('type') == 'local':
         return True
     
@@ -1341,7 +1354,7 @@ async def is_same_physical_host(worker_config):
         master_machine_id = get_machine_id()
         
         # Fetch worker's machine ID via API
-        host = worker_config.get('host', 'localhost')
+        host = normalize_host(worker_config.get('host', 'localhost')) or 'localhost'
         port = worker_config.get('port', 8188)
         
         session = await get_client_session()
@@ -1404,11 +1417,11 @@ async def get_comms_channel(worker_id, worker_config):
             return f"http://127.0.0.1:{worker_config['port']}"
     elif worker_config.get('type') == 'cloud' and is_runpod_environment():
         # Runpod same-host optimization (if detected)
-        host = worker_config.get('host', 'localhost')
+        host = normalize_host(worker_config.get('host', 'localhost')) or 'localhost'
         return f"http://{host}:{worker_config['port']}"
     else:
         # Remote worker: use configured endpoint
-        host = worker_config.get('host', 'localhost')
+        host = normalize_host(worker_config.get('host', 'localhost')) or 'localhost'
         return f"http://{host}:{worker_config['port']}"
 
 # Auto-launch workers if enabled
@@ -1435,7 +1448,7 @@ def auto_launch_workers():
                     worker_name = worker.get('name', f'Worker {worker_id}')
                     
                     # Skip remote workers
-                    host = worker.get('host', 'localhost').lower()
+                    host = (normalize_host(worker.get('host', 'localhost')) or 'localhost').lower()
                     if host not in ['localhost', '127.0.0.1', '', None]:
                         debug_log(f"Skipping remote worker {worker_name} (host: {host})")
                         continue
@@ -2121,7 +2134,7 @@ class DistributedCollectorNode:
                                 if not wrec:
                                     debug_log(f"Collector probe: worker {wid} not found in config")
                                     continue
-                                host = wrec.get('host') or 'localhost'
+                                host = normalize_host(wrec.get('host') or 'localhost') or 'localhost'
                                 port = int(wrec.get('port', 8188))
                                 url = f"http://{host}:{port}/prompt"
                                 try:

@@ -158,6 +158,24 @@ class DistributedExtension {
         }
     }
 
+    _parseHostInput(value) {
+        if (!value) {
+            return { host: "", port: null };
+        }
+        let cleaned = value.trim().replace(/^https?:\/\//i, "");
+        cleaned = cleaned.split("/")[0];
+        try {
+            const url = new URL(`http://${cleaned}`);
+            const port = url.port ? parseInt(url.port, 10) : null;
+            return {
+                host: url.hostname || cleaned,
+                port: Number.isFinite(port) ? port : null,
+            };
+        } catch (error) {
+            return { host: cleaned, port: null };
+        }
+    }
+
     updateTunnelUIElements() {
         const elements = this.tunnelElements || {};
         const status = (this.tunnelStatus?.status || "stopped").toLowerCase();
@@ -501,7 +519,9 @@ class DistributedExtension {
 
     // Helper to build worker URL
     getWorkerUrl(worker, endpoint = '') {
-        const host = worker.host || window.location.hostname;
+        const parsed = this._parseHostInput(worker.host || window.location.hostname);
+        const host = parsed.host || window.location.hostname;
+        const resolvedPort = parsed.port || worker.port;
         
         // Cloud workers always use HTTPS
         const isCloud = worker.type === 'cloud';
@@ -524,13 +544,13 @@ class DistributedExtension {
         }
         
         // Determine protocol: HTTPS for cloud, Runpod proxies, or port 443
-        const useHttps = isCloud || isRunpodProxy || worker.port === 443;
+        const useHttps = isCloud || isRunpodProxy || resolvedPort === 443;
         const protocol = useHttps ? 'https' : 'http';
         
         // Only add port if non-standard
         const defaultPort = useHttps ? 443 : 80;
-        const needsPort = !isRunpodProxy && worker.port !== defaultPort;
-        const portStr = needsPort ? `:${worker.port}` : '';
+        const needsPort = !isRunpodProxy && resolvedPort !== defaultPort;
+        const portStr = needsPort ? `:${resolvedPort}` : '';
         
         return `${protocol}://${finalHost}${portStr}${endpoint}`;
     }
@@ -974,7 +994,8 @@ class DistributedExtension {
             return true;
         }
         // Otherwise check by host (backward compatibility)
-        const host = worker.host || window.location.hostname;
+        const parsed = this._parseHostInput(worker.host || window.location.hostname);
+        const host = parsed.host || window.location.hostname;
         return host !== "localhost" && host !== "127.0.0.1" && host !== window.location.hostname;
     }
 
@@ -1194,10 +1215,16 @@ class DistributedExtension {
         const workerType = document.getElementById(`worker-type-${workerId}`).value;
         const isRemote = workerType === 'remote' || workerType === 'cloud';
         const isCloud = workerType === 'cloud';
-        const host = isRemote ? document.getElementById(`host-${workerId}`).value : window.location.hostname;
-        const port = parseInt(document.getElementById(`port-${workerId}`).value);
+        const rawHost = isRemote ? document.getElementById(`host-${workerId}`).value : window.location.hostname;
+        const parsedHost = isRemote ? this._parseHostInput(rawHost) : { host: window.location.hostname, port: null };
+        const host = isRemote ? parsedHost.host : window.location.hostname;
+        let port = parseInt(document.getElementById(`port-${workerId}`).value);
         const cudaDevice = isRemote ? undefined : parseInt(document.getElementById(`cuda-${workerId}`).value);
         const extraArgs = isRemote ? undefined : document.getElementById(`args-${workerId}`).value;
+
+        if (isRemote && Number.isFinite(parsedHost.port)) {
+            port = parsedHost.port;
+        }
         
         // Validate
         if (!name.trim()) {

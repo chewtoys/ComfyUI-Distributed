@@ -30,6 +30,14 @@ PUBLIC_URL_PATTERN = re.compile(r"(https?://[\w.-]+\.(?:trycloudflare\.com|cloud
 TUNNEL_START_TIMEOUT = 25
 
 
+def _normalize_host(value):
+    if not value or not isinstance(value, str):
+        return ""
+    value = value.strip()
+    value = re.sub(r"^https?://", "", value, flags=re.IGNORECASE)
+    return value.split("/")[0]
+
+
 class CloudflareTunnelManager:
     def __init__(self):
         self.process = None
@@ -300,13 +308,14 @@ class CloudflareTunnelManager:
                 raise RuntimeError(error_msg)
 
             debug_log(f"Cloudflare tunnel ready at {self.public_url}")
+            master_host = _normalize_host(self.public_url)
             self._persist_state(
                 status="running",
                 public_url=self.public_url,
                 pid=self.pid,
                 log_file=self.log_file,
                 previous_host=self.previous_master_host or "",
-                master_host=self.public_url
+                master_host=master_host
             )
             return {
                 "status": self.status,
@@ -339,8 +348,11 @@ class CloudflareTunnelManager:
             active_url = tunnel_cfg.get("public_url")
             current_master_host = (config.get("master") or {}).get("host")
             restore_host = None
-            if active_url and current_master_host == active_url:
-                restore_host = self.previous_master_host or ""
+            if active_url:
+                active_host = _normalize_host(active_url)
+                current_host = _normalize_host(current_master_host)
+                if current_host == active_host:
+                    restore_host = self.previous_master_host or ""
 
             self.status = "stopped"
             self.public_url = None
