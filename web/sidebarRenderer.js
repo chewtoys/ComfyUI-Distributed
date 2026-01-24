@@ -43,6 +43,8 @@ export async function renderSidebarContent(extension, el) {
         // Preload data outside render
         await extension.loadConfig();
         await extension.loadManagedWorkers();
+        await extension.refreshTunnelStatus();
+        extension.tunnelElements = {};
         
         el.innerHTML = '';
         

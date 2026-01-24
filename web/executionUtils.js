@@ -60,12 +60,21 @@ export function setupInterceptor(extension) {
         if (extension.isEnabled) {
             const hasCollector = findNodesByClass(prompt.output, "DistributedCollector").length > 0;
             const hasDistUpscale = findNodesByClass(prompt.output, "UltimateSDUpscaleDistributed").length > 0;
-            
+            const hasDistQueue = findNodesByClass(prompt.output, "DistributedQueue").length > 0;
+
             if (hasCollector || hasDistUpscale) {
                 const result = await executeParallelDistributed(extension, prompt);
                 // Immediate status check for instant feedback
                 extension.checkAllWorkerStatuses();
                 // Another check after a short delay to catch state changes
+                setTimeout(() => extension.checkAllWorkerStatuses(), TIMEOUTS.POST_ACTION_DELAY);
+                return result;
+            }
+
+            // DistributedQueue: route entire workflow to least-busy worker
+            if (hasDistQueue) {
+                const result = await executeQueueDistributed(extension, prompt);
+                extension.checkAllWorkerStatuses();
                 setTimeout(() => extension.checkAllWorkerStatuses(), TIMEOUTS.POST_ACTION_DELAY);
                 return result;
             }
@@ -94,11 +103,11 @@ export async function executeParallelDistributed(extension, promptWrapper) {
         }
         
         extension.log(`Pre-flight check: ${activeWorkers.length} of ${enabledWorkers.length} workers are active`, "debug");
-        
+
         // Check if master host might be unreachable by workers (cloudflare tunnel down)
         const masterHost = extension.config?.master?.host || '';
         const isCloudflareHost = /\.(trycloudflare\.com|cloudflare\.dev)$/i.test(masterHost);
-        
+
         if (isCloudflareHost && activeWorkers.length > 0) {
             // Try to verify if the cloudflare tunnel is actually up
             try {
@@ -109,24 +118,24 @@ export async function executeParallelDistributed(extension, promptWrapper) {
                     cache: 'no-cache',
                     signal: AbortSignal.timeout(3000) // 3 second timeout
                 });
-                
+
                 if (!response.ok) {
                     throw new Error('Master not reachable');
                 }
             } catch (error) {
                 // Cloudflare tunnel appears to be down
                 extension.log(`Master host ${masterHost} is not reachable - cloudflare tunnel may be down`, "error");
-                
+
                 if (extension.ui?.showCloudflareWarning) {
                     extension.ui.showCloudflareWarning(extension, masterHost);
                 }
-                
+
                 // Stop execution - workers won't be able to send results back
                 extension.log("Blocking execution - workers cannot reach master at cloudflare domain", "error");
                 return null; // This will prevent the workflow from running
             }
         }
-        
+
         // Find all distributed nodes in the workflow
         const collectorNodes = findNodesByClass(promptWrapper.output, "DistributedCollector");
         const upscaleNodes = findNodesByClass(promptWrapper.output, "UltimateSDUpscaleDistributed");
@@ -197,6 +206,126 @@ export async function executeParallelDistributed(extension, promptWrapper) {
     } catch (error) {
         extension.log("Parallel execution failed: " + error.message, "error");
         throw error;
+    }
+}
+
+/**
+ * Execute a workflow via DistributedQueue - routes to the least-busy worker.
+ * The workflow runs ONLY on the selected worker, not on the master.
+ */
+export async function executeQueueDistributed(extension, promptWrapper) {
+    try {
+        const enabledWorkers = extension.enabledWorkers;
+
+        if (enabledWorkers.length === 0) {
+            extension.log("DistributedQueue: No enabled workers. Falling back to local execution.", "warn");
+            return extension.originalQueuePrompt(0, promptWrapper);
+        }
+
+        // Fetch queue status from all enabled workers
+        const workerStatuses = await fetchWorkerQueueStatuses(extension, enabledWorkers);
+
+        if (workerStatuses.length === 0) {
+            extension.log("DistributedQueue: No reachable workers. Falling back to local execution.", "warn");
+            return extension.originalQueuePrompt(0, promptWrapper);
+        }
+
+        // Select the least-busy worker
+        const selectedWorker = selectLeastBusyWorker(extension, workerStatuses);
+        const worker = selectedWorker.worker;
+        const queueRemaining = selectedWorker.queueRemaining;
+
+        extension.log(`DistributedQueue: Routing to ${worker.name} (queue_remaining=${queueRemaining})`, "info");
+
+        // Prepare the prompt with skip_dispatch=True for DistributedQueue nodes
+        const promptToSend = JSON.parse(JSON.stringify(promptWrapper.output));
+        markSkipDispatch(promptToSend);
+
+        // Dispatch to the selected worker
+        const workerUrl = extension.getWorkerUrl(worker);
+        try {
+            const response = await fetch(`${workerUrl}/prompt`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                mode: 'cors',
+                body: JSON.stringify({
+                    prompt: promptToSend,
+                    extra_data: { extra_pnginfo: { workflow: promptWrapper.workflow } },
+                    client_id: api.clientId
+                })
+            });
+
+            if (!response.ok) {
+                throw new Error(`Worker returned ${response.status}`);
+            }
+
+            const result = await response.json();
+            extension.log(`DistributedQueue: Dispatched to ${worker.name}, prompt_id=${result.prompt_id}`, "info");
+
+            return { prompt_id: result.prompt_id, worker_id: worker.id };
+        } catch (error) {
+            extension.log(`DistributedQueue: Failed to dispatch to ${worker.name}: ${error.message}`, "error");
+            // Fall back to local execution
+            return extension.originalQueuePrompt(0, promptWrapper);
+        }
+    } catch (error) {
+        extension.log("DistributedQueue execution failed: " + error.message, "error");
+        throw error;
+    }
+}
+
+async function fetchWorkerQueueStatuses(extension, workers) {
+    const statuses = [];
+
+    const checkPromises = workers.map(async (worker) => {
+        const url = extension.getWorkerUrl(worker, '/prompt');
+        try {
+            const response = await fetch(url, {
+                method: 'GET',
+                mode: 'cors',
+                cache: 'no-store',
+                signal: AbortSignal.timeout(TIMEOUTS.STATUS_CHECK)
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                const queueRemaining = data.exec_info?.queue_remaining || 0;
+                return { worker, queueRemaining, online: true };
+            }
+        } catch (error) {
+            extension.log(`DistributedQueue: Worker ${worker.name} unreachable: ${error.message}`, "debug");
+        }
+        return null;
+    });
+
+    const results = await Promise.all(checkPromises);
+    return results.filter(r => r !== null);
+}
+
+function selectLeastBusyWorker(extension, statuses) {
+    // Find idle workers (queue_remaining == 0)
+    const idleWorkers = statuses.filter(s => s.queueRemaining === 0);
+
+    if (idleWorkers.length > 0) {
+        // Round-robin among idle workers
+        if (!extension._distributedQueueRRIndex) {
+            extension._distributedQueueRRIndex = 0;
+        }
+        const index = extension._distributedQueueRRIndex % idleWorkers.length;
+        extension._distributedQueueRRIndex++;
+        return idleWorkers[index];
+    }
+
+    // No idle workers - pick the one with the shortest queue
+    return statuses.reduce((min, s) => s.queueRemaining < min.queueRemaining ? s : min);
+}
+
+function markSkipDispatch(promptObj) {
+    for (const node of Object.values(promptObj)) {
+        if (node && typeof node === 'object' && node.class_type === 'DistributedQueue') {
+            node.inputs = node.inputs || {};
+            node.inputs.skip_dispatch = true;
+        }
     }
 }
 
@@ -496,22 +625,100 @@ async function dispatchToWorker(extension, worker, prompt, workflow, imageRefere
     
     const promptToSend = {
         prompt,
-        extra_data: { extra_pnginfo: { workflow } },
+        workflow,
         client_id: api.clientId
     };
-    
+
     extension.log('[Distributed] Prompt data: ' + JSON.stringify(promptToSend), "debug");
-    
+
     try {
-        await fetch(`${workerUrl}/prompt`, { 
-            method: 'POST', 
-            headers: { 'Content-Type': 'application/json' }, 
+        if (extension.config?.settings?.websocket_orchestration) {
+            const wsUrl = buildWorkerWebSocketUrl(workerUrl);
+            await dispatchPromptViaWebSocket(extension, wsUrl, promptToSend);
+            return;
+        }
+        await fetch(`${workerUrl}/prompt`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
             mode: 'cors',
-            body: JSON.stringify(promptToSend) 
+            body: JSON.stringify({
+                prompt,
+                extra_data: { extra_pnginfo: { workflow } },
+                client_id: api.clientId
+            })
         });
     } catch (e) {
         extension.log(`Failed to connect to worker ${worker.name} at ${workerUrl}: ${e.message}`, "error");
     }
+}
+
+function buildWorkerWebSocketUrl(workerUrl) {
+    const url = new URL(workerUrl);
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    url.pathname = '/distributed/worker_ws';
+    url.search = '';
+    return url.toString();
+}
+
+function generateRequestId() {
+    if (crypto.randomUUID) {
+        return crypto.randomUUID();
+    }
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+        const r = Math.random() * 16 | 0;
+        const v = c === 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+    });
+}
+
+async function dispatchPromptViaWebSocket(extension, wsUrl, payload) {
+    const requestId = generateRequestId();
+    const message = {
+        type: 'dispatch_prompt',
+        request_id: requestId,
+        prompt: payload.prompt,
+        workflow: payload.workflow,
+        client_id: payload.client_id
+    };
+
+    await new Promise((resolve, reject) => {
+        const ws = new WebSocket(wsUrl);
+        const timeoutId = setTimeout(() => {
+            ws.close();
+            reject(new Error('Websocket dispatch timed out.'));
+        }, 60000);
+
+        ws.addEventListener('open', () => {
+            ws.send(JSON.stringify(message));
+        });
+
+        ws.addEventListener('message', (event) => {
+            try {
+                const data = JSON.parse(event.data || '{}');
+                if (data.type !== 'dispatch_ack' || data.request_id !== requestId) {
+                    return;
+                }
+                clearTimeout(timeoutId);
+                ws.close();
+                if (data.ok) {
+                    resolve();
+                } else {
+                    reject(new Error(data.error || 'Worker rejected websocket dispatch.'));
+                }
+            } catch (error) {
+                clearTimeout(timeoutId);
+                ws.close();
+                reject(error);
+            }
+        });
+
+        ws.addEventListener('error', () => {
+            clearTimeout(timeoutId);
+            ws.close();
+            reject(new Error('Websocket connection failed.'));
+        });
+    });
+    extension.log(`[Distributed] Websocket dispatch succeeded for ${wsUrl}`, "debug");
 }
 
 export async function loadImagesForWorker(extension, imageReferences) {
@@ -666,9 +873,10 @@ export async function performPreflightCheck(extension, workers) {
             const response = await fetch(url, {
                 method: 'GET',
                 mode: 'cors',
+                cache: 'no-store',
                 signal: AbortSignal.timeout(TIMEOUTS.STATUS_CHECK)
             });
-            
+
             if (response.ok) {
                 extension.log(`Worker ${worker.name} is active`, "debug");
                 return { worker, active: true };
@@ -677,6 +885,10 @@ export async function performPreflightCheck(extension, workers) {
                 return { worker, active: false };
             }
         } catch (error) {
+            if (error?.name === 'AbortError') {
+                extension.log(`Worker ${worker.name} pre-flight check timed out; assuming active`, "debug");
+                return { worker, active: true, uncertain: true };
+            }
             extension.log(`Worker ${worker.name} is offline or unreachable: ${error.message}`, "debug");
             return { worker, active: false };
         }

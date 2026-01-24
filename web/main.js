@@ -17,6 +17,8 @@ class DistributedExtension {
         this.logAutoRefreshInterval = null;
         this.masterSettingsExpanded = false;
         this.app = app; // Store app reference for toast notifications
+        this.tunnelStatus = { status: "unknown" };
+        this.tunnelElements = {};
         
         // Initialize centralized state
         this.state = createStateManager();
@@ -146,6 +148,162 @@ class DistributedExtension {
         }
     }
 
+    _applyMasterHost(host) {
+        if (!host || !this.config) return;
+        if (!this.config.master) this.config.master = {};
+        this.config.master.host = host;
+        const hostInput = document.getElementById('master-host');
+        if (hostInput) {
+            hostInput.value = host;
+        }
+    }
+
+    _parseHostInput(value) {
+        if (!value) {
+            return { host: "", port: null };
+        }
+        let cleaned = value.trim().replace(/^https?:\/\//i, "");
+        cleaned = cleaned.split("/")[0];
+        try {
+            const url = new URL(`http://${cleaned}`);
+            const port = url.port ? parseInt(url.port, 10) : null;
+            return {
+                host: url.hostname || cleaned,
+                port: Number.isFinite(port) ? port : null,
+            };
+        } catch (error) {
+            return { host: cleaned, port: null };
+        }
+    }
+
+    updateTunnelUIElements() {
+        const elements = this.tunnelElements || {};
+        const status = (this.tunnelStatus?.status || "stopped").toLowerCase();
+        const enableColor = "#665533"; // requested yellow/brown tone
+        const disableColor = "#7c4a4a"; // match worker delete button
+        const colors = {
+            running: disableColor,
+            starting: enableColor,
+            stopped: enableColor,
+            error: disableColor,
+            unknown: enableColor,
+            stopping: disableColor
+        };
+
+        if (elements.button) {
+            elements.button.disabled = status === "starting" || status === "stopping";
+            if (status === "starting") {
+                elements.button.innerHTML = `<span class="tunnel-spinner"></span> Starting...`;
+                elements.button.style.backgroundColor = enableColor;
+            } else if (status === "running") {
+                elements.button.textContent = "Disable Cloudflare Tunnel";
+                elements.button.style.backgroundColor = disableColor;
+            } else if (status === "error") {
+                elements.button.textContent = "Retry Cloudflare Tunnel";
+                elements.button.style.backgroundColor = disableColor;
+            } else {
+                elements.button.textContent = "Enable Cloudflare Tunnel";
+                elements.button.style.backgroundColor = enableColor;
+            }
+        }
+
+        if (elements.status) {
+            elements.status.textContent = status.toUpperCase();
+            elements.status.style.backgroundColor = colors[status] || colors.stopped;
+        }
+
+        if (elements.url) {
+            const url = this.tunnelStatus?.public_url;
+            if (url) {
+                elements.url.innerHTML = `<a href="${url}" target="_blank" style="color: #eee; text-decoration: none;">${url}</a>`;
+            } else {
+                elements.url.textContent = status === "starting" ? "Requesting public URL..." : "No tunnel active";
+            }
+        }
+
+        if (elements.copyBtn) {
+            const hasUrl = Boolean(this.tunnelStatus?.public_url);
+            elements.copyBtn.disabled = !hasUrl;
+            elements.copyBtn.style.opacity = hasUrl ? "1" : "0.5";
+        }
+    }
+
+    async refreshTunnelStatus() {
+        try {
+            const data = await this.api.getTunnelStatus();
+            this.tunnelStatus = data.tunnel || { status: "stopped" };
+            if (data.master_host !== undefined) {
+                this._applyMasterHost(data.master_host);
+            }
+            return this.tunnelStatus;
+        } catch (error) {
+            this.tunnelStatus = { status: "error", last_error: error.message };
+            this.log("Failed to fetch tunnel status: " + error.message, "error");
+            return this.tunnelStatus;
+        } finally {
+            this.updateTunnelUIElements();
+        }
+    }
+
+    async handleTunnelToggle(button) {
+        const currentStatus = (this.tunnelStatus?.status || "stopped").toLowerCase();
+        if (currentStatus === "starting" || currentStatus === "stopping") {
+            return;
+        }
+
+        const setStatus = (status) => {
+            this.tunnelStatus = { ...(this.tunnelStatus || {}), status };
+            this.updateTunnelUIElements();
+        };
+
+        if (currentStatus === "running") {
+            setStatus("stopping");
+            try {
+                if (button) {
+                    button.innerHTML = `<span class="tunnel-spinner"></span> Stopping...`;
+                    button.disabled = true;
+                }
+                const data = await this.api.stopTunnel();
+                this.tunnelStatus = data.tunnel || { status: "stopped" };
+                if (data.master_host !== undefined) {
+                    this._applyMasterHost(data.master_host);
+                }
+                this.updateTunnelUIElements();
+                this.ui.showToast(this.app, "info", "Cloudflare Tunnel Disabled", "Master address restored", 4000);
+            } catch (error) {
+                this.tunnelStatus = { status: "error", last_error: error.message };
+                this.updateTunnelUIElements();
+                this.ui.showToast(this.app, "error", "Failed to stop tunnel", error.message, 5000);
+            } finally {
+                if (button) button.disabled = false;
+            }
+            return;
+        }
+
+        // Start tunnel
+        setStatus("starting");
+        if (button) {
+            button.innerHTML = `<span class="tunnel-spinner"></span> Starting...`;
+            button.disabled = true;
+        }
+        try {
+            const data = await this.api.startTunnel();
+            this.tunnelStatus = data.tunnel || { status: "running" };
+            if (data.master_host !== undefined) {
+                this._applyMasterHost(data.master_host);
+            }
+            this.updateTunnelUIElements();
+            const url = data.tunnel?.public_url || data.master_host;
+            this.ui.showToast(this.app, "success", "Cloudflare Tunnel Ready", url || "Public URL created", 4500);
+        } catch (error) {
+            this.tunnelStatus = { status: "error", last_error: error.message };
+            this.updateTunnelUIElements();
+            this.ui.showToast(this.app, "error", "Failed to start tunnel", error.message, 5000);
+        } finally {
+            if (button) button.disabled = false;
+        }
+    }
+
     async updateWorkerEnabled(workerId, enabled) {
         const worker = this.config.workers.find(w => w.id === workerId);
         if (worker) {
@@ -173,7 +331,7 @@ class DistributedExtension {
         }
 
         if (this.panelElement) {
-            renderSidebarContent(this, this.panelElement);
+            await renderSidebarContent(this, this.panelElement);
         }
     }
 
@@ -361,7 +519,9 @@ class DistributedExtension {
 
     // Helper to build worker URL
     getWorkerUrl(worker, endpoint = '') {
-        const host = worker.host || window.location.hostname;
+        const parsed = this._parseHostInput(worker.host || window.location.hostname);
+        const host = parsed.host || window.location.hostname;
+        const resolvedPort = parsed.port || worker.port;
         
         // Cloud workers always use HTTPS
         const isCloud = worker.type === 'cloud';
@@ -384,13 +544,13 @@ class DistributedExtension {
         }
         
         // Determine protocol: HTTPS for cloud, Runpod proxies, or port 443
-        const useHttps = isCloud || isRunpodProxy || worker.port === 443;
+        const useHttps = isCloud || isRunpodProxy || resolvedPort === 443;
         const protocol = useHttps ? 'https' : 'http';
         
         // Only add port if non-standard
         const defaultPort = useHttps ? 443 : 80;
-        const needsPort = !isRunpodProxy && worker.port !== defaultPort;
-        const portStr = needsPort ? `:${worker.port}` : '';
+        const needsPort = !isRunpodProxy && resolvedPort !== defaultPort;
+        const portStr = needsPort ? `:${resolvedPort}` : '';
         
         return `${protocol}://${finalHost}${portStr}${endpoint}`;
     }
@@ -476,20 +636,20 @@ class DistributedExtension {
 
     async launchWorker(workerId) {
         const worker = this.config.workers.find(w => w.id === workerId);
-        const launchBtn = document.querySelector(`#controls-${workerId} button`);
 
         // If worker is disabled, enable it first
         if (!worker.enabled) {
             await this.updateWorkerEnabled(workerId, true);
-            
+
             // Update the checkbox UI
             const checkbox = document.getElementById(`gpu-${workerId}`);
             if (checkbox) {
                 checkbox.checked = true;
             }
-            
-            this.updateSummary();
         }
+
+        // Re-query button AFTER updateWorkerEnabled (which may re-render sidebar)
+        const launchBtn = document.querySelector(`#controls-${workerId} button`);
 
         this.ui.updateStatusDot(workerId, "#f0ad4e", "Launching...", true);
         this.state.setWorkerLaunching(workerId, true);
@@ -834,7 +994,8 @@ class DistributedExtension {
             return true;
         }
         // Otherwise check by host (backward compatibility)
-        const host = worker.host || window.location.hostname;
+        const parsed = this._parseHostInput(worker.host || window.location.hostname);
+        const host = parsed.host || window.location.hostname;
         return host !== "localhost" && host !== "127.0.0.1" && host !== window.location.hostname;
     }
 
@@ -1054,10 +1215,16 @@ class DistributedExtension {
         const workerType = document.getElementById(`worker-type-${workerId}`).value;
         const isRemote = workerType === 'remote' || workerType === 'cloud';
         const isCloud = workerType === 'cloud';
-        const host = isRemote ? document.getElementById(`host-${workerId}`).value : window.location.hostname;
-        const port = parseInt(document.getElementById(`port-${workerId}`).value);
+        const rawHost = isRemote ? document.getElementById(`host-${workerId}`).value : window.location.hostname;
+        const parsedHost = isRemote ? this._parseHostInput(rawHost) : { host: window.location.hostname, port: null };
+        const host = isRemote ? parsedHost.host : window.location.hostname;
+        let port = parseInt(document.getElementById(`port-${workerId}`).value);
         const cudaDevice = isRemote ? undefined : parseInt(document.getElementById(`cuda-${workerId}`).value);
         const extraArgs = isRemote ? undefined : document.getElementById(`args-${workerId}`).value;
+
+        if (isRemote && Number.isFinite(parsedHost.port)) {
+            port = parsedHost.port;
+        }
         
         // Validate
         if (!name.trim()) {

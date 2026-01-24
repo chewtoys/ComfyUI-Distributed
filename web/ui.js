@@ -1084,6 +1084,14 @@ export class DistributedUI {
         
         const hostResult = this.createFormGroup("Host:", extension.config?.master?.host || "", "master-host", "text", "Auto-detect if empty");
         settingsForm.appendChild(hostResult.group);
+
+        // Cloudflare tunnel toggle (simple button inside master settings)
+        const tunnelBtn = this.createButton("Enable Cloudflare Tunnel", (e) => extension.handleTunnelToggle(e.target), "background-color: #665533;");
+        tunnelBtn.id = "cloudflare-tunnel-button";
+        tunnelBtn.style.cssText = BUTTON_STYLES.base + " background-color: #665533; margin: 4px 0 -5px 0;";
+        settingsForm.appendChild(tunnelBtn);
+        extension.tunnelElements = { button: tunnelBtn };
+        extension.updateTunnelUIElements();
         
         const saveBtn = this.createButton("Save", async () => {
             const nameInput = document.getElementById('master-name');
