@@ -1987,6 +1987,21 @@ async def job_complete_endpoint(request):
                 log(f"Error processing image from worker {worker_id}: {e}")
                 return await handle_api_error(request, f"Image processing error: {e}", 400)
 
+        # Parse audio data if present
+        audio_data = None
+        audio_waveform_field = data.get('audio_waveform')
+        audio_sample_rate = data.get('audio_sample_rate')
+        if audio_waveform_field is not None:
+            try:
+                waveform_bytes = audio_waveform_field.file.read()
+                waveform_buffer = io.BytesIO(waveform_bytes)
+                waveform_tensor = torch.load(waveform_buffer, weights_only=True)
+                sample_rate = int(audio_sample_rate) if audio_sample_rate else 44100
+                audio_data = {"waveform": waveform_tensor, "sample_rate": sample_rate}
+                debug_log(f"Received audio from worker {worker_id}: shape={waveform_tensor.shape}, sample_rate={sample_rate}")
+            except Exception as e:
+                log(f"Error parsing audio from worker {worker_id}: {e}")
+
         # Put batch into queue
         async with prompt_server.distributed_jobs_lock:
             debug_log(f"Current pending jobs: {list(prompt_server.distributed_pending_jobs.keys())}")
@@ -1997,7 +2012,8 @@ async def job_complete_endpoint(request):
                         'worker_id': worker_id,
                         'tensors': tensors,
                         'indices': indices,
-                        'is_last': is_last
+                        'is_last': is_last,
+                        'audio': audio_data
                     })
                     debug_log(f"Received batch result for job {multi_job_id} from worker {worker_id}, size={len(tensors)}")
                 else:
@@ -2006,7 +2022,8 @@ async def job_complete_endpoint(request):
                         'tensor': tensors[0],
                         'worker_id': worker_id,
                         'image_index': int(image_index) if image_index else 0,
-                        'is_last': is_last
+                        'is_last': is_last,
+                        'audio': audio_data
                     })
                     debug_log(f"Received single result for job {multi_job_id} from worker {worker_id}")
                     
@@ -2025,6 +2042,7 @@ class DistributedCollectorNode:
     def INPUT_TYPES(s):
         return {
             "required": { "images": ("IMAGE",) },
+            "optional": { "audio": ("AUDIO",) },
             "hidden": {
                 "multi_job_id": ("STRING", {"default": ""}),
                 "is_worker": ("BOOLEAN", {"default": False}),
@@ -2037,45 +2055,47 @@ class DistributedCollectorNode:
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = ("IMAGE", "AUDIO")
+    RETURN_NAMES = ("images", "audio")
     FUNCTION = "run"
     CATEGORY = "image"
     
-    def run(self, images, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", pass_through=False, delegate_only=False):
+    def run(self, images, audio=None, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", pass_through=False, delegate_only=False):
+        # Create empty audio if not provided
+        empty_audio = {"waveform": torch.zeros(1, 2, 1), "sample_rate": 44100}
+
         if not multi_job_id or pass_through:
             if pass_through:
                 print(f"[Distributed Collector] Pass-through mode enabled, returning images unchanged")
-            return (images,)
+            return (images, audio if audio is not None else empty_audio)
 
         # Use async helper to run in server loop
         result = run_async_in_server_loop(
-            self.execute(images, multi_job_id, is_worker, master_url, enabled_worker_ids, worker_batch_size, worker_id, delegate_only)
+            self.execute(images, audio, multi_job_id, is_worker, master_url, enabled_worker_ids, worker_batch_size, worker_id, delegate_only)
         )
         return result
 
-    async def send_batch_to_master(self, image_batch, multi_job_id, master_url, worker_id):
-        """Send image batch to master, chunked if large."""
+    async def send_batch_to_master(self, image_batch, audio, multi_job_id, master_url, worker_id):
+        """Send image batch and optional audio to master, chunked if large."""
         batch_size = image_batch.shape[0]
-        if batch_size == 0:
+        if batch_size == 0 and audio is None:
             return
-        
-        
+
         for start in range(0, batch_size, MAX_BATCH):
             chunk = image_batch[start:start + MAX_BATCH]
             chunk_size = chunk.shape[0]
             is_chunk_last = (start + chunk_size == batch_size)  # True only for final chunk
-            
-            
+
             data = aiohttp.FormData()
             data.add_field('multi_job_id', multi_job_id)
             data.add_field('worker_id', str(worker_id))
             data.add_field('is_last', str(is_chunk_last))
             data.add_field('batch_size', str(chunk_size))
-            
+
             # Chunk metadata: Absolute index from full batch
             metadata = [{'index': start + j} for j in range(chunk_size)]
             data.add_field('images_metadata', json.dumps(metadata), content_type='application/json')
-            
+
             # Add chunk images
             for j in range(chunk_size):
                 # Convert tensor slice to PIL
@@ -2084,9 +2104,21 @@ class DistributedCollectorNode:
                 img.save(byte_io, format='PNG', compress_level=0)
                 byte_io.seek(0)
                 data.add_field(f'image_{j}', byte_io, filename=f'image_{j}.png', content_type='image/png')
-            
+
+            # Add audio data only on the final chunk to avoid duplication
+            if is_chunk_last and audio is not None:
+                waveform = audio.get("waveform")
+                sample_rate = audio.get("sample_rate", 44100)
+                if waveform is not None and waveform.numel() > 0:
+                    # Serialize waveform tensor to bytes
+                    audio_bytes = io.BytesIO()
+                    torch.save(waveform, audio_bytes)
+                    audio_bytes.seek(0)
+                    data.add_field('audio_waveform', audio_bytes, filename='audio.pt', content_type='application/octet-stream')
+                    data.add_field('audio_sample_rate', str(sample_rate))
+                    debug_log(f"Worker - Including audio: shape={waveform.shape}, sample_rate={sample_rate}")
+
             try:
-                
                 session = await get_client_session()
                 url = f"{master_url}/distributed/job_complete"
                 async with session.post(url, data=data) as response:
@@ -2096,36 +2128,76 @@ class DistributedCollectorNode:
                 debug_log(f"Worker - Full error details: URL={url}")
                 raise  # Re-raise to handle at caller level
 
+    def _combine_audio(self, master_audio, worker_audio, empty_audio):
+        """Combine audio from master and workers into a single audio output."""
+        audio_pieces = []
+        sample_rate = 44100
 
-    async def execute(self, images, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False):
+        # Add master audio first if present
+        if master_audio is not None:
+            waveform = master_audio.get("waveform")
+            if waveform is not None and waveform.numel() > 0:
+                audio_pieces.append(waveform)
+                sample_rate = master_audio.get("sample_rate", 44100)
+
+        # Add worker audio in sorted order
+        for worker_id_str in sorted(worker_audio.keys()):
+            w_audio = worker_audio[worker_id_str]
+            if w_audio is not None:
+                waveform = w_audio.get("waveform")
+                if waveform is not None and waveform.numel() > 0:
+                    audio_pieces.append(waveform)
+                    # Use first available sample rate
+                    if sample_rate == 44100:
+                        sample_rate = w_audio.get("sample_rate", 44100)
+
+        if not audio_pieces:
+            return empty_audio
+
+        try:
+            # Concatenate along the samples dimension (dim=-1)
+            # Ensure all pieces have same batch and channel dimensions
+            combined_waveform = torch.cat(audio_pieces, dim=-1)
+            debug_log(f"Master - Combined audio: {len(audio_pieces)} pieces, final shape={combined_waveform.shape}")
+            return {"waveform": combined_waveform, "sample_rate": sample_rate}
+        except Exception as e:
+            log(f"Master - Error combining audio: {e}")
+            return empty_audio
+
+    async def execute(self, images, audio, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False):
+        empty_audio = {"waveform": torch.zeros(1, 2, 1), "sample_rate": 44100}
+
         if is_worker:
-            # Worker mode: send images to master in a single batch
+            # Worker mode: send images and audio to master in a single batch
             debug_log(f"Worker - Job {multi_job_id} complete. Sending {images.shape[0]} image(s) to master")
-            await self.send_batch_to_master(images, multi_job_id, master_url, worker_id)
-            return (images,)
+            await self.send_batch_to_master(images, audio, multi_job_id, master_url, worker_id)
+            return (images, audio if audio is not None else empty_audio)
         else:
             delegate_mode = delegate_only or is_master_delegate_only()
-            # Master mode: collect images from workers
+            # Master mode: collect images and audio from workers
             enabled_workers = json.loads(enabled_worker_ids)
             num_workers = len(enabled_workers)
             if num_workers == 0:
-                return (images,)
-            
+                return (images, audio if audio is not None else empty_audio)
+
             if delegate_mode:
                 master_batch_size = 0
                 images_on_cpu = None
+                master_audio = None
                 debug_log(f"Master - Job {multi_job_id}: Delegate-only mode enabled, collecting exclusively from {num_workers} workers")
             else:
                 images_on_cpu = images.cpu()
                 master_batch_size = images.shape[0]
+                master_audio = audio  # Keep master's audio for later
                 debug_log(f"Master - Job {multi_job_id}: Master has {master_batch_size} images, collecting from {num_workers} workers...")
-                
+
                 # Ensure master images are contiguous
                 images_on_cpu = ensure_contiguous(images_on_cpu)
-            
-            
-            # Initialize storage for collected images
+
+
+            # Initialize storage for collected images and audio
             worker_images = {}  # Dict to store images by worker_id and index
+            worker_audio = {}   # Dict to store audio by worker_id
             
             # Get the existing queue - it should already exist from prepare_job
             async with prompt_server.distributed_jobs_lock:
@@ -2193,19 +2265,25 @@ class DistributedCollectorNode:
                             # Single image mode (backward compat)
                             image_index = result['image_index']
                             tensor = result['tensor']
-                            
+
                             debug_log(f"Master - Got single result from worker {worker_id}, image {image_index}, is_last={is_last}")
-                            
+
                             if worker_id not in worker_images:
                                 worker_images[worker_id] = {}
                             worker_images[worker_id][image_index] = tensor
-                            
+
                             collected_count += 1
-                        
+
+                        # Collect audio data if present
+                        result_audio = result.get('audio')
+                        if result_audio is not None:
+                            worker_audio[worker_id] = result_audio
+                            debug_log(f"Master - Got audio from worker {worker_id}")
+
                         # Record activity and refresh timeout baseline
                         last_activity = time.time()
                         base_timeout = float(get_worker_timeout_seconds())
-                        
+
                         if is_last:
                             workers_done.add(worker_id)
                             p.update(1)  # +1 per completed worker
@@ -2361,11 +2439,15 @@ class DistributedCollectorNode:
                 # Ensure the combined tensor is contiguous and properly formatted
                 combined = ensure_contiguous(combined)
                 debug_log(f"Master - Job {multi_job_id} complete. Combined {combined.shape[0]} images total (master: {master_batch_size}, workers: {combined.shape[0] - master_batch_size})")
-                return (combined,)
+
+                # Combine audio from master and workers
+                combined_audio = self._combine_audio(master_audio, worker_audio, empty_audio)
+
+                return (combined, combined_audio)
             except Exception as e:
                 log(f"Master - Error combining images: {e}")
                 # Return just the master images as fallback
-                return (images,)
+                return (images, audio if audio is not None else empty_audio)
 
 # --- Distributor Node ---
 class DistributedSeed:
