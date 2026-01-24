@@ -10,6 +10,7 @@ import aiohttp
 from aiohttp import web
 import io
 import server
+import execution
 import comfy.model_management
 import subprocess
 import platform
@@ -95,6 +96,102 @@ async def queue_status_endpoint(request):
         return web.json_response({"exists": exists, "job_id": job_id})
     except Exception as e:
         return await handle_api_error(request, e, 500)
+
+
+prompt_server = server.PromptServer.instance
+
+
+async def _queue_prompt_payload(prompt_obj, workflow_meta=None, client_id=None):
+    """Validate and queue a prompt via ComfyUI's prompt queue."""
+    payload = {"prompt": prompt_obj}
+    payload = prompt_server.trigger_on_prompt(payload)
+    prompt = payload["prompt"]
+
+    prompt_id = str(uuid.uuid4())
+    valid = await execution.validate_prompt(prompt_id, prompt, None)
+    if not valid[0]:
+        raise RuntimeError(f"Invalid prompt: {valid[1]}")
+
+    extra_data = {}
+    if workflow_meta:
+        extra_data.setdefault("extra_pnginfo", {})["workflow"] = workflow_meta
+    if client_id:
+        extra_data["client_id"] = client_id
+
+    sensitive = {}
+    for key in getattr(execution, "SENSITIVE_EXTRA_DATA_KEYS", []):
+        if key in extra_data:
+            sensitive[key] = extra_data.pop(key)
+
+    number = getattr(prompt_server, "number", 0)
+    prompt_server.number = number + 1
+    prompt_queue_item = (number, prompt_id, prompt, extra_data, valid[2], sensitive)
+    prompt_server.prompt_queue.put(prompt_queue_item)
+    return prompt_id
+
+
+@server.PromptServer.instance.routes.get("/distributed/worker_ws")
+async def worker_ws_endpoint(request):
+    """WebSocket endpoint for worker prompt dispatch."""
+    ws = web.WebSocketResponse(heartbeat=30)
+    await ws.prepare(request)
+
+    async for msg in ws:
+        if msg.type == aiohttp.WSMsgType.TEXT:
+            try:
+                data = json.loads(msg.data or "{}")
+            except json.JSONDecodeError:
+                await ws.send_json({
+                    "type": "dispatch_ack",
+                    "request_id": None,
+                    "ok": False,
+                    "error": "Invalid JSON payload.",
+                })
+                continue
+
+            if data.get("type") != "dispatch_prompt":
+                await ws.send_json({
+                    "type": "dispatch_ack",
+                    "request_id": data.get("request_id"),
+                    "ok": False,
+                    "error": "Unsupported websocket message type.",
+                })
+                continue
+
+            prompt = data.get("prompt")
+            if not isinstance(prompt, dict):
+                await ws.send_json({
+                    "type": "dispatch_ack",
+                    "request_id": data.get("request_id"),
+                    "ok": False,
+                    "error": "Field 'prompt' must be an object.",
+                })
+                continue
+
+            try:
+                prompt_id = await _queue_prompt_payload(
+                    prompt,
+                    workflow_meta=data.get("workflow"),
+                    client_id=data.get("client_id"),
+                )
+                await ws.send_json({
+                    "type": "dispatch_ack",
+                    "request_id": data.get("request_id"),
+                    "ok": True,
+                    "prompt_id": prompt_id,
+                })
+            except Exception as exc:
+                await ws.send_json({
+                    "type": "dispatch_ack",
+                    "request_id": data.get("request_id"),
+                    "ok": False,
+                    "error": str(exc),
+                })
+        elif msg.type == aiohttp.WSMsgType.ERROR:
+            log(f"[Distributed] Worker websocket error: {ws.exception()}")
+
+    return ws
+
 
 @server.PromptServer.instance.routes.post("/distributed/worker/clear_launching")
 async def clear_launching_state(request):
@@ -2486,17 +2583,165 @@ class DistributedEmptyImage:
         return (tensor,)
 
 
-NODE_CLASS_MAPPINGS = { 
+# --- Distributed Queue Node ---
+class DistributedQueueNode:
+    """Routes entire workflows to the least-busy worker for job scheduling/load balancing."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+                "client_id": "CLIENT_ID",
+                "skip_dispatch": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("worker_id", "prompt_id")
+    FUNCTION = "queue"
+    OUTPUT_NODE = True
+    CATEGORY = "utils"
+
+    def queue(self, prompt=None, extra_pnginfo=None, client_id=None, skip_dispatch=False):
+        if skip_dispatch:
+            debug_log("DistributedQueue: skip_dispatch enabled; not dispatching.")
+            return ("", "")
+        if not prompt:
+            log("DistributedQueue: No prompt supplied; skipping dispatch.")
+            return ("", "")
+
+        return run_async_in_server_loop(
+            self._queue_on_worker(prompt, extra_pnginfo, client_id)
+        )
+
+    async def _queue_on_worker(self, prompt_obj, workflow_meta, client_id):
+        config = load_config()
+        enabled_workers = [
+            worker for worker in config.get("workers", [])
+            if worker.get("enabled", False)
+        ]
+
+        if not enabled_workers:
+            log("DistributedQueue: No enabled workers found.")
+            return ("", "")
+
+        statuses = await self._fetch_worker_statuses(enabled_workers)
+        if not statuses:
+            log("DistributedQueue: No reachable workers found.")
+            return ("", "")
+
+        selected = self._select_worker(statuses)
+        worker = selected["worker"]
+        queue_remaining = selected["queue_remaining"]
+
+        prompt_copy = json.loads(json.dumps(prompt_obj))
+        self._mark_skip_dispatch(prompt_copy)
+
+        payload = {"prompt": prompt_copy}
+        extra_data = {}
+        if workflow_meta:
+            extra_data.setdefault("extra_pnginfo", {})["workflow"] = workflow_meta
+        if client_id:
+            extra_data["client_id"] = client_id
+        if extra_data:
+            payload["extra_data"] = extra_data
+
+        url = self._build_worker_url(worker, "/prompt")
+        session = await get_client_session()
+        async with session.post(
+            url,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
+            resp.raise_for_status()
+            response_payload = await resp.json()
+
+        prompt_id = str(response_payload.get("prompt_id", ""))
+        worker_id = str(worker.get("id", ""))
+        log(
+            f"DistributedQueue: queued prompt {prompt_id} on worker {worker_id} (queue_remaining={queue_remaining})."
+        )
+        return (worker_id, prompt_id)
+
+    async def _fetch_worker_statuses(self, workers):
+        session = await get_client_session()
+        statuses = []
+        for worker in workers:
+            url = self._build_worker_url(worker, "/prompt")
+            try:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=3),
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    queue_remaining = int(data.get("exec_info", {}).get("queue_remaining", 0))
+                    statuses.append({
+                        "worker": worker,
+                        "queue_remaining": queue_remaining,
+                    })
+            except Exception as e:
+                debug_log(f"DistributedQueue: Worker status check failed ({url}): {e}")
+
+        return statuses
+
+    def _select_worker(self, statuses):
+        idle_workers = [status for status in statuses if status["queue_remaining"] == 0]
+        if idle_workers:
+            return self._select_round_robin(idle_workers)
+        return min(statuses, key=lambda status: status["queue_remaining"])
+
+    def _select_round_robin(self, statuses):
+        prompt_server = server.PromptServer.instance
+        if not hasattr(prompt_server, "distributed_queue_rr_index"):
+            prompt_server.distributed_queue_rr_index = 0
+
+        index = prompt_server.distributed_queue_rr_index % len(statuses)
+        prompt_server.distributed_queue_rr_index += 1
+        return statuses[index]
+
+    def _mark_skip_dispatch(self, prompt_obj):
+        for node in prompt_obj.values():
+            if isinstance(node, dict) and node.get("class_type") == "DistributedQueue":
+                inputs = node.setdefault("inputs", {})
+                inputs["skip_dispatch"] = True
+
+    def _build_worker_url(self, worker, endpoint=""):
+        host = (worker.get("host") or "").strip()
+        port = int(worker.get("port", worker.get("listen_port", 8188)) or 8188)
+
+        if not host:
+            host = getattr(server.PromptServer.instance, "address", "127.0.0.1") or "127.0.0.1"
+
+        if host.startswith(("http://", "https://")):
+            base = host.rstrip("/")
+        else:
+            is_cloud = worker.get("type") == "cloud" or host.endswith(".proxy.runpod.net") or port == 443
+            scheme = "https" if is_cloud else "http"
+            default_port = 443 if scheme == "https" else 80
+            port_part = "" if port == default_port else f":{port}"
+            base = f"{scheme}://{host}{port_part}"
+
+        return f"{base}{endpoint}"
+
+
+NODE_CLASS_MAPPINGS = {
+    "DistributedQueue": DistributedQueueNode,
     "DistributedCollector": DistributedCollectorNode,
     "DistributedSeed": DistributedSeed,
     "DistributedModelName": DistributedModelName,
     "ImageBatchDivider": ImageBatchDivider,
     "DistributedEmptyImage": DistributedEmptyImage,
 }
-NODE_DISPLAY_NAME_MAPPINGS = { 
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "DistributedQueue": "Distributed Queue",
     "DistributedCollector": "Distributed Collector",
     "DistributedSeed": "Distributed Seed",
-    "DistributedModelName": "DistributedModelName",
+    "DistributedModelName": "Distributed Model Name",
     "ImageBatchDivider": "Image Batch Divider",
     "DistributedEmptyImage": "Distributed Empty Image",
 }

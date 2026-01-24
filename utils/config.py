@@ -19,7 +19,8 @@ def get_default_config():
             "debug": False,
             "auto_launch_workers": False,
             "stop_workers_on_master_exit": True,
-            "master_delegate_only": False
+            "master_delegate_only": False,
+            "websocket_orchestration": True
         },
         "tunnel": {
             "status": "stopped",

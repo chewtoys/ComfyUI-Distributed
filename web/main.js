@@ -331,7 +331,7 @@ class DistributedExtension {
         }
 
         if (this.panelElement) {
-            renderSidebarContent(this, this.panelElement);
+            await renderSidebarContent(this, this.panelElement);
         }
     }
 
@@ -636,20 +636,20 @@ class DistributedExtension {
 
     async launchWorker(workerId) {
         const worker = this.config.workers.find(w => w.id === workerId);
-        const launchBtn = document.querySelector(`#controls-${workerId} button`);
 
         // If worker is disabled, enable it first
         if (!worker.enabled) {
             await this.updateWorkerEnabled(workerId, true);
-            
+
             // Update the checkbox UI
             const checkbox = document.getElementById(`gpu-${workerId}`);
             if (checkbox) {
                 checkbox.checked = true;
             }
-            
-            this.updateSummary();
         }
+
+        // Re-query button AFTER updateWorkerEnabled (which may re-render sidebar)
+        const launchBtn = document.querySelector(`#controls-${workerId} button`);
 
         this.ui.updateStatusDot(workerId, "#f0ad4e", "Launching...", true);
         this.state.setWorkerLaunching(workerId, true);

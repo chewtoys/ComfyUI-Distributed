@@ -22,6 +22,8 @@ def ensure_distributed_state():
         prompt_server.distributed_pending_jobs = {}
     if not hasattr(prompt_server, "distributed_jobs_lock"):
         prompt_server.distributed_jobs_lock = asyncio.Lock()
+    if not hasattr(prompt_server, "distributed_worker_ws"):
+        prompt_server.distributed_worker_ws = {}
 
 
 async def _get_client_session():
@@ -31,9 +33,53 @@ async def _get_client_session():
     return prompt_server._distributed_session
 
 
-def _deepcopy_prompt(prompt_obj):
-    """Return a deep copy of the workflow/prompt dictionary."""
-    return json.loads(json.dumps(prompt_obj))
+class PromptIndex:
+    """Cache prompt metadata for faster worker/master prompt preparation."""
+
+    def __init__(self, prompt_obj):
+        self._prompt_json = json.dumps(prompt_obj)
+        self.nodes_by_class = {}
+        self.class_by_node = {}
+        self.inputs_by_node = {}
+        for node_id, node in _iter_prompt_nodes(prompt_obj):
+            class_type = node.get("class_type")
+            node_id_str = str(node_id)
+            if class_type:
+                self.nodes_by_class.setdefault(class_type, []).append(node_id_str)
+            self.class_by_node[node_id_str] = class_type
+            self.inputs_by_node[node_id_str] = node.get("inputs", {})
+        self._upstream_cache = {}
+
+    def copy_prompt(self):
+        return json.loads(self._prompt_json)
+
+    def nodes_for_class(self, class_name):
+        return self.nodes_by_class.get(class_name, [])
+
+    def has_upstream(self, start_node_id, target_class):
+        cache_key = (str(start_node_id), target_class)
+        if cache_key in self._upstream_cache:
+            return self._upstream_cache[cache_key]
+
+        visited = set()
+        stack = [str(start_node_id)]
+        while stack:
+            node_id = stack.pop()
+            if node_id in visited:
+                continue
+            visited.add(node_id)
+            inputs = self.inputs_by_node.get(node_id, {})
+            for value in inputs.values():
+                if isinstance(value, list) and len(value) == 2:
+                    upstream_id = str(value[0])
+                    if self.class_by_node.get(upstream_id) == target_class:
+                        self._upstream_cache[cache_key] = True
+                        return True
+                    if upstream_id in self.inputs_by_node:
+                        stack.append(upstream_id)
+
+        self._upstream_cache[cache_key] = False
+        return False
 
 
 def _iter_prompt_nodes(prompt_obj):
@@ -48,32 +94,6 @@ def _find_nodes_by_class(prompt_obj, class_name):
         if node.get("class_type") == class_name:
             nodes.append(node_id)
     return nodes
-
-
-def _has_upstream_node(prompt_obj, start_node_id, target_class):
-    """Depth-first search to find if start node depends on target_class."""
-    visited = set()
-    stack = [start_node_id]
-
-    while stack:
-        node_id = stack.pop()
-        if node_id in visited:
-            continue
-        visited.add(node_id)
-        node = prompt_obj.get(node_id)
-        if not node:
-            continue
-        inputs = node.get("inputs", {})
-        for value in inputs.values():
-            if isinstance(value, list) and len(value) == 2:
-                upstream_id = str(value[0])
-                upstream_node = prompt_obj.get(upstream_id)
-                if not upstream_node:
-                    continue
-                if upstream_node.get("class_type") == target_class:
-                    return True
-                stack.append(upstream_id)
-    return False
 
 
 def _find_downstream_nodes(prompt_obj, start_ids):
@@ -176,11 +196,11 @@ async def _ensure_distributed_queue(job_id):
             prompt_server.distributed_pending_jobs[job_id] = asyncio.Queue()
 
 
-def _generate_job_id_map(prompt_obj, prefix):
+def _generate_job_id_map(prompt_index, prefix):
     """Create stable per-node job IDs for distributed nodes."""
     job_map = {}
-    distributed_nodes = _find_nodes_by_class(prompt_obj, "DistributedCollector") + _find_nodes_by_class(
-        prompt_obj, "UltimateSDUpscaleDistributed"
+    distributed_nodes = prompt_index.nodes_for_class("DistributedCollector") + prompt_index.nodes_for_class(
+        "UltimateSDUpscaleDistributed"
     )
     for node_id in distributed_nodes:
         job_map[node_id] = f"{prefix}_{node_id}"
@@ -201,12 +221,19 @@ def _resolve_enabled_workers(config, requested_ids=None):
         elif not worker.get("enabled", False):
             continue
 
+        raw_port = worker.get("port", worker.get("listen_port", 8188))
+        try:
+            port = int(raw_port or 8188)
+        except (TypeError, ValueError):
+            log(f"[Distributed] Invalid port '{raw_port}' for worker {worker_id}; defaulting to 8188.")
+            port = 8188
+
         workers.append(
             {
                 "id": worker_id,
                 "name": worker.get("name", worker_id),
                 "host": worker.get("host"),
-                "port": int(worker.get("port", worker.get("listen_port", 8188)) or 8188),
+                "port": port,
                 "type": worker.get("type", "local"),
             }
         )
@@ -287,7 +314,40 @@ async def _worker_is_active(worker):
         return False
 
 
-async def _dispatch_worker_prompt(worker, prompt_obj, workflow_meta):
+async def _worker_ws_is_active(worker):
+    """Ping worker's websocket endpoint to confirm it's reachable."""
+    session = await _get_client_session()
+    url = _build_worker_url(worker, "/distributed/worker_ws")
+    try:
+        ws = await session.ws_connect(url, heartbeat=20, timeout=3)
+        await ws.close()
+        return True
+    except Exception:
+        return False
+
+
+async def _get_worker_ws_connection(worker):
+    """Return a cached websocket connection to a worker (creating if needed)."""
+    ensure_distributed_state()
+    worker_id = worker.get("id")
+    existing = prompt_server.distributed_worker_ws.get(worker_id)
+    if existing and not existing.closed:
+        return existing
+
+    session = await _get_client_session()
+    url = _build_worker_url(worker, "/distributed/worker_ws")
+    ws = await session.ws_connect(url, heartbeat=20, timeout=10)
+    prompt_server.distributed_worker_ws[worker_id] = ws
+    return ws
+
+
+async def _close_worker_ws(worker_id):
+    ws = prompt_server.distributed_worker_ws.pop(worker_id, None)
+    if ws and not ws.closed:
+        await ws.close()
+
+
+async def _dispatch_worker_prompt(worker, prompt_obj, workflow_meta, client_id=None, use_websocket=False):
     """Send the prepared prompt to a worker ComfyUI instance."""
     url = _build_worker_url(worker, "/prompt")
     payload = {"prompt": prompt_obj}
@@ -296,6 +356,35 @@ async def _dispatch_worker_prompt(worker, prompt_obj, workflow_meta):
         extra_data.setdefault("extra_pnginfo", {})["workflow"] = workflow_meta
     if extra_data:
         payload["extra_data"] = extra_data
+
+    if use_websocket:
+        request_id = uuid.uuid4().hex
+        ws_payload = {
+            "type": "dispatch_prompt",
+            "request_id": request_id,
+            "prompt": prompt_obj,
+            "workflow": workflow_meta,
+            "client_id": client_id,
+        }
+        try:
+            ws = await _get_worker_ws_connection(worker)
+            await ws.send_json(ws_payload)
+            response = await asyncio.wait_for(ws.receive(), timeout=60)
+            if response.type == aiohttp.WSMsgType.TEXT:
+                data = json.loads(response.data or "{}")
+                if (
+                    data.get("type") == "dispatch_ack"
+                    and data.get("request_id") == request_id
+                    and data.get("ok")
+                ):
+                    return
+                error_msg = data.get("error") or "Worker rejected websocket dispatch."
+                raise RuntimeError(error_msg)
+            raise RuntimeError("Unexpected websocket response from worker.")
+        except Exception as exc:
+            worker_id = worker.get("id")
+            await _close_worker_ws(worker_id)
+            log(f"[Distributed] Websocket dispatch failed for worker {worker_id}: {exc}")
 
     session = await _get_client_session()
     async with session.post(
@@ -336,21 +425,21 @@ async def _queue_master_prompt(prompt_obj, workflow_meta, client_id):
 
 
 def _apply_participant_overrides(
-    base_prompt,
+    prompt_copy,
     participant_id,
     enabled_worker_ids,
     job_id_map,
     master_url,
     delegate_master,
+    prompt_index,
 ):
     """Return a prompt copy with hidden inputs configured for master/worker."""
-    prompt_copy = _deepcopy_prompt(base_prompt)
     is_master = participant_id == "master"
     worker_index_map = {wid: idx for idx, wid in enumerate(enabled_worker_ids)}
     enabled_json = json.dumps(enabled_worker_ids)
 
     # Distributed seed nodes
-    for node_id in _find_nodes_by_class(prompt_copy, "DistributedSeed"):
+    for node_id in prompt_index.nodes_for_class("DistributedSeed"):
         node = prompt_copy.get(node_id, {})
         inputs = node.setdefault("inputs", {})
         inputs["is_worker"] = not is_master
@@ -361,11 +450,11 @@ def _apply_participant_overrides(
             inputs["worker_id"] = ""
 
     # Distributed collectors
-    for node_id in _find_nodes_by_class(prompt_copy, "DistributedCollector"):
+    for node_id in prompt_index.nodes_for_class("DistributedCollector"):
         node = prompt_copy.get(node_id, {})
         inputs = node.setdefault("inputs", {})
 
-        if _has_upstream_node(prompt_copy, node_id, "UltimateSDUpscaleDistributed"):
+        if prompt_index.has_upstream(node_id, "UltimateSDUpscaleDistributed"):
             inputs["pass_through"] = True
             continue
 
@@ -385,7 +474,7 @@ def _apply_participant_overrides(
             inputs["delegate_only"] = False
 
     # Distributed upscaler nodes
-    for node_id in _find_nodes_by_class(prompt_copy, "UltimateSDUpscaleDistributed"):
+    for node_id in prompt_index.nodes_for_class("UltimateSDUpscaleDistributed"):
         node = prompt_copy.get(node_id, {})
         inputs = node.setdefault("inputs", {})
         unique_id = job_id_map.get(node_id, node_id)
@@ -418,8 +507,10 @@ async def orchestrate_distributed_execution(
     ensure_distributed_state()
 
     config = load_config()
+    use_websocket = bool(config.get("settings", {}).get("websocket_orchestration", False))
     requested_ids = enabled_worker_ids if enabled_worker_ids is not None else None
     workers = _resolve_enabled_workers(config, requested_ids)
+    prompt_index = PromptIndex(prompt_obj)
 
     # Respect master delegate-only configuration
     if delegate_master is None:
@@ -432,7 +523,11 @@ async def orchestrate_distributed_execution(
     # Filter to active workers
     active_workers = []
     for worker in workers:
-        if await _worker_is_active(worker):
+        if use_websocket:
+            is_active = await _worker_ws_is_active(worker)
+        else:
+            is_active = await _worker_is_active(worker)
+        if is_active:
             active_workers.append(worker)
         else:
             log(f"[Distributed] Worker {worker['name']} ({worker['id']}) is offline, skipping.")
@@ -444,7 +539,7 @@ async def orchestrate_distributed_execution(
     enabled_ids = [worker["id"] for worker in active_workers]
 
     discovery_prefix = f"exec_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
-    job_id_map = _generate_job_id_map(prompt_obj, discovery_prefix)
+    job_id_map = _generate_job_id_map(prompt_index, discovery_prefix)
 
     if not job_id_map:
         prompt_id = await _queue_master_prompt(prompt_obj, workflow_meta, client_id)
@@ -454,13 +549,15 @@ async def orchestrate_distributed_execution(
         await _ensure_distributed_queue(job_id)
 
     master_url = _resolve_master_url()
+    master_prompt = prompt_index.copy_prompt()
     master_prompt = _apply_participant_overrides(
-        prompt_obj,
+        master_prompt,
         "master",
         enabled_ids,
         job_id_map,
         master_url,
         delegate_master,
+        prompt_index,
     )
 
     if delegate_master:
@@ -477,21 +574,31 @@ async def orchestrate_distributed_execution(
         else:
             master_prompt = _prepare_delegate_master_prompt(master_prompt, collector_ids)
 
+    if active_workers:
+        debug_log(
+            "Active distributed workers: "
+            + ", ".join(f"{worker['name']} ({worker['id']})" for worker in active_workers)
+        )
     worker_payloads = []
     for worker in active_workers:
+        worker_prompt = prompt_index.copy_prompt()
         worker_prompt = _apply_participant_overrides(
-            prompt_obj,
+            worker_prompt,
             worker["id"],
             enabled_ids,
             job_id_map,
             master_url,
             delegate_master,
+            prompt_index,
         )
         worker_payloads.append((worker, worker_prompt))
 
     if worker_payloads:
         await asyncio.gather(
-            *[_dispatch_worker_prompt(worker, wprompt, workflow_meta) for worker, wprompt in worker_payloads]
+            *[
+                _dispatch_worker_prompt(worker, wprompt, workflow_meta, client_id, use_websocket=use_websocket)
+                for worker, wprompt in worker_payloads
+            ]
         )
 
     prompt_id = await _queue_master_prompt(master_prompt, workflow_meta, client_id)

@@ -39,6 +39,7 @@ except ImportError:
 def monitor_and_run(master_pid, command):
     """Run command and monitor master process."""
     # Start the actual worker process
+    print(f"[Distributed] Launching worker command: {' '.join(command)}")
     worker_process = subprocess.Popen(command)
     
     print(f"[Distributed] Started worker PID: {worker_process.pid}")
