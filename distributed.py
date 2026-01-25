@@ -4,11 +4,13 @@ from PIL import Image
 import folder_paths
 import os
 import json
+import re
 import asyncio
 import aiohttp
 from aiohttp import web
 import io
 import server
+import execution
 import comfy.model_management
 import subprocess
 import platform
@@ -36,6 +38,7 @@ from .utils.image import tensor_to_pil, pil_to_tensor, ensure_contiguous
 from .utils.process import is_process_alive, terminate_process, get_python_executable
 from .utils.network import handle_api_error, get_server_port, get_server_loop, get_client_session, cleanup_client_session
 from .utils.async_helpers import run_async_in_server_loop
+from .utils.cloudflare import cloudflare_tunnel_manager
 from .utils.constants import (
     WORKER_JOB_TIMEOUT, PROCESS_TERMINATION_TIMEOUT, WORKER_CHECK_INTERVAL, 
     STATUS_CHECK_INTERVAL, CHUNK_SIZE, LOG_TAIL_BYTES, WORKER_LOG_PATTERN, 
@@ -58,6 +61,17 @@ def cleanup():
     loop.close()
 
 atexit.register(cleanup)
+
+def normalize_host(value):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return value
+    host = value.strip()
+    if not host:
+        return host
+    host = re.sub(r"^https?://", "", host, flags=re.IGNORECASE)
+    return host.split("/")[0]
 
 # --- API Endpoints ---
 @server.PromptServer.instance.routes.get("/distributed/config")
@@ -82,6 +96,102 @@ async def queue_status_endpoint(request):
         return web.json_response({"exists": exists, "job_id": job_id})
     except Exception as e:
         return await handle_api_error(request, e, 500)
+
+
+prompt_server = server.PromptServer.instance
+
+
+async def _queue_prompt_payload(prompt_obj, workflow_meta=None, client_id=None):
+    """Validate and queue a prompt via ComfyUI's prompt queue."""
+    payload = {"prompt": prompt_obj}
+    payload = prompt_server.trigger_on_prompt(payload)
+    prompt = payload["prompt"]
+
+    prompt_id = str(uuid.uuid4())
+    valid = await execution.validate_prompt(prompt_id, prompt, None)
+    if not valid[0]:
+        raise RuntimeError(f"Invalid prompt: {valid[1]}")
+
+    extra_data = {}
+    if workflow_meta:
+        extra_data.setdefault("extra_pnginfo", {})["workflow"] = workflow_meta
+    if client_id:
+        extra_data["client_id"] = client_id
+
+    sensitive = {}
+    for key in getattr(execution, "SENSITIVE_EXTRA_DATA_KEYS", []):
+        if key in extra_data:
+            sensitive[key] = extra_data.pop(key)
+
+    number = getattr(prompt_server, "number", 0)
+    prompt_server.number = number + 1
+    prompt_queue_item = (number, prompt_id, prompt, extra_data, valid[2], sensitive)
+    prompt_server.prompt_queue.put(prompt_queue_item)
+    return prompt_id
+
+
+@server.PromptServer.instance.routes.get("/distributed/worker_ws")
+async def worker_ws_endpoint(request):
+    """WebSocket endpoint for worker prompt dispatch."""
+    ws = web.WebSocketResponse(heartbeat=30)
+    await ws.prepare(request)
+
+    async for msg in ws:
+        if msg.type == aiohttp.WSMsgType.TEXT:
+            try:
+                data = json.loads(msg.data or "{}")
+            except json.JSONDecodeError:
+                await ws.send_json({
+                    "type": "dispatch_ack",
+                    "request_id": None,
+                    "ok": False,
+                    "error": "Invalid JSON payload.",
+                })
+                continue
+
+            if data.get("type") != "dispatch_prompt":
+                await ws.send_json({
+                    "type": "dispatch_ack",
+                    "request_id": data.get("request_id"),
+                    "ok": False,
+                    "error": "Unsupported websocket message type.",
+                })
+                continue
+
+            prompt = data.get("prompt")
+            if not isinstance(prompt, dict):
+                await ws.send_json({
+                    "type": "dispatch_ack",
+                    "request_id": data.get("request_id"),
+                    "ok": False,
+                    "error": "Field 'prompt' must be an object.",
+                })
+                continue
+
+            try:
+                prompt_id = await _queue_prompt_payload(
+                    prompt,
+                    workflow_meta=data.get("workflow"),
+                    client_id=data.get("client_id"),
+                )
+                await ws.send_json({
+                    "type": "dispatch_ack",
+                    "request_id": data.get("request_id"),
+                    "ok": True,
+                    "prompt_id": prompt_id,
+                })
+            except Exception as exc:
+                await ws.send_json({
+                    "type": "dispatch_ack",
+                    "request_id": data.get("request_id"),
+                    "ok": False,
+                    "error": str(exc),
+                })
+        elif msg.type == aiohttp.WSMsgType.ERROR:
+            log(f"[Distributed] Worker websocket error: {ws.exception()}")
+
+    return ws
+
 
 @server.PromptServer.instance.routes.post("/distributed/worker/clear_launching")
 async def clear_launching_state(request):
@@ -269,6 +379,49 @@ async def get_network_info_endpoint(request):
             "recommended_ip": None
         })
 
+@server.PromptServer.instance.routes.get("/distributed/tunnel/status")
+async def tunnel_status_endpoint(request):
+    """Return Cloudflare tunnel status and last known details."""
+    try:
+        status = cloudflare_tunnel_manager.get_status()
+        config = load_config()
+        master_host = (config.get("master") or {}).get("host")
+        return web.json_response({
+            "status": "success",
+            "tunnel": status,
+            "master_host": master_host
+        })
+    except Exception as e:
+        return await handle_api_error(request, e, 500)
+
+@server.PromptServer.instance.routes.post("/distributed/tunnel/start")
+async def tunnel_start_endpoint(request):
+    """Start a Cloudflare tunnel pointing at the current ComfyUI server."""
+    try:
+        result = await cloudflare_tunnel_manager.start_tunnel()
+        config = load_config()
+        return web.json_response({
+            "status": "success",
+            "tunnel": result,
+            "master_host": (config.get("master") or {}).get("host")
+        })
+    except Exception as e:
+        return await handle_api_error(request, e, 500)
+
+@server.PromptServer.instance.routes.post("/distributed/tunnel/stop")
+async def tunnel_stop_endpoint(request):
+    """Stop the managed Cloudflare tunnel if running."""
+    try:
+        result = await cloudflare_tunnel_manager.stop_tunnel()
+        config = load_config()
+        return web.json_response({
+            "status": "success",
+            "tunnel": result,
+            "master_host": (config.get("master") or {}).get("host")
+        })
+    except Exception as e:
+        return await handle_api_error(request, e, 500)
+
 @server.PromptServer.instance.routes.get("/distributed/system_info")
 async def get_system_info_endpoint(request):
     """Get system information including machine ID for local worker detection."""
@@ -323,7 +476,7 @@ async def update_worker_endpoint(request):
                     if data["host"] is None:
                         worker.pop("host", None)
                     else:
-                        worker["host"] = data["host"]
+                        worker["host"] = normalize_host(data["host"])
                         
                 # Handle cuda_device field - remove it if None
                 if "cuda_device" in data:
@@ -352,7 +505,7 @@ async def update_worker_endpoint(request):
                 new_worker = {
                     "id": worker_id,
                     "name": data["name"],
-                    "host": data.get("host", "localhost"),
+                    "host": normalize_host(data.get("host", "localhost")),
                     "port": data["port"],
                     "cuda_device": data["cuda_device"],
                     "enabled": data.get("enabled", False),
@@ -629,7 +782,8 @@ async def get_local_worker_status_endpoint(request):
         
         for worker in config.get("workers", []):
             # Only check local workers
-            if not worker.get("host") or worker.get("host") in ["localhost", "127.0.0.1"]:
+            host = normalize_host(worker.get("host")) or ""
+            if not host or host in ["localhost", "127.0.0.1"]:
                 worker_id = worker["id"]
                 port = worker["port"]
                 
@@ -1280,7 +1434,7 @@ async def get_client_session():
 # Local worker detection functions
 async def is_local_worker(worker_config):
     """Check if a worker is running on the same machine as the master."""
-    host = worker_config.get('host', 'localhost')
+    host = normalize_host(worker_config.get('host', 'localhost')) or 'localhost'
     if host in ['localhost', '127.0.0.1', '0.0.0.0', ''] or worker_config.get('type') == 'local':
         return True
     
@@ -1297,7 +1451,7 @@ async def is_same_physical_host(worker_config):
         master_machine_id = get_machine_id()
         
         # Fetch worker's machine ID via API
-        host = worker_config.get('host', 'localhost')
+        host = normalize_host(worker_config.get('host', 'localhost')) or 'localhost'
         port = worker_config.get('port', 8188)
         
         session = await get_client_session()
@@ -1360,11 +1514,11 @@ async def get_comms_channel(worker_id, worker_config):
             return f"http://127.0.0.1:{worker_config['port']}"
     elif worker_config.get('type') == 'cloud' and is_runpod_environment():
         # Runpod same-host optimization (if detected)
-        host = worker_config.get('host', 'localhost')
+        host = normalize_host(worker_config.get('host', 'localhost')) or 'localhost'
         return f"http://{host}:{worker_config['port']}"
     else:
         # Remote worker: use configured endpoint
-        host = worker_config.get('host', 'localhost')
+        host = normalize_host(worker_config.get('host', 'localhost')) or 'localhost'
         return f"http://{host}:{worker_config['port']}"
 
 # Auto-launch workers if enabled
@@ -1391,7 +1545,7 @@ def auto_launch_workers():
                     worker_name = worker.get('name', f'Worker {worker_id}')
                     
                     # Skip remote workers
-                    host = worker.get('host', 'localhost').lower()
+                    host = (normalize_host(worker.get('host', 'localhost')) or 'localhost').lower()
                     if host not in ['localhost', '127.0.0.1', '', None]:
                         debug_log(f"Skipping remote worker {worker_name} (host: {host})")
                         continue
@@ -1445,6 +1599,10 @@ async def async_cleanup_and_exit(signum=None):
         else:
             print("\n[Distributed] Master shutting down, workers will continue running")
             worker_manager.save_processes()
+        try:
+            await cloudflare_tunnel_manager.stop_tunnel()
+        except Exception as tunnel_error:
+            debug_log(f"Error stopping Cloudflare tunnel during shutdown: {tunnel_error}")
     except Exception as e:
         print(f"[Distributed] Error during cleanup: {e}")
     
@@ -1503,6 +1661,17 @@ def sync_cleanup():
         else:
             print("\n[Distributed] Master shutting down, workers will continue running")
             worker_manager.save_processes()
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(cloudflare_tunnel_manager.stop_tunnel())
+            else:
+                loop.run_until_complete(cloudflare_tunnel_manager.stop_tunnel())
+        except RuntimeError:
+            # No running loop; create a temporary one
+            asyncio.run(cloudflare_tunnel_manager.stop_tunnel())
+        except Exception as tunnel_error:
+            debug_log(f"Error stopping Cloudflare tunnel during sync cleanup: {tunnel_error}")
     except Exception as e:
         print(f"[Distributed] Error during cleanup: {e}")
 
@@ -1525,6 +1694,10 @@ if not os.environ.get('COMFYUI_MASTER_PID'):
                     worker_manager.cleanup_all()
                 else:
                     worker_manager.save_processes()
+                try:
+                    asyncio.run(cloudflare_tunnel_manager.stop_tunnel())
+                except Exception as tunnel_error:
+                    print(f"[Distributed] Error stopping Cloudflare tunnel: {tunnel_error}")
             except Exception as cleanup_error:
                 print(f"[Distributed] Error during cleanup: {cleanup_error}")
             sys.exit(0)
@@ -1814,6 +1987,21 @@ async def job_complete_endpoint(request):
                 log(f"Error processing image from worker {worker_id}: {e}")
                 return await handle_api_error(request, f"Image processing error: {e}", 400)
 
+        # Parse audio data if present
+        audio_data = None
+        audio_waveform_field = data.get('audio_waveform')
+        audio_sample_rate = data.get('audio_sample_rate')
+        if audio_waveform_field is not None:
+            try:
+                waveform_bytes = audio_waveform_field.file.read()
+                waveform_buffer = io.BytesIO(waveform_bytes)
+                waveform_tensor = torch.load(waveform_buffer, weights_only=True)
+                sample_rate = int(audio_sample_rate) if audio_sample_rate else 44100
+                audio_data = {"waveform": waveform_tensor, "sample_rate": sample_rate}
+                debug_log(f"Received audio from worker {worker_id}: shape={waveform_tensor.shape}, sample_rate={sample_rate}")
+            except Exception as e:
+                log(f"Error parsing audio from worker {worker_id}: {e}")
+
         # Put batch into queue
         async with prompt_server.distributed_jobs_lock:
             debug_log(f"Current pending jobs: {list(prompt_server.distributed_pending_jobs.keys())}")
@@ -1824,7 +2012,8 @@ async def job_complete_endpoint(request):
                         'worker_id': worker_id,
                         'tensors': tensors,
                         'indices': indices,
-                        'is_last': is_last
+                        'is_last': is_last,
+                        'audio': audio_data
                     })
                     debug_log(f"Received batch result for job {multi_job_id} from worker {worker_id}, size={len(tensors)}")
                 else:
@@ -1833,7 +2022,8 @@ async def job_complete_endpoint(request):
                         'tensor': tensors[0],
                         'worker_id': worker_id,
                         'image_index': int(image_index) if image_index else 0,
-                        'is_last': is_last
+                        'is_last': is_last,
+                        'audio': audio_data
                     })
                     debug_log(f"Received single result for job {multi_job_id} from worker {worker_id}")
                     
@@ -1852,6 +2042,7 @@ class DistributedCollectorNode:
     def INPUT_TYPES(s):
         return {
             "required": { "images": ("IMAGE",) },
+            "optional": { "audio": ("AUDIO",) },
             "hidden": {
                 "multi_job_id": ("STRING", {"default": ""}),
                 "is_worker": ("BOOLEAN", {"default": False}),
@@ -1864,45 +2055,47 @@ class DistributedCollectorNode:
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = ("IMAGE", "AUDIO")
+    RETURN_NAMES = ("images", "audio")
     FUNCTION = "run"
     CATEGORY = "image"
     
-    def run(self, images, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", pass_through=False, delegate_only=False):
+    def run(self, images, audio=None, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", pass_through=False, delegate_only=False):
+        # Create empty audio if not provided
+        empty_audio = {"waveform": torch.zeros(1, 2, 1), "sample_rate": 44100}
+
         if not multi_job_id or pass_through:
             if pass_through:
                 print(f"[Distributed Collector] Pass-through mode enabled, returning images unchanged")
-            return (images,)
+            return (images, audio if audio is not None else empty_audio)
 
         # Use async helper to run in server loop
         result = run_async_in_server_loop(
-            self.execute(images, multi_job_id, is_worker, master_url, enabled_worker_ids, worker_batch_size, worker_id, delegate_only)
+            self.execute(images, audio, multi_job_id, is_worker, master_url, enabled_worker_ids, worker_batch_size, worker_id, delegate_only)
         )
         return result
 
-    async def send_batch_to_master(self, image_batch, multi_job_id, master_url, worker_id):
-        """Send image batch to master, chunked if large."""
+    async def send_batch_to_master(self, image_batch, audio, multi_job_id, master_url, worker_id):
+        """Send image batch and optional audio to master, chunked if large."""
         batch_size = image_batch.shape[0]
-        if batch_size == 0:
+        if batch_size == 0 and audio is None:
             return
-        
-        
+
         for start in range(0, batch_size, MAX_BATCH):
             chunk = image_batch[start:start + MAX_BATCH]
             chunk_size = chunk.shape[0]
             is_chunk_last = (start + chunk_size == batch_size)  # True only for final chunk
-            
-            
+
             data = aiohttp.FormData()
             data.add_field('multi_job_id', multi_job_id)
             data.add_field('worker_id', str(worker_id))
             data.add_field('is_last', str(is_chunk_last))
             data.add_field('batch_size', str(chunk_size))
-            
+
             # Chunk metadata: Absolute index from full batch
             metadata = [{'index': start + j} for j in range(chunk_size)]
             data.add_field('images_metadata', json.dumps(metadata), content_type='application/json')
-            
+
             # Add chunk images
             for j in range(chunk_size):
                 # Convert tensor slice to PIL
@@ -1911,9 +2104,21 @@ class DistributedCollectorNode:
                 img.save(byte_io, format='PNG', compress_level=0)
                 byte_io.seek(0)
                 data.add_field(f'image_{j}', byte_io, filename=f'image_{j}.png', content_type='image/png')
-            
+
+            # Add audio data only on the final chunk to avoid duplication
+            if is_chunk_last and audio is not None:
+                waveform = audio.get("waveform")
+                sample_rate = audio.get("sample_rate", 44100)
+                if waveform is not None and waveform.numel() > 0:
+                    # Serialize waveform tensor to bytes
+                    audio_bytes = io.BytesIO()
+                    torch.save(waveform, audio_bytes)
+                    audio_bytes.seek(0)
+                    data.add_field('audio_waveform', audio_bytes, filename='audio.pt', content_type='application/octet-stream')
+                    data.add_field('audio_sample_rate', str(sample_rate))
+                    debug_log(f"Worker - Including audio: shape={waveform.shape}, sample_rate={sample_rate}")
+
             try:
-                
                 session = await get_client_session()
                 url = f"{master_url}/distributed/job_complete"
                 async with session.post(url, data=data) as response:
@@ -1923,36 +2128,76 @@ class DistributedCollectorNode:
                 debug_log(f"Worker - Full error details: URL={url}")
                 raise  # Re-raise to handle at caller level
 
+    def _combine_audio(self, master_audio, worker_audio, empty_audio):
+        """Combine audio from master and workers into a single audio output."""
+        audio_pieces = []
+        sample_rate = 44100
 
-    async def execute(self, images, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False):
+        # Add master audio first if present
+        if master_audio is not None:
+            waveform = master_audio.get("waveform")
+            if waveform is not None and waveform.numel() > 0:
+                audio_pieces.append(waveform)
+                sample_rate = master_audio.get("sample_rate", 44100)
+
+        # Add worker audio in sorted order
+        for worker_id_str in sorted(worker_audio.keys()):
+            w_audio = worker_audio[worker_id_str]
+            if w_audio is not None:
+                waveform = w_audio.get("waveform")
+                if waveform is not None and waveform.numel() > 0:
+                    audio_pieces.append(waveform)
+                    # Use first available sample rate
+                    if sample_rate == 44100:
+                        sample_rate = w_audio.get("sample_rate", 44100)
+
+        if not audio_pieces:
+            return empty_audio
+
+        try:
+            # Concatenate along the samples dimension (dim=-1)
+            # Ensure all pieces have same batch and channel dimensions
+            combined_waveform = torch.cat(audio_pieces, dim=-1)
+            debug_log(f"Master - Combined audio: {len(audio_pieces)} pieces, final shape={combined_waveform.shape}")
+            return {"waveform": combined_waveform, "sample_rate": sample_rate}
+        except Exception as e:
+            log(f"Master - Error combining audio: {e}")
+            return empty_audio
+
+    async def execute(self, images, audio, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False):
+        empty_audio = {"waveform": torch.zeros(1, 2, 1), "sample_rate": 44100}
+
         if is_worker:
-            # Worker mode: send images to master in a single batch
+            # Worker mode: send images and audio to master in a single batch
             debug_log(f"Worker - Job {multi_job_id} complete. Sending {images.shape[0]} image(s) to master")
-            await self.send_batch_to_master(images, multi_job_id, master_url, worker_id)
-            return (images,)
+            await self.send_batch_to_master(images, audio, multi_job_id, master_url, worker_id)
+            return (images, audio if audio is not None else empty_audio)
         else:
             delegate_mode = delegate_only or is_master_delegate_only()
-            # Master mode: collect images from workers
+            # Master mode: collect images and audio from workers
             enabled_workers = json.loads(enabled_worker_ids)
             num_workers = len(enabled_workers)
             if num_workers == 0:
-                return (images,)
-            
+                return (images, audio if audio is not None else empty_audio)
+
             if delegate_mode:
                 master_batch_size = 0
                 images_on_cpu = None
+                master_audio = None
                 debug_log(f"Master - Job {multi_job_id}: Delegate-only mode enabled, collecting exclusively from {num_workers} workers")
             else:
                 images_on_cpu = images.cpu()
                 master_batch_size = images.shape[0]
+                master_audio = audio  # Keep master's audio for later
                 debug_log(f"Master - Job {multi_job_id}: Master has {master_batch_size} images, collecting from {num_workers} workers...")
-                
+
                 # Ensure master images are contiguous
                 images_on_cpu = ensure_contiguous(images_on_cpu)
-            
-            
-            # Initialize storage for collected images
+
+
+            # Initialize storage for collected images and audio
             worker_images = {}  # Dict to store images by worker_id and index
+            worker_audio = {}   # Dict to store audio by worker_id
             
             # Get the existing queue - it should already exist from prepare_job
             async with prompt_server.distributed_jobs_lock:
@@ -2020,19 +2265,25 @@ class DistributedCollectorNode:
                             # Single image mode (backward compat)
                             image_index = result['image_index']
                             tensor = result['tensor']
-                            
+
                             debug_log(f"Master - Got single result from worker {worker_id}, image {image_index}, is_last={is_last}")
-                            
+
                             if worker_id not in worker_images:
                                 worker_images[worker_id] = {}
                             worker_images[worker_id][image_index] = tensor
-                            
+
                             collected_count += 1
-                        
+
+                        # Collect audio data if present
+                        result_audio = result.get('audio')
+                        if result_audio is not None:
+                            worker_audio[worker_id] = result_audio
+                            debug_log(f"Master - Got audio from worker {worker_id}")
+
                         # Record activity and refresh timeout baseline
                         last_activity = time.time()
                         base_timeout = float(get_worker_timeout_seconds())
-                        
+
                         if is_last:
                             workers_done.add(worker_id)
                             p.update(1)  # +1 per completed worker
@@ -2058,7 +2309,7 @@ class DistributedCollectorNode:
                                 if not wrec:
                                     debug_log(f"Collector probe: worker {wid} not found in config")
                                     continue
-                                host = wrec.get('host') or 'localhost'
+                                host = normalize_host(wrec.get('host') or 'localhost') or 'localhost'
                                 port = int(wrec.get('port', 8188))
                                 url = f"http://{host}:{port}/prompt"
                                 try:
@@ -2188,11 +2439,15 @@ class DistributedCollectorNode:
                 # Ensure the combined tensor is contiguous and properly formatted
                 combined = ensure_contiguous(combined)
                 debug_log(f"Master - Job {multi_job_id} complete. Combined {combined.shape[0]} images total (master: {master_batch_size}, workers: {combined.shape[0] - master_batch_size})")
-                return (combined,)
+
+                # Combine audio from master and workers
+                combined_audio = self._combine_audio(master_audio, worker_audio, empty_audio)
+
+                return (combined, combined_audio)
             except Exception as e:
                 log(f"Master - Error combining images: {e}")
                 # Return just the master images as fallback
-                return (images,)
+                return (images, audio if audio is not None else empty_audio)
 
 # --- Distributor Node ---
 class DistributedSeed:
@@ -2255,6 +2510,68 @@ class AnyType(str):
         return False
 
 any_type = AnyType("*")
+
+class DistributedModelName:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"default": ""}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
+        }
+
+    RETURN_TYPES = (any_type,)
+    RETURN_NAMES = ("output",)
+    FUNCTION = "log_input"
+    OUTPUT_NODE = True
+    CATEGORY = "utils"
+
+    def _stringify(self, value):
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        try:
+            return json.dumps(value, indent=4)
+        except Exception:
+            return str(value)
+
+    def _update_workflow(self, extra_pnginfo, unique_id, values):
+        if not extra_pnginfo:
+            return
+        info = extra_pnginfo[0] if isinstance(extra_pnginfo, list) else extra_pnginfo
+        if not isinstance(info, dict) or "workflow" not in info:
+            return
+        node_id = None
+        if isinstance(unique_id, list) and unique_id:
+            node_id = str(unique_id[0])
+        elif unique_id is not None:
+            node_id = str(unique_id)
+        if not node_id:
+            return
+        workflow = info["workflow"]
+        node = next((x for x in workflow["nodes"] if str(x.get("id")) == node_id), None)
+        if node:
+            node["widgets_values"] = [values]
+
+    def log_input(self, text, unique_id=None, extra_pnginfo=None):
+        values = []
+        if isinstance(text, list):
+            for val in text:
+                values.append(self._stringify(val))
+        else:
+            values.append(self._stringify(text))
+
+        # Keep widget display in workflow metadata if available.
+        self._update_workflow(extra_pnginfo, unique_id, values)
+
+        if isinstance(values, list) and len(values) == 1:
+            return {"ui": {"text": values}, "result": (values[0],)}
+        return {"ui": {"text": values}, "result": (values,)}
 
 class ByPassTypeTuple(tuple):
     def __getitem__(self, index):
@@ -2323,6 +2640,75 @@ class ImageBatchDivider:
         return tuple(outputs)
 
 
+class AudioBatchDivider:
+    """Divides an audio waveform into multiple parts along the time/samples dimension."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "divide_by": ("INT", {
+                    "default": 2,
+                    "min": 1,
+                    "max": 10,
+                    "step": 1,
+                    "display": "number",
+                    "tooltip": "Number of parts to divide the audio into"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ByPassTypeTuple(("AUDIO",))  # Flexible for variable outputs
+    RETURN_NAMES = ByPassTypeTuple(tuple([f"audio_{i+1}" for i in range(10)]))
+    FUNCTION = "divide_audio"
+    OUTPUT_NODE = True
+    CATEGORY = "audio"
+
+    def divide_audio(self, audio, divide_by):
+        import torch
+
+        waveform = audio.get("waveform")
+        sample_rate = audio.get("sample_rate", 44100)
+
+        if waveform is None or waveform.numel() == 0:
+            # Return empty audio for all outputs
+            empty_audio = {"waveform": torch.zeros(1, 2, 1), "sample_rate": sample_rate}
+            return tuple([empty_audio] * 10)
+
+        total_splits = min(divide_by, 10)  # Cap to max 10
+
+        # Waveform shape: [batch, channels, samples]
+        total_samples = waveform.shape[-1]
+        samples_per_split = total_samples // total_splits
+        remainder = total_samples % total_splits
+
+        outputs = []
+        start_idx = 0
+
+        for i in range(total_splits):
+            current_samples = samples_per_split + (1 if i < remainder else 0)
+            end_idx = start_idx + current_samples
+            split_waveform = waveform[..., start_idx:end_idx]
+            outputs.append({
+                "waveform": split_waveform,
+                "sample_rate": sample_rate
+            })
+            start_idx = end_idx
+
+        # Pad with empty audio up to max (10) to match RETURN_TYPES length
+        empty_audio = {
+            "waveform": torch.zeros(waveform.shape[0], waveform.shape[1], 1,
+                                    dtype=waveform.dtype, device=waveform.device),
+            "sample_rate": sample_rate
+        }
+
+        while len(outputs) < 10:
+            outputs.append(empty_audio)
+
+        return tuple(outputs)
+
+
 class DistributedEmptyImage:
     """Produces an empty IMAGE batch used when the master delegates all work."""
 
@@ -2348,15 +2734,167 @@ class DistributedEmptyImage:
         return (tensor,)
 
 
-NODE_CLASS_MAPPINGS = { 
+# --- Distributed Queue Node ---
+class DistributedQueueNode:
+    """Routes entire workflows to the least-busy worker for job scheduling/load balancing."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+                "client_id": "CLIENT_ID",
+                "skip_dispatch": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("worker_id", "prompt_id")
+    FUNCTION = "queue"
+    OUTPUT_NODE = True
+    CATEGORY = "utils"
+
+    def queue(self, prompt=None, extra_pnginfo=None, client_id=None, skip_dispatch=False):
+        if skip_dispatch:
+            debug_log("DistributedQueue: skip_dispatch enabled; not dispatching.")
+            return ("", "")
+        if not prompt:
+            log("DistributedQueue: No prompt supplied; skipping dispatch.")
+            return ("", "")
+
+        return run_async_in_server_loop(
+            self._queue_on_worker(prompt, extra_pnginfo, client_id)
+        )
+
+    async def _queue_on_worker(self, prompt_obj, workflow_meta, client_id):
+        config = load_config()
+        enabled_workers = [
+            worker for worker in config.get("workers", [])
+            if worker.get("enabled", False)
+        ]
+
+        if not enabled_workers:
+            log("DistributedQueue: No enabled workers found.")
+            return ("", "")
+
+        statuses = await self._fetch_worker_statuses(enabled_workers)
+        if not statuses:
+            log("DistributedQueue: No reachable workers found.")
+            return ("", "")
+
+        selected = self._select_worker(statuses)
+        worker = selected["worker"]
+        queue_remaining = selected["queue_remaining"]
+
+        prompt_copy = json.loads(json.dumps(prompt_obj))
+        self._mark_skip_dispatch(prompt_copy)
+
+        payload = {"prompt": prompt_copy}
+        extra_data = {}
+        if workflow_meta:
+            extra_data.setdefault("extra_pnginfo", {})["workflow"] = workflow_meta
+        if client_id:
+            extra_data["client_id"] = client_id
+        if extra_data:
+            payload["extra_data"] = extra_data
+
+        url = self._build_worker_url(worker, "/prompt")
+        session = await get_client_session()
+        async with session.post(
+            url,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
+            resp.raise_for_status()
+            response_payload = await resp.json()
+
+        prompt_id = str(response_payload.get("prompt_id", ""))
+        worker_id = str(worker.get("id", ""))
+        log(
+            f"DistributedQueue: queued prompt {prompt_id} on worker {worker_id} (queue_remaining={queue_remaining})."
+        )
+        return (worker_id, prompt_id)
+
+    async def _fetch_worker_statuses(self, workers):
+        session = await get_client_session()
+        statuses = []
+        for worker in workers:
+            url = self._build_worker_url(worker, "/prompt")
+            try:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=3),
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    queue_remaining = int(data.get("exec_info", {}).get("queue_remaining", 0))
+                    statuses.append({
+                        "worker": worker,
+                        "queue_remaining": queue_remaining,
+                    })
+            except Exception as e:
+                debug_log(f"DistributedQueue: Worker status check failed ({url}): {e}")
+
+        return statuses
+
+    def _select_worker(self, statuses):
+        idle_workers = [status for status in statuses if status["queue_remaining"] == 0]
+        if idle_workers:
+            return self._select_round_robin(idle_workers)
+        return min(statuses, key=lambda status: status["queue_remaining"])
+
+    def _select_round_robin(self, statuses):
+        prompt_server = server.PromptServer.instance
+        if not hasattr(prompt_server, "distributed_queue_rr_index"):
+            prompt_server.distributed_queue_rr_index = 0
+
+        index = prompt_server.distributed_queue_rr_index % len(statuses)
+        prompt_server.distributed_queue_rr_index += 1
+        return statuses[index]
+
+    def _mark_skip_dispatch(self, prompt_obj):
+        for node in prompt_obj.values():
+            if isinstance(node, dict) and node.get("class_type") == "DistributedQueue":
+                inputs = node.setdefault("inputs", {})
+                inputs["skip_dispatch"] = True
+
+    def _build_worker_url(self, worker, endpoint=""):
+        host = (worker.get("host") or "").strip()
+        port = int(worker.get("port", worker.get("listen_port", 8188)) or 8188)
+
+        if not host:
+            host = getattr(server.PromptServer.instance, "address", "127.0.0.1") or "127.0.0.1"
+
+        if host.startswith(("http://", "https://")):
+            base = host.rstrip("/")
+        else:
+            is_cloud = worker.get("type") == "cloud" or host.endswith(".proxy.runpod.net") or port == 443
+            scheme = "https" if is_cloud else "http"
+            default_port = 443 if scheme == "https" else 80
+            port_part = "" if port == default_port else f":{port}"
+            base = f"{scheme}://{host}{port_part}"
+
+        return f"{base}{endpoint}"
+
+
+NODE_CLASS_MAPPINGS = {
+    "DistributedQueue": DistributedQueueNode,
     "DistributedCollector": DistributedCollectorNode,
     "DistributedSeed": DistributedSeed,
+    "DistributedModelName": DistributedModelName,
     "ImageBatchDivider": ImageBatchDivider,
+    "AudioBatchDivider": AudioBatchDivider,
     "DistributedEmptyImage": DistributedEmptyImage,
 }
-NODE_DISPLAY_NAME_MAPPINGS = { 
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "DistributedQueue": "Distributed Queue",
     "DistributedCollector": "Distributed Collector",
     "DistributedSeed": "Distributed Seed",
+    "DistributedModelName": "Distributed Model Name",
     "ImageBatchDivider": "Image Batch Divider",
+    "AudioBatchDivider": "Audio Batch Divider",
     "DistributedEmptyImage": "Distributed Empty Image",
 }
