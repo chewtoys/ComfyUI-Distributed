@@ -154,6 +154,21 @@ Control your distributed cluster programmatically without opening the browser.
 
 ---
 
+## Nodes
+
+| Node | Description |
+|------|-------------|
+| **Distributed Seed** | Generates unique seeds for each worker |
+| **Distributed Collector** | Collects results (image/video frames and optionally audio) from all workers back to the master |
+| **Distributed Queue** | Routes the entire workflow to the least-busy worker for load balancing (don't use Distributed Collector with this) |
+| **Ultimate SD Upscale Distributed** | Distributes upscale tiles across workers |
+| **Image Batch Divider** | Splits image batches for multi-GPU output |
+| **Audio Batch Divider** | Splits audio batches for multi-GPU output |
+| **Distributed Model Name** | Passes model paths to workers, enabling workflows to use models not present on the master in orchestrator-only mode |
+| **Distributed Empty Image** | Creates placeholder images for workflow initialization |
+
+---
+
 ## FAQ
 
 <details>
@@ -173,12 +188,17 @@ Currently, it is not compatible with the ComfyUI desktop app.
 
 <details>
 <summary>Can I combine my RTX 5090 with a GTX 980 to get faster results?</summary>
-Yes, you can combine different GPUs, but performance is optimized when using similar GPUs. A significant performance imbalance between GPUs may cause bottlenecks. For upscaling, setting `static_distribution` to `false` allows the faster GPU to handle more processing, which can mitigate some bottlenecks. Note that this setting only applies to upscaling tasks.
+Yes, you can combine different GPUs, but performance is optimized when using similar GPUs. A significant performance imbalance between GPUs may cause bottlenecks.
 </details>
 
 <details>
 <summary>Does this work with cloud providers?</summary>
 Yes, it is compatible with cloud providers. Refer to the setup guides for detailed instructions.
+</details>
+
+<details>
+<summary>Can I use my main machine just to coordinate workers without rendering?</summary>
+Yes. Open the Distributed panel and uncheck the master toggle to run in orchestrator-only mode. The master will distribute work to workers but won't render locally. If all workers become unavailable, the master automatically re-enables to ensure your workflow still runs.
 </details>
 
 <details>
@@ -203,4 +223,5 @@ If my custom nodes have added value to your workflow, consider fueling future de
 Your support helps keep this project thriving.
 
 Buy me a coffee at: https://buymeacoffee.com/robertvoy
+
 
