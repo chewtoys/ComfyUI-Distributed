@@ -91,6 +91,23 @@ export const PULSE_ANIMATION_CSS = `
         opacity: 1;
         padding: 12px 0;
     }
+
+    /* Cloudflare tunnel spinner */
+    @keyframes tunnel-spin {
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
+    }
+    .tunnel-spinner {
+        width: 14px;
+        height: 14px;
+        border: 2px solid rgba(255, 255, 255, 0.35);
+        border-top-color: #fff;
+        border-radius: 50%;
+        display: inline-block;
+        animation: tunnel-spin 0.9s linear infinite;
+        margin-right: 8px;
+        vertical-align: middle;
+    }
 `;
 
 export const UI_STYLES = {

@@ -1,0 +1,4 @@
+bin/
+logs/
+gpu_config.json
+__pycache__/
