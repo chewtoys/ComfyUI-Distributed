@@ -165,7 +165,7 @@ Control your distributed cluster programmatically without opening the browser.
 | **Image Batch Divider** | Splits image batches for multi-GPU output |
 | **Audio Batch Divider** | Splits audio batches for multi-GPU output |
 | **Distributed Model Name** | Passes model paths to workers, enabling workflows to use models not present on the master in orchestrator-only mode |
-| **Distributed Empty Image** | Creates placeholder images for workflow initialization |
+| **Distributed Empty Image** | Produces an empty IMAGE batch used when the master delegates all work |
 
 ---
 
@@ -223,5 +223,6 @@ If my custom nodes have added value to your workflow, consider fueling future de
 Your support helps keep this project thriving.
 
 Buy me a coffee at: https://buymeacoffee.com/robertvoy
+
 
 
