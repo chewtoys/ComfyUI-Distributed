@@ -2,6 +2,8 @@
 Network and API utilities for ComfyUI-Distributed.
 """
 import aiohttp
+import re
+import server
 from aiohttp import web
 from .logging import debug_log
 
@@ -39,3 +41,34 @@ def get_server_loop():
     import server
     return server.PromptServer.instance.loop
 
+
+def normalize_host(value):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return value
+    host = value.strip()
+    if not host:
+        return host
+    host = re.sub(r"^https?://", "", host, flags=re.IGNORECASE)
+    return host.split("/")[0]
+
+
+def build_worker_url(worker, endpoint=""):
+    """Construct the worker base URL with optional endpoint."""
+    host = (worker.get("host") or "").strip()
+    port = int(worker.get("port", worker.get("listen_port", 8188)) or 8188)
+
+    if not host:
+        host = getattr(server.PromptServer.instance, "address", "127.0.0.1") or "127.0.0.1"
+
+    if host.startswith(("http://", "https://")):
+        base = host.rstrip("/")
+    else:
+        is_cloud = worker.get("type") == "cloud" or host.endswith(".proxy.runpod.net") or port == 443
+        scheme = "https" if is_cloud else "http"
+        default_port = 443 if scheme == "https" else 80
+        port_part = "" if port == default_port else f":{port}"
+        base = f"{scheme}://{host}{port_part}"
+
+    return f"{base}{endpoint}"
