@@ -22,6 +22,8 @@ prompt_server = _server.PromptServer.instance
 
 
 class DistributedCollectorNode:
+    EMPTY_AUDIO = {"waveform": torch.zeros(1, 2, 1), "sample_rate": 44100}
+
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -148,21 +150,76 @@ class DistributedCollectorNode:
             log(f"[Distributed] Master - Audio combination failed, returning silence: {e}")
             return empty_audio
 
-    async def execute(self, images, audio, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False):
-        empty_audio = {"waveform": torch.zeros(1, 2, 1), "sample_rate": 44100}
+    def _store_worker_result(self, worker_images: dict, item: dict) -> int:
+        """Store one queue item (batch or single image) in worker_images in-place.
 
+        Handles two formats:
+        - Batch mode: item has 'tensors' list and optional 'indices' list (index-aware)
+        - Single mode: item has 'image_index' int and 'tensor'
+
+        Returns the number of images stored.
+        """
+        worker_id = item['worker_id']
+        tensors = item.get('tensors', [])
+        if tensors:
+            worker_images.setdefault(worker_id, {})
+            indices = item.get('indices', [])
+            if indices:
+                for i, tensor in enumerate(tensors):
+                    worker_images[worker_id][indices[i]] = tensor
+            else:
+                for idx, tensor in enumerate(tensors):
+                    worker_images[worker_id][idx] = tensor
+            return len(tensors)
+        else:
+            worker_images.setdefault(worker_id, {})
+            worker_images[worker_id][item['image_index']] = item['tensor']
+            return 1
+
+    def _reorder_and_combine_tensors(
+        self,
+        worker_images: dict,
+        master_batch_size: int,
+        images_on_cpu,
+        delegate_mode: bool,
+        fallback_images,
+    ) -> torch.Tensor:
+        """Assemble final tensor: master images first, then workers sorted by ID and index."""
+        ordered_tensors = []
+        if not delegate_mode and images_on_cpu is not None:
+            for i in range(master_batch_size):
+                ordered_tensors.append(images_on_cpu[i:i+1])
+        for worker_id_str in sorted(worker_images.keys()):
+            for idx in sorted(worker_images[worker_id_str].keys()):
+                ordered_tensors.append(worker_images[worker_id_str][idx])
+
+        cpu_tensors = []
+        for t in ordered_tensors:
+            if t.is_cuda:
+                t = t.cpu()
+            t = ensure_contiguous(t)
+            cpu_tensors.append(t)
+
+        if cpu_tensors:
+            return ensure_contiguous(torch.cat(cpu_tensors, dim=0))
+        elif fallback_images is not None:
+            return ensure_contiguous(fallback_images)
+        else:
+            raise ValueError("No image data collected from master or workers")
+
+    async def execute(self, images, audio, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False):
         if is_worker:
             # Worker mode: send images and audio to master in a single batch
             debug_log(f"Worker - Job {multi_job_id} complete. Sending {images.shape[0]} image(s) to master")
             await self.send_batch_to_master(images, audio, multi_job_id, master_url, worker_id)
-            return (images, audio if audio is not None else empty_audio)
+            return (images, audio if audio is not None else self.EMPTY_AUDIO)
         else:
             delegate_mode = delegate_only or is_master_delegate_only()
             # Master mode: collect images and audio from workers
             enabled_workers = json.loads(enabled_worker_ids)
             num_workers = len(enabled_workers)
             if num_workers == 0:
-                return (images, audio if audio is not None else empty_audio)
+                return (images, audio if audio is not None else self.EMPTY_AUDIO)
 
             if delegate_mode:
                 master_batch_size = 0
@@ -226,37 +283,12 @@ class DistributedCollectorNode:
                         
                         # Check if batch mode
                         tensors = result.get('tensors', [])
-                        indices = result.get('indices', [])  # Get the indices
+                        count = self._store_worker_result(worker_images, result)
+                        collected_count += count
                         if tensors:
-                            # Batch mode
                             debug_log(f"Master - Got batch from worker {worker_id}, size={len(tensors)}, is_last={is_last}")
-                            
-                            if worker_id not in worker_images:
-                                worker_images[worker_id] = {}
-                            
-                            # Use actual indices if available, otherwise fall back to sequential
-                            if indices:
-                                for i, tensor in enumerate(tensors):
-                                    actual_idx = indices[i]
-                                    worker_images[worker_id][actual_idx] = tensor
-                            else:
-                                # Fallback for backward compatibility
-                                for idx, tensor in enumerate(tensors):
-                                    worker_images[worker_id][idx] = tensor
-                            
-                            collected_count += len(tensors)
                         else:
-                            # Single image mode (backward compat)
-                            image_index = result['image_index']
-                            tensor = result['tensor']
-
-                            debug_log(f"Master - Got single result from worker {worker_id}, image {image_index}, is_last={is_last}")
-
-                            if worker_id not in worker_images:
-                                worker_images[worker_id] = {}
-                            worker_images[worker_id][image_index] = tensor
-
-                            collected_count += 1
+                            debug_log(f"Master - Got single result from worker {worker_id}, image {result.get('image_index', 0)}, is_last={is_last}")
 
                         # Collect audio data if present
                         result_audio = result.get('audio')
@@ -343,28 +375,8 @@ class DistributedCollectorNode:
                                     for item in remaining_items:
                                         worker_id = item['worker_id']
                                         is_last = item.get('is_last', False)
-                                        
-                                        # Check if batch mode
-                                        tensors = item.get('tensors', [])
-                                        if tensors:
-                                            # Batch mode
-                                            if worker_id not in worker_images:
-                                                worker_images[worker_id] = {}
-                                            
-                                            for idx, tensor in enumerate(tensors):
-                                                worker_images[worker_id][idx] = tensor
-                                            
-                                            collected_count += len(tensors)
-                                        else:
-                                            # Single image mode
-                                            image_index = item['image_index']
-                                            tensor = item['tensor']
-                                            
-                                            if worker_id not in worker_images:
-                                                worker_images[worker_id] = {}
-                                            worker_images[worker_id][image_index] = tensor
-                                            
-                                            collected_count += 1
+
+                                        collected_count += self._store_worker_result(worker_images, item)
                                         
                                         if is_last:
                                             workers_done.add(worker_id)
@@ -386,49 +398,18 @@ class DistributedCollectorNode:
                 if multi_job_id in prompt_server.distributed_pending_jobs:
                     del prompt_server.distributed_pending_jobs[multi_job_id]
 
-            # Reorder images according to seed distribution pattern
-            # Pattern: master img 1, master img 2, worker 1 img 1, worker 1 img 2, worker 2 img 1, worker 2 img 2, etc.
-            ordered_tensors = []
-            
-            # Add master images first (if any)
-            if not delegate_mode and images_on_cpu is not None:
-                for i in range(master_batch_size):
-                    ordered_tensors.append(images_on_cpu[i:i+1])
-            
-            # Add worker images in order
-            # The worker IDs in worker_images are already strings (e.g., "1", "2")
-            # Just iterate through what we actually received
-            for worker_id_str in sorted(worker_images.keys()):
-                # Sort by image index for each worker
-                for idx in sorted(worker_images[worker_id_str].keys()):
-                    ordered_tensors.append(worker_images[worker_id_str][idx])
-            
-            # Ensure all tensors are on CPU and properly formatted before concatenation
-            cpu_tensors = []
-            for t in ordered_tensors:
-                if t.is_cuda:
-                    t = t.cpu()
-                # Ensure tensor is contiguous in memory
-                t = ensure_contiguous(t)
-                cpu_tensors.append(t)
-            
             try:
-                if cpu_tensors:
-                    combined = torch.cat(cpu_tensors, dim=0)
-                else:
-                    # No tensors collected (likely delegate mode with no worker output)
-                    combined = ensure_contiguous(images) if images is not None else images
-                    if combined is None:
-                        raise ValueError("No image data collected from master or workers")
-                # Ensure the combined tensor is contiguous and properly formatted
-                combined = ensure_contiguous(combined)
-                debug_log(f"Master - Job {multi_job_id} complete. Combined {combined.shape[0]} images total (master: {master_batch_size}, workers: {combined.shape[0] - master_batch_size})")
+                combined = self._reorder_and_combine_tensors(
+                    worker_images, master_batch_size, images_on_cpu, delegate_mode, images
+                )
+                debug_log(f"Master - Job {multi_job_id} complete. Combined {combined.shape[0]} images total "
+                          f"(master: {master_batch_size}, workers: {combined.shape[0] - master_batch_size})")
 
                 # Combine audio from master and workers
-                combined_audio = self._combine_audio(master_audio, worker_audio, empty_audio)
+                combined_audio = self._combine_audio(master_audio, worker_audio, self.EMPTY_AUDIO)
 
                 return (combined, combined_audio)
             except Exception as e:
                 log(f"Master - Error combining images: {e}")
                 # Return just the master images as fallback
-                return (images, audio if audio is not None else empty_audio)
+                return (images, audio if audio is not None else self.EMPTY_AUDIO)

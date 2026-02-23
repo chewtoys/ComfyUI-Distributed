@@ -439,6 +439,70 @@ async def _queue_master_prompt(prompt_obj, workflow_meta, client_id):
     return prompt_id
 
 
+def _override_seed_nodes(prompt_copy, prompt_index, is_master, participant_id, worker_index_map):
+    """Configure DistributedSeed nodes for master or worker role."""
+    for node_id in prompt_index.nodes_for_class("DistributedSeed"):
+        inputs = prompt_copy.setdefault(node_id, {}).setdefault("inputs", {})
+        inputs["is_worker"] = not is_master
+        if is_master:
+            inputs["worker_id"] = ""
+        else:
+            inputs["worker_id"] = f"worker_{worker_index_map.get(participant_id, 0)}"
+
+
+def _override_collector_nodes(
+    prompt_copy,
+    prompt_index,
+    is_master,
+    participant_id,
+    job_id_map,
+    master_url,
+    enabled_json,
+    delegate_master,
+):
+    """Configure DistributedCollector nodes for master or worker role."""
+    for node_id in prompt_index.nodes_for_class("DistributedCollector"):
+        if prompt_index.has_upstream(node_id, "UltimateSDUpscaleDistributed"):
+            prompt_copy.setdefault(node_id, {}).setdefault("inputs", {})["pass_through"] = True
+            continue
+
+        inputs = prompt_copy.setdefault(node_id, {}).setdefault("inputs", {})
+        inputs["multi_job_id"] = job_id_map.get(node_id, node_id)
+        inputs["is_worker"] = not is_master
+        inputs["enabled_worker_ids"] = enabled_json
+        if is_master:
+            inputs["delegate_only"] = bool(delegate_master)
+            inputs.pop("master_url", None)
+            inputs.pop("worker_id", None)
+        else:
+            inputs["master_url"] = master_url
+            inputs["worker_id"] = participant_id
+            inputs["delegate_only"] = False
+
+
+def _override_upscale_nodes(
+    prompt_copy,
+    prompt_index,
+    is_master,
+    participant_id,
+    job_id_map,
+    master_url,
+    enabled_json,
+):
+    """Configure UltimateSDUpscaleDistributed nodes for master or worker role."""
+    for node_id in prompt_index.nodes_for_class("UltimateSDUpscaleDistributed"):
+        inputs = prompt_copy.setdefault(node_id, {}).setdefault("inputs", {})
+        inputs["multi_job_id"] = job_id_map.get(node_id, node_id)
+        inputs["is_worker"] = not is_master
+        inputs["enabled_worker_ids"] = enabled_json
+        if is_master:
+            inputs.pop("master_url", None)
+            inputs.pop("worker_id", None)
+        else:
+            inputs["master_url"] = master_url
+            inputs["worker_id"] = participant_id
+
+
 def _apply_participant_overrides(
     prompt_copy,
     participant_id,
@@ -453,58 +517,52 @@ def _apply_participant_overrides(
     worker_index_map = {wid: idx for idx, wid in enumerate(enabled_worker_ids)}
     enabled_json = json.dumps(enabled_worker_ids)
 
-    # Distributed seed nodes
-    for node_id in prompt_index.nodes_for_class("DistributedSeed"):
-        node = prompt_copy.get(node_id, {})
-        inputs = node.setdefault("inputs", {})
-        inputs["is_worker"] = not is_master
-        if not is_master:
-            idx = worker_index_map.get(participant_id, 0)
-            inputs["worker_id"] = f"worker_{idx}"
-        else:
-            inputs["worker_id"] = ""
-
-    # Distributed collectors
-    for node_id in prompt_index.nodes_for_class("DistributedCollector"):
-        node = prompt_copy.get(node_id, {})
-        inputs = node.setdefault("inputs", {})
-
-        if prompt_index.has_upstream(node_id, "UltimateSDUpscaleDistributed"):
-            inputs["pass_through"] = True
-            continue
-
-        unique_id = job_id_map.get(node_id, node_id)
-        inputs["multi_job_id"] = unique_id
-        inputs["is_worker"] = not is_master
-
-        if is_master:
-            inputs["enabled_worker_ids"] = enabled_json
-            inputs["delegate_only"] = bool(delegate_master)
-            inputs.pop("master_url", None)
-            inputs.pop("worker_id", None)
-        else:
-            inputs["master_url"] = master_url
-            inputs["worker_id"] = participant_id
-            inputs["enabled_worker_ids"] = enabled_json
-            inputs["delegate_only"] = False
-
-    # Distributed upscaler nodes
-    for node_id in prompt_index.nodes_for_class("UltimateSDUpscaleDistributed"):
-        node = prompt_copy.get(node_id, {})
-        inputs = node.setdefault("inputs", {})
-        unique_id = job_id_map.get(node_id, node_id)
-        inputs["multi_job_id"] = unique_id
-        inputs["is_worker"] = not is_master
-        if is_master:
-            inputs["enabled_worker_ids"] = enabled_json
-            inputs.pop("master_url", None)
-            inputs.pop("worker_id", None)
-        else:
-            inputs["master_url"] = master_url
-            inputs["worker_id"] = participant_id
-            inputs["enabled_worker_ids"] = enabled_json
+    _override_seed_nodes(prompt_copy, prompt_index, is_master, participant_id, worker_index_map)
+    _override_collector_nodes(
+        prompt_copy,
+        prompt_index,
+        is_master,
+        participant_id,
+        job_id_map,
+        master_url,
+        enabled_json,
+        delegate_master,
+    )
+    _override_upscale_nodes(
+        prompt_copy,
+        prompt_index,
+        is_master,
+        participant_id,
+        job_id_map,
+        master_url,
+        enabled_json,
+    )
 
     return prompt_copy
+
+
+async def _select_active_workers(workers, use_websocket, delegate_master):
+    """Probe workers and return (active_workers, updated_delegate_master).
+
+    If all workers are offline and delegate_master was True, flips delegate_master to False.
+    """
+    active_workers = []
+    for worker in workers:
+        is_active = (
+            await _worker_ws_is_active(worker)
+            if use_websocket
+            else await _worker_is_active(worker)
+        )
+        if is_active:
+            active_workers.append(worker)
+        else:
+            log(f"[Distributed] Worker {worker['name']} ({worker['id']}) is offline, skipping.")
+
+    if not active_workers and delegate_master:
+        debug_log("All workers offline while delegate-only requested; enabling master participation.")
+        delegate_master = False
+
+    return active_workers, delegate_master
 
 
 async def orchestrate_distributed_execution(
@@ -535,21 +593,7 @@ async def orchestrate_distributed_execution(
         debug_log("Delegate-only requested but no workers are enabled. Falling back to master execution.")
         delegate_master = False
 
-    # Filter to active workers
-    active_workers = []
-    for worker in workers:
-        if use_websocket:
-            is_active = await _worker_ws_is_active(worker)
-        else:
-            is_active = await _worker_is_active(worker)
-        if is_active:
-            active_workers.append(worker)
-        else:
-            log(f"[Distributed] Worker {worker['name']} ({worker['id']}) is offline, skipping.")
-
-    if not active_workers and delegate_master:
-        debug_log("All workers offline while delegate-only requested; enabling master participation.")
-        delegate_master = False
+    active_workers, delegate_master = await _select_active_workers(workers, use_websocket, delegate_master)
 
     enabled_ids = [worker["id"] for worker in active_workers]
 

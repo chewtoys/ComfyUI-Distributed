@@ -4,6 +4,7 @@ import os
 import time
 import platform
 import subprocess
+import socket
 
 import torch
 import aiohttp
@@ -111,152 +112,147 @@ async def clear_launching_state(request):
     except Exception as e:
         return await handle_api_error(request, e, 500)
 
+
+def get_network_ips():
+    """Get all network IPs, trying multiple methods."""
+    ips = []
+    hostname = socket.gethostname()
+
+    # Method 1: Try socket.getaddrinfo
+    try:
+        addr_info = socket.getaddrinfo(hostname, None)
+        for info in addr_info:
+            ip = info[4][0]
+            if ip and ip not in ips and not ip.startswith('::'):  # Skip IPv6 for now
+                ips.append(ip)
+    except (socket.gaierror, OSError):
+        pass
+
+    # Method 2: Try to connect to external server and get local IP
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))  # Google DNS
+        local_ip = s.getsockname()[0]
+        s.close()
+        if local_ip not in ips:
+            ips.append(local_ip)
+    except (OSError, socket.error):
+        pass
+
+    # Method 3: Platform-specific commands
+    try:
+        if platform.system() == "Windows":
+            # Windows ipconfig
+            result = subprocess.run(["ipconfig"], capture_output=True, text=True)
+            lines = result.stdout.split('\n')
+            for i, line in enumerate(lines):
+                if 'IPv4' in line and i + 1 < len(lines):
+                    ip = lines[i].split(':')[-1].strip()
+                    if ip and ip not in ips:
+                        ips.append(ip)
+        else:
+            # Unix/Linux/Mac ifconfig or ip addr
+            try:
+                result = subprocess.run(["ip", "addr"], capture_output=True, text=True)
+            except (FileNotFoundError, OSError):
+                try:
+                    result = subprocess.run(["ifconfig"], capture_output=True, text=True)
+                except (FileNotFoundError, OSError):
+                    result = None
+
+            import re
+            ip_pattern = re.compile(r'inet\s+(\d+\.\d+\.\d+\.\d+)')
+            if result is not None:
+                for match in ip_pattern.finditer(result.stdout):
+                    ip = match.group(1)
+                    if ip and ip not in ips:
+                        ips.append(ip)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    return ips
+
+
+def get_recommended_ip(ips):
+    """Choose the best IP for master-worker communication."""
+    # Priority order:
+    # 1. Private network ranges (192.168.x.x, 10.x.x.x, 172.16-31.x.x)
+    # 2. Other non-localhost IPs
+    # 3. Localhost as last resort
+
+    private_ips = []
+    public_ips = []
+
+    for ip in ips:
+        if ip.startswith('127.') or ip == 'localhost':
+            continue
+        elif (ip.startswith('192.168.')
+                or ip.startswith('10.')
+                or (ip.startswith('172.') and 16 <= int(ip.split('.')[1]) <= 31)):
+            private_ips.append(ip)
+        else:
+            public_ips.append(ip)
+
+    # Prefer private IPs
+    if private_ips:
+        # Prefer 192.168 range as it's most common
+        for ip in private_ips:
+            if ip.startswith('192.168.'):
+                return ip
+        return private_ips[0]
+    elif public_ips:
+        return public_ips[0]
+    elif ips:
+        return ips[0]
+    else:
+        return None
+
+
+def _get_cuda_info():
+    """Detect CUDA device index and total physical GPU count.
+
+    Returns (cuda_device, cuda_device_count, physical_device_count).
+    All three are 0/None if CUDA is unavailable.
+    """
+    if not torch.cuda.is_available():
+        return None, 0, 0
+    try:
+        cuda_device_count = torch.cuda.device_count()
+        cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+        if cuda_visible and cuda_visible.strip():
+            visible_devices = [int(d.strip()) for d in cuda_visible.split(',') if d.strip().isdigit()]
+            if visible_devices:
+                cuda_device = visible_devices[0]
+                try:
+                    result = subprocess.run(
+                        ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    physical_device_count = (
+                        len(result.stdout.strip().split('\n'))
+                        if result.returncode == 0
+                        else max(visible_devices) + 1
+                    )
+                except (FileNotFoundError, OSError, subprocess.SubprocessError):
+                    physical_device_count = max(visible_devices) + 1
+                return cuda_device, cuda_device_count, physical_device_count
+            else:
+                return 0, cuda_device_count, cuda_device_count
+        else:
+            cuda_device = torch.cuda.current_device()
+            return cuda_device, cuda_device_count, cuda_device_count
+    except Exception as e:
+        debug_log(f"CUDA detection error: {e}")
+        return None, 0, 0
+
+
 @server.PromptServer.instance.routes.get("/distributed/network_info")
 async def get_network_info_endpoint(request):
     """Get network interfaces and recommend best IP for master."""
-    import socket
-    
-    # Get CUDA device if available
-    cuda_device = None
-    cuda_device_count = 0
-    physical_device_count = 0
-    
-    if torch.cuda.is_available():
-        try:
-            import os
-            import subprocess
-            
-            # Get visible device count (what PyTorch sees)
-            cuda_device_count = torch.cuda.device_count()
-            
-            # Try to get actual physical device info
-            cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
-            
-            # Method 1: Parse CUDA_VISIBLE_DEVICES
-            if cuda_visible and cuda_visible.strip():
-                visible_devices = [int(d.strip()) for d in cuda_visible.split(',') if d.strip().isdigit()]
-                if visible_devices:
-                    # Get the first visible device as the actual physical device
-                    cuda_device = visible_devices[0]
-                    
-                    # Try to get total physical device count using nvidia-smi
-                    try:
-                        result = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'], 
-                                              capture_output=True, text=True, timeout=5)
-                        if result.returncode == 0:
-                            physical_device_count = len(result.stdout.strip().split('\n'))
-                        else:
-                            physical_device_count = max(visible_devices) + 1  # Best guess
-                    except (FileNotFoundError, OSError, subprocess.SubprocessError):
-                        physical_device_count = max(visible_devices) + 1  # Best guess
-                else:
-                    cuda_device = 0
-                    physical_device_count = cuda_device_count
-            else:
-                # No CUDA_VISIBLE_DEVICES set, current device is actual device
-                cuda_device = torch.cuda.current_device()
-                physical_device_count = cuda_device_count
-                
-        except Exception as e:
-            debug_log(f"CUDA detection error: {e}")
-            cuda_device = None
-            cuda_device_count = 0
-            physical_device_count = 0
-    
-    def get_network_ips():
-        """Get all network IPs, trying multiple methods."""
-        ips = []
-        hostname = socket.gethostname()
-        
-        # Method 1: Try socket.getaddrinfo
-        try:
-            addr_info = socket.getaddrinfo(hostname, None)
-            for info in addr_info:
-                ip = info[4][0]
-                if ip and ip not in ips and not ip.startswith('::'):  # Skip IPv6 for now
-                    ips.append(ip)
-        except (socket.gaierror, OSError):
-            pass
-        
-        # Method 2: Try to connect to external server and get local IP
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))  # Google DNS
-            local_ip = s.getsockname()[0]
-            s.close()
-            if local_ip not in ips:
-                ips.append(local_ip)
-        except (OSError, socket.error):
-            pass
-        
-        # Method 3: Platform-specific commands
-        
-        try:
-            if platform.system() == "Windows":
-                # Windows ipconfig
-                result = subprocess.run(["ipconfig"], capture_output=True, text=True)
-                lines = result.stdout.split('\n')
-                for i, line in enumerate(lines):
-                    if 'IPv4' in line and i + 1 < len(lines):
-                        ip = lines[i].split(':')[-1].strip()
-                        if ip and ip not in ips:
-                            ips.append(ip)
-            else:
-                # Unix/Linux/Mac ifconfig or ip addr
-                try:
-                    result = subprocess.run(["ip", "addr"], capture_output=True, text=True)
-                except (FileNotFoundError, OSError):
-                    try:
-                        result = subprocess.run(["ifconfig"], capture_output=True, text=True)
-                    except (FileNotFoundError, OSError):
-                        result = None
-                
-                import re
-                ip_pattern = re.compile(r'inet\s+(\d+\.\d+\.\d+\.\d+)')
-                if result is not None:
-                    for match in ip_pattern.finditer(result.stdout):
-                        ip = match.group(1)
-                        if ip and ip not in ips:
-                            ips.append(ip)
-        except (OSError, subprocess.SubprocessError):
-            pass
-        
-        return ips
-    
-    def get_recommended_ip(ips):
-        """Choose the best IP for master-worker communication."""
-        # Priority order:
-        # 1. Private network ranges (192.168.x.x, 10.x.x.x, 172.16-31.x.x)
-        # 2. Other non-localhost IPs
-        # 3. Localhost as last resort
-        
-        private_ips = []
-        public_ips = []
-        
-        for ip in ips:
-            if ip.startswith('127.') or ip == 'localhost':
-                continue
-            elif (ip.startswith('192.168.') or 
-                  ip.startswith('10.') or 
-                  (ip.startswith('172.') and 16 <= int(ip.split('.')[1]) <= 31)):
-                private_ips.append(ip)
-            else:
-                public_ips.append(ip)
-        
-        # Prefer private IPs
-        if private_ips:
-            # Prefer 192.168 range as it's most common
-            for ip in private_ips:
-                if ip.startswith('192.168.'):
-                    return ip
-            return private_ips[0]
-        elif public_ips:
-            return public_ips[0]
-        elif ips:
-            return ips[0]
-        else:
-            return None
-    
+    cuda_device, cuda_device_count, physical_device_count = _get_cuda_info()
+
     try:
         hostname = socket.gethostname()
         all_ips = get_network_ips()
