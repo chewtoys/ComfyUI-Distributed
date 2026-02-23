@@ -1,6 +1,7 @@
 """
 Network and API utilities for ComfyUI-Distributed.
 """
+import asyncio
 import aiohttp
 import re
 import server
@@ -13,6 +14,11 @@ _client_session = None
 async def get_client_session():
     """Get or create a shared aiohttp client session."""
     global _client_session
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError as exc:
+        raise RuntimeError("get_client_session() requires an active asyncio event loop.") from exc
+
     if _client_session is None or _client_session.closed:
         connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
         # Don't set timeout here - set it per request

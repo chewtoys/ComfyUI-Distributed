@@ -50,7 +50,9 @@ Queue a workflow for distributed execution.
   "workflow": { },
   "client_id": "optional",
   "delegate_master": false,
-  "enabled_worker_ids": ["1", "2"]
+  "enabled_worker_ids": ["1", "2"],
+  "workers": ["1", "2"],
+  "auto_prepare": true
 }
 ```
 
@@ -69,6 +71,11 @@ Queue a workflow for distributed execution.
 - `enabled_worker_ids` (optional, array of strings)
   - If provided, only these worker IDs will be considered.
   - If omitted, the plugin uses workers marked as enabled in the UI config.
+- `workers` (optional, array of strings or objects with `id`)
+  - Transitional alias for `enabled_worker_ids` used by the frontend auto-prepare path.
+- `auto_prepare` (optional, boolean)
+  - Feature flag used by newer clients. Current backend still requires `prompt`, but can also read
+    `workflow.prompt` when this flag is true.
 
 ##### How to get `enabled_worker_ids`
 
@@ -93,7 +100,8 @@ $cfg.workers | Select-Object id,name,enabled,host,port,type | Format-Table -Auto
 ```json
 {
   "prompt_id": "<uuid>",
-  "worker_count": 2
+  "worker_count": 2,
+  "auto_prepare_supported": true
 }
 ```
 
@@ -118,6 +126,41 @@ For a worker to participate, it must be reachable from the master:
 Also, for collector-based flows:
 
 - Workers will send results back to the master via `POST /distributed/job_complete` (that route must be reachable from workers).
+
+---
+
+## Endpoint: `POST /distributed/job_complete`
+
+Submit one completed worker image back to the master collector queue.
+
+### URL
+
+- `http://<master-host>:<master-port>/distributed/job_complete`
+
+### Request Body
+
+```json
+{
+  "job_id": "exec_1234567890_17",
+  "worker_id": "worker-1",
+  "batch_idx": 0,
+  "image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...",
+  "is_last": false
+}
+```
+
+### Canonical envelope (required fields)
+
+- `job_id` (string, required)
+- `worker_id` (string, required)
+- `batch_idx` (integer >= 0, required)
+- `image` (string, required)
+  - PNG payload as either:
+    - data URL: `data:image/png;base64,...`
+    - raw base64 PNG bytes
+- `is_last` (boolean, required)
+
+Legacy multipart/tensor payload formats are no longer accepted on this endpoint.
 
 ### CORS note
 

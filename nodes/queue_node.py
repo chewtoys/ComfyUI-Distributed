@@ -75,7 +75,7 @@ class DistributedQueueNode:
         if extra_data:
             payload["extra_data"] = extra_data
 
-        url = self._build_worker_url(worker, "/prompt")
+        url = build_worker_url(worker, "/prompt")
         session = await get_client_session()
         async with session.post(
             url,
@@ -96,7 +96,7 @@ class DistributedQueueNode:
         session = await get_client_session()
         statuses = []
         for worker in workers:
-            url = self._build_worker_url(worker, "/prompt")
+            url = build_worker_url(worker, "/prompt")
             try:
                 async with session.get(
                     url,
@@ -135,7 +135,3 @@ class DistributedQueueNode:
             if isinstance(node, dict) and node.get("class_type") == "DistributedQueue":
                 inputs = node.setdefault("inputs", {})
                 inputs["skip_dispatch"] = True
-
-    def _build_worker_url(self, worker, endpoint=""):
-        from ..utils.network import build_worker_url
-        return build_worker_url(worker, endpoint)

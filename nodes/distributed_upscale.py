@@ -4,17 +4,17 @@ from functools import wraps
 
 import comfy.samplers
 
-from .utils.logging import debug_log, log
-from .utils.async_helpers import run_async_in_server_loop
-from .utils.usdu_managment import ensure_tile_jobs_initialized
+from ..utils.logging import debug_log, log
+from ..utils.async_helpers import run_async_in_server_loop
+from ..utils.usdu_managment import ensure_tile_jobs_initialized
 
-from .upscale.tile_ops import TileOpsMixin
-from .upscale.result_collector import ResultCollectorMixin
-from .upscale.worker_comms import WorkerCommsMixin
-from .upscale.job_state import JobStateMixin
-from .upscale.modes.single_gpu import SingleGpuModeMixin
-from .upscale.modes.static import StaticModeMixin
-from .upscale.modes.dynamic import DynamicModeMixin
+from ..upscale.tile_ops import TileOpsMixin
+from ..upscale.result_collector import ResultCollectorMixin
+from ..upscale.worker_comms import WorkerCommsMixin
+from ..upscale.job_state import JobStateMixin
+from ..upscale.modes.single_gpu import SingleGpuModeMixin
+from ..upscale.modes.static import StaticModeMixin
+from ..upscale.modes.dynamic import DynamicModeMixin
 
 def sync_wrapper(async_func):
     """Decorator to wrap async methods for synchronous execution."""

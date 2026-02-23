@@ -9,6 +9,12 @@ from .logging import log
 from .constants import HEARTBEAT_TIMEOUT
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "gpu_config.json")
+_config_cache = None
+_config_mtime = 0.0
+
+
+def _config_path():
+    return CONFIG_FILE
 
 def get_default_config():
     """Returns the default configuration dictionary. Single source of truth."""
@@ -31,26 +37,64 @@ def get_default_config():
         }
     }
 
+def _merge_with_defaults(data, defaults):
+    """Recursively merge loaded config data with default keys."""
+    if not isinstance(data, dict):
+        return defaults
+
+    merged = {}
+    for key, default_value in defaults.items():
+        loaded_value = data.get(key, default_value)
+        if isinstance(default_value, dict) and isinstance(loaded_value, dict):
+            merged[key] = _merge_with_defaults(loaded_value, default_value)
+        else:
+            merged[key] = loaded_value
+
+    # Preserve unknown keys for forward compatibility.
+    for key, value in data.items():
+        if key not in merged:
+            merged[key] = value
+
+    return merged
+
+
+def invalidate_config_cache():
+    """Invalidate in-memory config cache so next load reads from disk."""
+    global _config_cache, _config_mtime
+    _config_cache = None
+    _config_mtime = 0.0
+
+
 def load_config():
     """Loads the config, falling back to defaults if the file is missing or invalid."""
-    if os.path.exists(CONFIG_FILE):
+    global _config_cache, _config_mtime
+    path = _config_path()
+
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        if _config_cache is None:
+            _config_cache = get_default_config()
+        return _config_cache
+
+    if _config_cache is None or mtime != _config_mtime:
         try:
-            with open(CONFIG_FILE, 'r') as f:
-                data = json.load(f)
-                defaults = get_default_config()
-                for key, value in defaults.items():
-                    if key not in data:
-                        data[key] = value
-                return data
+            with open(path, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+            _config_cache = _merge_with_defaults(loaded, get_default_config())
         except Exception as e:
             log(f"Error loading config, using defaults: {e}")
-    return get_default_config()
+            _config_cache = get_default_config()
+        _config_mtime = mtime
+
+    return _config_cache
 
 def save_config(config):
     """Saves the configuration to file."""
     try:
-        with open(CONFIG_FILE, 'w') as f:
+        with open(_config_path(), 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2)
+        invalidate_config_cache()
         return True
     except Exception as e:
         log(f"Error saving config: {e}")
@@ -58,7 +102,7 @@ def save_config(config):
 
 def ensure_config_exists():
     """Creates default config file if it doesn't exist. Used by __init__.py"""
-    if not os.path.exists(CONFIG_FILE):
+    if not os.path.exists(_config_path()):
         default_config = get_default_config()
         if save_config(default_config):
             from .logging import debug_log

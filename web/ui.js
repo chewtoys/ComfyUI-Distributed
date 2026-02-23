@@ -1,4 +1,8 @@
 import { BUTTON_STYLES, UI_STYLES, STATUS_COLORS, UI_COLORS, TIMEOUTS } from './constants.js';
+import { createButtonHelper as createButtonHelperFn } from './ui/buttonHelpers.js';
+import { showCloudflareWarning as showCloudflareWarningFn } from './ui/cloudflareWarning.js';
+import { createWorkerSettingsForm as createWorkerSettingsFormFn } from './ui/settingsForm.js';
+import { renderEntityCard as renderEntityCardFn } from './ui/entityCard.js';
 
 const cardConfigs = {
     master: {
@@ -317,7 +321,7 @@ export class DistributedUI {
 
 
     createButtonHelper(text, onClick, style) {
-        return this.createButton(text, onClick, style);
+        return createButtonHelperFn(this, text, onClick, style);
     }
 
     updateMasterDisplay(extension) {
@@ -349,144 +353,35 @@ export class DistributedUI {
     }
 
     showCloudflareWarning(extension, masterHost) {
-        // Remove any existing banner first
-        const existingBanner = document.getElementById('cloudflare-warning-banner');
-        if (existingBanner) {
-            existingBanner.remove();
-        }
-
-        // Create warning banner
-        const banner = document.createElement('div');
-        banner.id = 'cloudflare-warning-banner';
-        banner.style.cssText = `
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            background: #ff9800;
-            color: #333;
-            padding: 8px 16px;
-            text-align: center;
-            z-index: 10000;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 16px;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-        `;
-        
-        const messageSpan = document.createElement('span');
-        messageSpan.innerHTML = `Connection issue: Master address <strong>${masterHost}</strong> is not reachable. The cloudflare tunnel may be offline.`;
-        messageSpan.style.fontSize = '13px';
-        
-        const resetButton = document.createElement('button');
-        resetButton.textContent = 'Reset Master Address';
-        resetButton.style.cssText = `
-            background: #333;
-            color: white;
-            border: none;
-            padding: 6px 14px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-weight: 500;
-            font-size: 13px;
-            transition: background 0.2s;
-        `;
-        resetButton.onmouseover = () => resetButton.style.background = '#555';
-        resetButton.onmouseout = () => resetButton.style.background = '#333';
-        
-        const dismissButton = document.createElement('button');
-        dismissButton.textContent = 'Dismiss';
-        dismissButton.style.cssText = `
-            background: transparent;
-            color: #333;
-            border: 1px solid #333;
-            padding: 6px 14px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 13px;
-            transition: opacity 0.2s;
-        `;
-        dismissButton.onmouseover = () => dismissButton.style.opacity = '0.7';
-        dismissButton.onmouseout = () => dismissButton.style.opacity = '1';
-        
-        // Add click handlers
-        resetButton.onclick = async () => {
-            resetButton.disabled = true;
-            resetButton.textContent = 'Resetting...';
-            
-            try {
-                // Save with empty host - this will trigger auto-detection
-                await extension.api.updateMaster({ 
-                    name: extension.config?.master?.name || "Master",
-                    host: "" 
-                });
-                
-                // Clear the local config host so detectMasterIP() doesn't skip
-                if (extension.config?.master) {
-                    extension.config.master.host = "";
-                }
-                
-                // The API call above doesn't trigger auto-detection, so we need to do it
-                await extension.detectMasterIP();
-                
-                // Reload config to get the new detected IP
-                await extension.loadConfig();
-                
-                // Log the new master URL for debugging
-                const newMasterUrl = extension.getMasterUrl();
-                extension.log(`Master host reset. New URL: ${newMasterUrl}`, "info");
-                
-                // Update UI if sidebar is open
-                if (extension.panelElement) {
-                    const hostInput = document.getElementById('master-host');
-                    if (hostInput) {
-                        hostInput.value = extension.config?.master?.host || "";
-                    }
-                }
-                
-                // Show success message with the actual URL that will be used
-                extension.app.extensionManager.toast.add({
-                    severity: "success",
-                    summary: "Master Host Reset",
-                    detail: `New address: ${newMasterUrl}`,
-                    life: 4000
-                });
-                
-                banner.remove();
-            } catch (error) {
-                resetButton.disabled = false;
-                resetButton.textContent = 'Reset Master Host';
-                extension.log(`Failed to reset master host: ${error.message}`, "error");
-            }
-        };
-        
-        dismissButton.onclick = () => banner.remove();
-        
-        // Assemble banner
-        banner.appendChild(messageSpan);
-        banner.appendChild(resetButton);
-        banner.appendChild(dismissButton);
-        
-        // Add to page
-        document.body.prepend(banner);
-        
-        // Auto-dismiss after 30 seconds
-        setTimeout(() => {
-            if (document.getElementById('cloudflare-warning-banner')) {
-                banner.style.transition = 'opacity 0.5s';
-                banner.style.opacity = '0';
-                setTimeout(() => banner.remove(), 500);
-            }
-        }, 30000);
+        return showCloudflareWarningFn(extension, masterHost);
     }
 
     updateStatusDot(workerId, color, title, pulsing = false) {
         const statusDot = document.getElementById(`status-${workerId}`);
         if (!statusDot) return;
-        
-        statusDot.style.backgroundColor = color;
+
+        const statusClasses = [
+            "worker-status--online",
+            "worker-status--offline",
+            "worker-status--unknown",
+            "worker-status--processing",
+        ];
+        statusDot.classList.remove(...statusClasses);
+
+        const colorClassMap = {
+            [STATUS_COLORS.ONLINE_GREEN]: "worker-status--online",
+            [STATUS_COLORS.OFFLINE_RED]: "worker-status--offline",
+            [STATUS_COLORS.DISABLED_GRAY]: "worker-status--unknown",
+            [STATUS_COLORS.PROCESSING_YELLOW]: "worker-status--processing",
+        };
+
+        const statusClass = colorClassMap[color];
+        if (statusClass) {
+            statusDot.classList.add(statusClass);
+            statusDot.style.backgroundColor = "";
+        } else {
+            statusDot.style.backgroundColor = color;
+        }
         statusDot.title = title;
         statusDot.classList.toggle('status-pulsing', pulsing);
     }
@@ -661,170 +556,7 @@ export class DistributedUI {
     }
 
     createWorkerSettingsForm(extension, worker) {
-        const form = document.createElement("div");
-        form.style.cssText = "display: flex; flex-direction: column; gap: 8px;";
-        
-        // Name field
-        const nameGroup = this.createFormGroup("Name:", worker.name, `name-${worker.id}`);
-        form.appendChild(nameGroup.group);
-        
-        // Worker type dropdown
-        const typeGroup = document.createElement("div");
-        typeGroup.style.cssText = "display: flex; flex-direction: column; gap: 4px; margin: 5px 0;";
-        
-        const typeLabel = document.createElement("label");
-        typeLabel.htmlFor = `worker-type-${worker.id}`;
-        typeLabel.textContent = "Worker Type:";
-        typeLabel.style.cssText = "font-size: 12px; color: #ccc;";
-        
-        const typeSelect = document.createElement("select");
-        typeSelect.id = `worker-type-${worker.id}`;
-        typeSelect.style.cssText = "padding: 4px 8px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px; font-size: 12px;";
-        
-        // Create options
-        const localOption = document.createElement("option");
-        localOption.value = "local";
-        localOption.textContent = "Local";
-        
-        const remoteOption = document.createElement("option");
-        remoteOption.value = "remote";
-        remoteOption.textContent = "Remote";
-        
-        const cloudOption = document.createElement("option");
-        cloudOption.value = "cloud";
-        cloudOption.textContent = "Cloud";
-        
-        typeSelect.appendChild(localOption);
-        typeSelect.appendChild(remoteOption);
-        typeSelect.appendChild(cloudOption);
-        
-        // Create powered by Runpod text (initially hidden)
-        const runpodText = document.createElement("a");
-        runpodText.id = `runpod-text-${worker.id}`;
-        runpodText.href = "https://github.com/robertvoy/ComfyUI-Distributed/blob/main/docs/worker-setup-guides.md#cloud-workers";
-        runpodText.target = "_blank";
-        runpodText.textContent = "Deploy Cloud Worker with Runpod";
-        runpodText.style.cssText = "font-size: 12px; color: #4a90e2; text-decoration: none; margin-top: 4px; display: none; cursor: pointer;";
-        
-        // Store the onchange function to be assigned later
-        const createOnChangeHandler = () => {
-            return (e) => {
-                const workerType = e.target.value;
-                // Show/hide relevant fields
-                const hostGroup = document.getElementById(`host-group-${worker.id}`);
-                const hostInput = document.getElementById(`host-${worker.id}`);
-                const portGroup = document.getElementById(`port-group-${worker.id}`);
-                const portInput = document.getElementById(`port-${worker.id}`);
-                const cudaGroup = document.getElementById(`cuda-group-${worker.id}`);
-                const argsGroup = document.getElementById(`args-group-${worker.id}`);
-                const runpodTextElem = document.getElementById(`runpod-text-${worker.id}`);
-                
-                // Check if elements exist before accessing them
-                if (!hostGroup || !portGroup || !cudaGroup || !argsGroup || !runpodTextElem || !hostInput || !portInput) {
-                    return; // Elements not ready yet
-                }
-                
-                if (workerType === "local") {
-                    hostGroup.style.display = "none";
-                    portGroup.style.display = "flex";
-                    cudaGroup.style.display = "flex";
-                    argsGroup.style.display = "flex";
-                    runpodTextElem.style.display = "none";
-                } else if (workerType === "remote") {
-                    hostGroup.style.display = "flex";
-                    portGroup.style.display = "flex";
-                    cudaGroup.style.display = "none";
-                    argsGroup.style.display = "none";
-                    runpodTextElem.style.display = "none";
-                    // Update placeholder for remote workers
-                    hostInput.placeholder = "e.g., 192.168.1.100";
-                    // If switching to remote and host is localhost, clear it
-                    if (hostInput.value === "localhost" || hostInput.value === "127.0.0.1") {
-                        hostInput.value = "";
-                    }
-                } else if (workerType === "cloud") {
-                    hostGroup.style.display = "flex";
-                    portGroup.style.display = "flex"; // Keep port visible for cloud workers
-                    cudaGroup.style.display = "none";
-                    argsGroup.style.display = "none";
-                    runpodTextElem.style.display = "block";
-                    // Update placeholder for cloud workers
-                    hostInput.placeholder = "e.g., your-cloud-worker.trycloudflare.com";
-                    // Set port to 443 for cloud workers
-                    portInput.value = "443";
-                    // If switching to cloud and host is localhost, clear it
-                    if (hostInput.value === "localhost" || hostInput.value === "127.0.0.1") {
-                        hostInput.value = "";
-                    }
-                }
-            };
-        };
-        
-        typeGroup.appendChild(typeLabel);
-        typeGroup.appendChild(typeSelect);
-        typeGroup.appendChild(runpodText);
-        form.appendChild(typeGroup);
-        
-        // Host field (only for remote workers)
-        const hostGroup = this.createFormGroup("Host:", worker.host || "", `host-${worker.id}`, "text", "e.g., 192.168.1.100");
-        hostGroup.group.id = `host-group-${worker.id}`;
-        hostGroup.group.style.display = (extension.isRemoteWorker(worker) || worker.type === "cloud") ? "flex" : "none";
-        form.appendChild(hostGroup.group);
-        
-        // Port field
-        const portGroup = this.createFormGroup("Port:", worker.port, `port-${worker.id}`, "number");
-        portGroup.group.id = `port-group-${worker.id}`;
-        form.appendChild(portGroup.group);
-        
-        // CUDA Device field (only for local workers)
-        const cudaGroup = this.createFormGroup("CUDA Device:", worker.cuda_device || 0, `cuda-${worker.id}`, "number");
-        cudaGroup.group.id = `cuda-group-${worker.id}`;
-        cudaGroup.group.style.display = (extension.isRemoteWorker(worker) || worker.type === "cloud") ? "none" : "flex";
-        form.appendChild(cudaGroup.group);
-        
-        // Extra Args field (only for local workers)
-        const argsGroup = this.createFormGroup("Extra Args:", worker.extra_args || "", `args-${worker.id}`);
-        argsGroup.group.id = `args-group-${worker.id}`;
-        argsGroup.group.style.display = (extension.isRemoteWorker(worker) || worker.type === "cloud") ? "none" : "flex";
-        form.appendChild(argsGroup.group);
-        
-        // Buttons
-        const saveBtn = this.createButton("Save", 
-            () => extension.saveWorkerSettings(worker.id),
-            "background-color: #4a7c4a;");
-        saveBtn.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.success;
-        
-        const cancelBtn = this.createButton("Cancel", 
-            () => extension.cancelWorkerSettings(worker.id),
-            "background-color: #555;");
-        cancelBtn.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.cancel;
-        
-        const deleteBtn = this.createButton("Delete", 
-            () => extension.deleteWorker(worker.id),
-            "background-color: #7c4a4a;");
-        deleteBtn.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.error + BUTTON_STYLES.marginLeftAuto;
-        
-        const buttonGroup = this.createButtonGroup([saveBtn, cancelBtn, deleteBtn], " margin-top: 8px;");
-        form.appendChild(buttonGroup);
-        
-        // Assign the onchange handler now that all elements are created
-        typeSelect.onchange = createOnChangeHandler();
-        
-        // Set initial value and trigger state after all DOM elements are created
-        if (worker.type === "cloud") {
-            typeSelect.value = "cloud";
-            // Show Runpod text immediately for cloud workers
-            runpodText.style.display = "block";
-        } else if (extension.isRemoteWorker(worker)) {
-            typeSelect.value = "remote";
-        } else {
-            typeSelect.value = "local";
-        }
-        
-        // Trigger initial state now that all elements exist
-        typeSelect.dispatchEvent(new Event('change'));
-        
-        return form;
+        return createWorkerSettingsFormFn(this, extension, worker);
     }
 
     createSettingsToggle() {
@@ -907,7 +639,6 @@ export class DistributedUI {
                 column.onclick = async () => {
                     checkbox.checked = !checkbox.checked;
                     await extension.updateWorkerEnabled(data.id, checkbox.checked);
-                    extension.updateSummary();
                 };
             }
             
@@ -1182,118 +913,6 @@ export class DistributedUI {
     }
 
     renderEntityCard(entityType, data, extension) {
-        const config = cardConfigs[entityType] || {};
-        const isPlaceholder = entityType === 'blueprint' || entityType === 'add';
-        const isWorker = entityType === 'worker';
-        const isMaster = entityType === 'master';
-        const isRemote = isWorker && extension.isRemoteWorker(data);
-
-        const cardOptions = { 
-            onClick: isPlaceholder ? data?.onClick : null 
-        };
-        if (isPlaceholder) {
-            cardOptions.title = entityType === 'blueprint' ? "Click to add your first worker" : "Click to add a new worker";
-        }
-        const card = this.createCard(entityType, cardOptions);
-
-        const leftColumn = this.createCheckboxOrIconColumn(config.checkbox, data, extension);
-        card.appendChild(leftColumn);
-
-        const rightColumn = this.createCardColumn('content');
-
-        const infoRow = this.createInfoRow();
-        if (config.infoRowPadding) {
-            infoRow.style.padding = config.infoRowPadding;
-        }
-        if (config.minHeight === 'auto') {
-            infoRow.style.minHeight = 'auto';
-        } else if (config.minHeight) {
-            infoRow.style.minHeight = config.minHeight;
-        }
-        if (config.expand) {
-            infoRow.title = "Click to expand settings";
-            infoRow.onclick = () => {
-                if (isMaster) {
-                    const masterSettingsExpanded = !extension.masterSettingsExpanded;
-                    extension.masterSettingsExpanded = masterSettingsExpanded;
-                    const masterSettingsDiv = document.getElementById("master-settings");
-                    const arrow = infoRow.querySelector('.settings-arrow');
-                    if (masterSettingsExpanded) {
-                        masterSettingsDiv.classList.add("expanded");
-                        masterSettingsDiv.style.padding = "12px";
-                        masterSettingsDiv.style.marginTop = "8px";
-                        masterSettingsDiv.style.marginBottom = "8px";
-                        arrow.style.transform = "rotate(90deg)";
-                    } else {
-                        masterSettingsDiv.classList.remove("expanded");
-                        masterSettingsDiv.style.padding = "0 12px";
-                        masterSettingsDiv.style.marginTop = "0";
-                        masterSettingsDiv.style.marginBottom = "0";
-                        arrow.style.transform = "rotate(0deg)";
-                    }
-                } else {
-                    extension.toggleWorkerExpanded(data.id);
-                }
-            };
-        }
-
-        const workerContent = this.createWorkerContent();
-        if (entityType === 'add') {
-            workerContent.style.alignItems = "center";
-        }
-
-        const statusDot = this.createStatusDotHelper(config.statusDot, data, extension);
-        workerContent.appendChild(statusDot);
-
-        const infoSpan = document.createElement("span");
-        infoSpan.innerHTML = config.infoText(data, extension);
-        workerContent.appendChild(infoSpan);
-
-        infoRow.appendChild(workerContent);
-
-        let settingsArrow;
-        if (config.expand) {
-            const expandedId = config.settings?.expandedId || (isMaster ? 'master' : data?.id);
-            settingsArrow = this.createSettingsToggleHelper(expandedId, extension);
-            if (isMaster && !extension.masterSettingsExpanded) {
-                settingsArrow.style.transform = "rotate(0deg)";
-            }
-            infoRow.appendChild(settingsArrow);
-        }
-
-        rightColumn.appendChild(infoRow);
-
-        if (config.hover === true) {
-            rightColumn.onmouseover = () => {
-                rightColumn.style.backgroundColor = "#333";
-                if (settingsArrow) settingsArrow.style.color = "#fff";
-            };
-            rightColumn.onmouseout = () => {
-                rightColumn.style.backgroundColor = "transparent";
-                if (settingsArrow) settingsArrow.style.color = "#888";
-            };
-        }
-
-        const controlsDiv = this.createControlsSection(config.controls, data, extension, isRemote);
-        if (controlsDiv) {
-            rightColumn.appendChild(controlsDiv);
-        }
-
-        if (config.settings) {
-            const settingsDiv = this.createSettingsSection(config.settings, data, extension);
-            rightColumn.appendChild(settingsDiv);
-        }
-
-        card.appendChild(rightColumn);
-
-        if (config.hover === 'placeholder') {
-            this.addPlaceholderHover(card, leftColumn, entityType);
-        }
-
-        if (isWorker && !isRemote) {
-            extension.updateWorkerControls(data.id);
-        }
-
-        return card;
+        return renderEntityCardFn(this, cardConfigs, entityType, data, extension);
     }
 }

@@ -1,6 +1,6 @@
 import { api } from "../../scripts/api.js";
 import { findNodesByClass, findImageReferences, hasUpstreamNode, pruneWorkflowForWorker, getCachedWorkerSystemInfo, findCollectorDownstreamNodes } from './workerUtils.js';
-import { TIMEOUTS, NODE_CLASSES, generateUUID } from './constants.js';
+import { TIMEOUTS, NODE_CLASSES, generateUUID, STATUS_COLORS } from './constants.js';
 
 /**
  * Convert paths in the API prompt to match the target platform's separator
@@ -134,6 +134,28 @@ export async function executeParallelDistributed(extension, promptWrapper) {
                 extension.log("Blocking execution - workers cannot reach master at cloudflare domain", "error");
                 return null; // This will prevent the workflow from running
             }
+        }
+
+        try {
+            const queueResponse = await extension.api.queueDistributed({
+                prompt: promptWrapper.output,
+                workflow: promptWrapper.workflow,
+                enabled_worker_ids: activeWorkers.map((worker) => worker.id),
+                workers: activeWorkers.map((worker) => ({ id: worker.id })),
+                client_id: api.clientId,
+                delegate_master: Boolean(extension.config?.settings?.master_delegate_only),
+                auto_prepare: true,
+            });
+            if (queueResponse?.prompt_id && queueResponse?.auto_prepare_supported !== false) {
+                extension.log(
+                    `Distributed queue accepted by backend (prompt_id=${queueResponse.prompt_id}, workers=${queueResponse.worker_count ?? activeWorkers.length})`,
+                    "debug"
+                );
+                return queueResponse;
+            }
+            extension.log("Backend responded without auto-prepare support; using legacy frontend orchestration.", "warn");
+        } catch (error) {
+            extension.log(`Backend auto-prepare dispatch failed, using legacy frontend path: ${error.message}`, "warn");
         }
 
         // Find all distributed nodes in the workflow
@@ -895,7 +917,7 @@ export async function performPreflightCheck(extension, workers) {
         if (statusDot) {
             // Remove pulsing animation once status is determined
             statusDot.classList.remove('status-pulsing');
-            statusDot.style.backgroundColor = "#c04c4c"; // Red for offline
+            statusDot.style.backgroundColor = STATUS_COLORS.OFFLINE_RED;
             statusDot.title = "Offline - Cannot connect";
         }
     });

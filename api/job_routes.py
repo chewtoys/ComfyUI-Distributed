@@ -1,9 +1,9 @@
 import json
 import asyncio
 import io
-import uuid
-import time
 import os
+import base64
+import binascii
 
 from aiohttp import web
 import server
@@ -16,9 +16,114 @@ from ..utils.image import pil_to_tensor, ensure_contiguous
 from ..utils.network import handle_api_error
 from ..utils.constants import MEMORY_CLEAR_DELAY
 from ..utils.async_helpers import queue_prompt_payload
-from ..distributed_queue_api import orchestrate_distributed_execution
+from .queue_orchestration import orchestrate_distributed_execution
 
 prompt_server = _server.PromptServer.instance
+
+# Canonical worker result envelope accepted by POST /distributed/job_complete:
+# { "job_id": str, "worker_id": str, "batch_idx": int, "image": <base64 PNG>, "is_last": bool }
+
+
+def _decode_image_sync(image_path):
+    """Decode image/video file and compute hash in a threadpool worker."""
+    import base64
+    import hashlib
+    import folder_paths
+
+    full_path = folder_paths.get_annotated_filepath(image_path)
+    if not os.path.exists(full_path):
+        raise FileNotFoundError(image_path)
+
+    hash_md5 = hashlib.md5()
+    with open(full_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    file_hash = hash_md5.hexdigest()
+
+    video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
+    file_ext = os.path.splitext(full_path)[1].lower()
+
+    if file_ext in video_extensions:
+        with open(full_path, 'rb') as f:
+            file_data = f.read()
+        mime_types = {
+            '.mp4': 'video/mp4',
+            '.avi': 'video/x-msvideo',
+            '.mov': 'video/quicktime',
+            '.mkv': 'video/x-matroska',
+            '.webm': 'video/webm'
+        }
+        mime_type = mime_types.get(file_ext, 'video/mp4')
+        image_data = f"data:{mime_type};base64,{base64.b64encode(file_data).decode('utf-8')}"
+    else:
+        with Image.open(full_path) as img:
+            if img.mode not in ('RGB', 'RGBA'):
+                img = img.convert('RGB')
+            buffer = io.BytesIO()
+            img.save(buffer, format='PNG', compress_level=1)
+            image_data = f"data:image/png;base64,{base64.b64encode(buffer.getvalue()).decode('utf-8')}"
+
+    return {
+        "status": "success",
+        "image_data": image_data,
+        "hash": file_hash,
+    }
+
+
+def _check_file_sync(filename, expected_hash):
+    """Check file presence and hash in a threadpool worker."""
+    import hashlib
+    import folder_paths
+
+    full_path = folder_paths.get_annotated_filepath(filename)
+    if not os.path.exists(full_path):
+        return {
+            "status": "success",
+            "exists": False,
+        }
+
+    hash_md5 = hashlib.md5()
+    with open(full_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    file_hash = hash_md5.hexdigest()
+
+    return {
+        "status": "success",
+        "exists": True,
+        "hash_matches": file_hash == expected_hash,
+    }
+
+
+def _decode_canonical_png_tensor(image_payload):
+    """Decode canonical base64 PNG payload into a contiguous IMAGE tensor."""
+    if not isinstance(image_payload, str) or not image_payload.strip():
+        raise ValueError("Field 'image' must be a non-empty base64 PNG string.")
+
+    encoded = image_payload.strip()
+    if encoded.startswith("data:"):
+        header, sep, data_part = encoded.partition(",")
+        if not sep:
+            raise ValueError("Field 'image' data URL is malformed.")
+        if not header.lower().startswith("data:image/png;base64"):
+            raise ValueError("Field 'image' must be a PNG data URL when using data:* format.")
+        encoded = data_part
+
+    try:
+        png_bytes = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("Field 'image' is not valid base64 PNG data.") from exc
+
+    if not png_bytes:
+        raise ValueError("Field 'image' decoded to empty PNG data.")
+
+    try:
+        with Image.open(io.BytesIO(png_bytes)) as img:
+            img = img.convert("RGB")
+            tensor = pil_to_tensor(img)
+        return ensure_contiguous(tensor)
+    except Exception as exc:
+        raise ValueError(f"Failed to decode PNG image payload: {exc}") from exc
 
 
 @server.PromptServer.instance.routes.post("/distributed/prepare_job")
@@ -92,9 +197,32 @@ async def distributed_queue_endpoint(request):
     except Exception as exc:
         return await handle_api_error(request, f"Invalid JSON payload: {exc}", 400)
 
+    auto_prepare = bool(data.get("auto_prepare"))
     prompt = data.get("prompt")
+    if prompt is None and auto_prepare:
+        # Transitional compatibility: allow payload.workflow.prompt when auto_prepare is enabled.
+        workflow_payload = data.get("workflow")
+        if isinstance(workflow_payload, dict):
+            candidate_prompt = workflow_payload.get("prompt")
+            if isinstance(candidate_prompt, dict):
+                prompt = candidate_prompt
+
     if not isinstance(prompt, dict):
         return await handle_api_error(request, "Field 'prompt' must be an object", 400)
+
+    # Accept either enabled_worker_ids (legacy) or workers list (auto-prepare path).
+    workers_field = data.get("workers")
+    if workers_field is not None and data.get("enabled_worker_ids") is None:
+        if isinstance(workers_field, list):
+            enabled_ids = []
+            for entry in workers_field:
+                if isinstance(entry, dict):
+                    worker_id = entry.get("id")
+                else:
+                    worker_id = entry
+                if worker_id is not None:
+                    enabled_ids.append(str(worker_id))
+            data["enabled_worker_ids"] = enabled_ids
 
     workflow_meta = data.get("workflow")
     client_id = data.get("client_id")
@@ -117,6 +245,7 @@ async def distributed_queue_endpoint(request):
         return web.json_response({
             "prompt_id": prompt_id,
             "worker_count": worker_count,
+            "auto_prepare_supported": True,
         })
     except Exception as exc:
         return await handle_api_error(request, exc, 500)
@@ -130,72 +259,11 @@ async def load_image_endpoint(request):
         
         if not image_path:
             return await handle_api_error(request, "Missing image_path", 400)
-        
-        import folder_paths
-        import base64
-        import io
-        import hashlib
-        
-        # Use ComfyUI's folder paths to find the file
-        full_path = folder_paths.get_annotated_filepath(image_path)
-        
-        if not os.path.exists(full_path):
-            return await handle_api_error(request, f"File not found: {image_path}", 404)
-        
-        # Calculate file hash
-        hash_md5 = hashlib.md5()
-        with open(full_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_md5.update(chunk)
-        file_hash = hash_md5.hexdigest()
-        
-        # Check if it's a video file
-        video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
-        file_ext = os.path.splitext(full_path)[1].lower()
-        
-        if file_ext in video_extensions:
-            # For video files, read the raw bytes
-            with open(full_path, 'rb') as f:
-                file_data = f.read()
-            
-            # Determine MIME type
-            mime_types = {
-                '.mp4': 'video/mp4',
-                '.avi': 'video/x-msvideo', 
-                '.mov': 'video/quicktime',
-                '.mkv': 'video/x-matroska',
-                '.webm': 'video/webm'
-            }
-            mime_type = mime_types.get(file_ext, 'video/mp4')
-            
-            # Return base64 encoded video with data URL
-            video_base64 = base64.b64encode(file_data).decode('utf-8')
-            return web.json_response({
-                "status": "success",
-                "image_data": f"data:{mime_type};base64,{video_base64}",
-                "hash": file_hash
-            })
-        else:
-            # For images, use PIL
-            from PIL import Image
-            
-            # Load and convert to base64
-            with Image.open(full_path) as img:
-                # Convert to RGB if needed
-                if img.mode not in ('RGB', 'RGBA'):
-                    img = img.convert('RGB')
-                
-                # Save to bytes
-                buffer = io.BytesIO()
-                img.save(buffer, format='PNG', compress_level=1)  # Fast compression
-                img_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-            
-            return web.json_response({
-                "status": "success",
-                "image_data": f"data:image/png;base64,{img_base64}",
-                "hash": file_hash
-            })
-        
+        loop = asyncio.get_running_loop()
+        payload = await loop.run_in_executor(None, _decode_image_sync, image_path)
+        return web.json_response(payload)
+    except FileNotFoundError:
+        return await handle_api_error(request, f"File not found: {image_path}", 404)
     except Exception as e:
         return await handle_api_error(request, e, 500)
 
@@ -209,34 +277,9 @@ async def check_file_endpoint(request):
         
         if not filename or not expected_hash:
             return await handle_api_error(request, "Missing filename or hash", 400)
-        
-        import folder_paths
-        import hashlib
-        
-        # Use ComfyUI's folder paths to find the file
-        full_path = folder_paths.get_annotated_filepath(filename)
-        
-        if not os.path.exists(full_path):
-            return web.json_response({
-                "status": "success",
-                "exists": False
-            })
-        
-        # Calculate file hash
-        hash_md5 = hashlib.md5()
-        with open(full_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_md5.update(chunk)
-        file_hash = hash_md5.hexdigest()
-        
-        # Check if hash matches
-        hash_matches = file_hash == expected_hash
-        
-        return web.json_response({
-            "status": "success",
-            "exists": True,
-            "hash_matches": hash_matches
-        })
+        loop = asyncio.get_running_loop()
+        payload = await loop.run_in_executor(None, _check_file_sync, filename, expected_hash)
+        return web.json_response(payload)
         
     except Exception as e:
         return await handle_api_error(request, e, 500)
@@ -245,160 +288,59 @@ async def check_file_endpoint(request):
 @server.PromptServer.instance.routes.post("/distributed/job_complete")
 async def job_complete_endpoint(request):
     try:
-        data = await request.post()
-        multi_job_id = data.get('multi_job_id')
-        worker_id = data.get('worker_id')
-        is_last = data.get('is_last', 'False').lower() == 'true'
-        
-        if multi_job_id is None or worker_id is None:
-            return await handle_api_error(request, "Missing multi_job_id or worker_id", 400)
+        data = await request.json()
+    except Exception as exc:
+        return await handle_api_error(request, f"Invalid JSON payload: {exc}", 400)
 
-        # Check for batch mode
-        batch_size = int(data.get('batch_size', 0))
-        tensors = []
-        
-        if batch_size > 0:
-            # Batch mode: Extract multiple images
-            debug_log(f"job_complete received batch - job_id: {multi_job_id}, worker: {worker_id}, batch_size: {batch_size}")
-            
-            # Check for JSON metadata
-            metadata_field = data.get('images_metadata')
-            metadata = None
-            if metadata_field:
-                # New JSON metadata format
-                try:
-                    # Handle different types of metadata field
-                    if hasattr(metadata_field, 'file'):
-                        # File-like object
-                        metadata_str = metadata_field.file.read().decode('utf-8')
-                    elif isinstance(metadata_field, (bytes, bytearray)):
-                        # Direct bytes/bytearray
-                        metadata_str = metadata_field.decode('utf-8')
-                    else:
-                        # String
-                        metadata_str = str(metadata_field)
-                    
-                    metadata = json.loads(metadata_str)
-                    if len(metadata) != batch_size:
-                        return await handle_api_error(request, "Metadata length mismatch", 400)
-                    debug_log(f"Using JSON metadata for batch from worker {worker_id}")
-                except Exception as e:
-                    log(f"Error parsing JSON metadata from worker {worker_id}: {e}")
-                    return await handle_api_error(request, f"Metadata parsing error: {e}", 400)
-            else:
-                # Legacy format - log deprecation warning
-                debug_log(f"WARNING: Worker {worker_id} using legacy field format. Please update to use JSON metadata.")
-            
-            # Process images with per-item error handling
-            image_data_list = []  # List of tuples: (index, tensor)
-            
-            for i in range(batch_size):
-                image_field = data.get(f'image_{i}')
-                if image_field is None:
-                    log(f"Missing image_{i} from worker {worker_id}, skipping")
-                    continue
-                    
-                try:
-                    img_data = image_field.file.read()
-                    img = Image.open(io.BytesIO(img_data)).convert("RGB")
-                    tensor = pil_to_tensor(img)
-                    tensor = ensure_contiguous(tensor)
-                    
-                    # Get expected index from metadata or use position
-                    if metadata and i < len(metadata):
-                        expected_idx = metadata[i].get('index', i)
-                        if i != expected_idx:
-                            debug_log(f"Warning: Image order mismatch at position {i}, expected index {expected_idx}")
-                    else:
-                        expected_idx = i
-                    
-                    image_data_list.append((expected_idx, tensor))
-                except Exception as e:
-                    log(f"Error processing image {i} from worker {worker_id}: {e}, skipping this image")
-                    # Continue processing other images instead of failing entire batch
-                    continue
-            
-            # Check if we got any valid images
-            if not image_data_list:
-                return await handle_api_error(request, "No valid images in batch", 400)
-            
-            # Sort by index to ensure correct order
-            image_data_list.sort(key=lambda x: x[0])
-            tensors = [tensor for _, tensor in image_data_list]
-            
-            # Keep the indices for later use
-            indices = [idx for idx, _ in image_data_list]
-            
-            # Validate final order
-            if metadata:
-                debug_log(f"Reordered {len(tensors)} images based on metadata indices")
-        else:
-            # Fallback for single-image mode (backward compatibility)
-            image_file = data.get('image')
-            image_index = data.get('image_index')
-            
-            debug_log(f"job_complete received single - job_id: {multi_job_id}, worker: {worker_id}, index: {image_index}, is_last: {is_last}")
-            
-            if not image_file:
-                return await handle_api_error(request, "Missing image data", 400)
-                
-            try:
-                img_data = image_file.file.read()
-                img = Image.open(io.BytesIO(img_data)).convert("RGB")
-                tensor = pil_to_tensor(img)
-                tensor = ensure_contiguous(tensor)
-                tensors = [tensor]
-            except Exception as e:
-                log(f"Error processing image from worker {worker_id}: {e}")
-                return await handle_api_error(request, f"Image processing error: {e}", 400)
+    if not isinstance(data, dict):
+        return await handle_api_error(request, "Expected a JSON object body", 400)
 
-        # Parse audio data if present
-        audio_data = None
-        audio_waveform_field = data.get('audio_waveform')
-        audio_sample_rate = data.get('audio_sample_rate')
-        if audio_waveform_field is not None:
-            try:
-                waveform_bytes = audio_waveform_field.file.read()
-                waveform_buffer = io.BytesIO(waveform_bytes)
-                try:
-                    waveform_tensor = torch.load(waveform_buffer, weights_only=True)
-                except TypeError:
-                    waveform_tensor = torch.load(waveform_buffer)
-                sample_rate = int(audio_sample_rate) if audio_sample_rate else 44100
-                audio_data = {"waveform": waveform_tensor, "sample_rate": sample_rate}
-                debug_log(f"Received audio from worker {worker_id}: shape={waveform_tensor.shape}, sample_rate={sample_rate}")
-            except Exception as e:
-                log(f"Error parsing audio from worker {worker_id}: {e}")
+    try:
+        job_id = data.get("job_id")
+        worker_id = data.get("worker_id")
+        batch_idx = data.get("batch_idx")
+        image_payload = data.get("image")
+        is_last = data.get("is_last")
 
-        # Put batch into queue
+        errors = []
+        if not isinstance(job_id, str) or not job_id.strip():
+            errors.append("job_id: expected non-empty string")
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            errors.append("worker_id: expected non-empty string")
+        if not isinstance(batch_idx, int) or batch_idx < 0:
+            errors.append("batch_idx: expected non-negative integer")
+        if not isinstance(image_payload, str) or not image_payload.strip():
+            errors.append("image: expected non-empty base64 PNG string")
+        if not isinstance(is_last, bool):
+            errors.append("is_last: expected boolean")
+        if errors:
+            return web.json_response({"error": errors}, status=400)
+
+        tensor = _decode_canonical_png_tensor(image_payload)
+        multi_job_id = job_id.strip()
+        worker_id = worker_id.strip()
+
         async with prompt_server.distributed_jobs_lock:
-            debug_log(f"Current pending jobs: {list(prompt_server.distributed_pending_jobs.keys())}")
-            if multi_job_id in prompt_server.distributed_pending_jobs:
-                if batch_size > 0:
-                    # Put batch as single item with indices
-                    await prompt_server.distributed_pending_jobs[multi_job_id].put({
-                        'worker_id': worker_id,
-                        'tensors': tensors,
-                        'indices': indices,
-                        'is_last': is_last,
-                        'audio': audio_data
-                    })
-                    debug_log(f"Received batch result for job {multi_job_id} from worker {worker_id}, size={len(tensors)}")
-                else:
-                    # Put single image (backward compat)
-                    await prompt_server.distributed_pending_jobs[multi_job_id].put({
-                        'tensor': tensors[0],
-                        'worker_id': worker_id,
-                        'image_index': int(image_index) if image_index else 0,
-                        'is_last': is_last,
-                        'audio': audio_data
-                    })
-                    debug_log(f"Received single result for job {multi_job_id} from worker {worker_id}")
-                    
-                debug_log(f"Queue size after put: {prompt_server.distributed_pending_jobs[multi_job_id].qsize()}")
-                return web.json_response({"status": "success"})
-            else:
+            pending = prompt_server.distributed_pending_jobs.get(multi_job_id)
+            if pending is None:
                 log(f"ERROR: Job {multi_job_id} not found in distributed_pending_jobs")
                 return await handle_api_error(request, "Job not found or already complete", 404)
+
+            await pending.put(
+                {
+                    "tensor": tensor,
+                    "worker_id": worker_id,
+                    "image_index": int(batch_idx),
+                    "is_last": is_last,
+                    "audio": None,
+                }
+            )
+            debug_log(
+                f"job_complete received canonical envelope - job_id: {multi_job_id}, "
+                f"worker: {worker_id}, batch_idx: {batch_idx}, is_last: {is_last}, "
+                f"queue_size: {pending.qsize()}"
+            )
+
+        return web.json_response({"status": "success"})
     except Exception as e:
         return await handle_api_error(request, e)

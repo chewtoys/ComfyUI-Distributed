@@ -4,13 +4,14 @@ import { DistributedUI } from './ui.js';
 
 import { createStateManager } from './stateManager.js';
 import { createApiClient } from './apiClient.js';
-import { renderSidebarContent } from './sidebarRenderer.js';
+import { renderSidebarContent, updateWorkerCard } from './sidebarRenderer.js';
 import { handleInterruptWorkers, handleClearMemory } from './workerUtils.js';
-import { setupInterceptor, executeParallelDistributed } from './executionUtils.js';
-import { BUTTON_STYLES, PULSE_ANIMATION_CSS, TIMEOUTS, STATUS_COLORS, generateUUID } from './constants.js';
+import { setupInterceptor } from './executionUtils.js';
+import { BUTTON_STYLES, PULSE_ANIMATION_CSS, TIMEOUTS, STATUS_COLORS } from './constants.js';
 import { updateTunnelUIElements, refreshTunnelStatus, handleTunnelToggle } from './tunnelManager.js';
-import { checkAllWorkerStatuses, checkMasterStatus, getWorkerUrl, checkWorkerStatus, launchWorker, stopWorker, clearLaunchingFlag, loadManagedWorkers, updateWorkerControls, viewWorkerLog, refreshLog, startLogAutoRefresh, stopLogAutoRefresh, toggleWorkerExpanded } from './workerLifecycle.js';
-import { isRemoteWorker, isCloudWorker, saveWorkerSettings, cancelWorkerSettings, deleteWorker, addNewWorker } from './workerSettings.js';
+import { checkAllWorkerStatuses, getWorkerUrl, checkWorkerStatus, launchWorker, stopWorker, loadManagedWorkers, updateWorkerControls, viewWorkerLog, startLogAutoRefresh, stopLogAutoRefresh, toggleWorkerExpanded } from './workerLifecycle.js';
+import { isRemoteWorker, saveWorkerSettings, cancelWorkerSettings, deleteWorker, addNewWorker } from './workerSettings.js';
+import { detectMasterIP } from './masterDetection.js';
 
 class DistributedExtension {
     constructor() {
@@ -190,7 +191,7 @@ class DistributedExtension {
                 if (enabled) {
                     // Enabled: Start with checking state and trigger check
                     this.ui.updateStatusDot(workerId, STATUS_COLORS.OFFLINE_RED, "Checking status...", true);
-                    setTimeout(() => this.checkWorkerStatus(worker), TIMEOUTS.STATUS_CHECK_DELAY);
+                    setTimeout(() => checkWorkerStatus(this, worker), TIMEOUTS.STATUS_CHECK_DELAY);
                 } else {
                     // Disabled: Set to gray
                     this.ui.updateStatusDot(workerId, STATUS_COLORS.DISABLED_GRAY, "Disabled", false);
@@ -292,28 +293,15 @@ class DistributedExtension {
         this.panelElement = null;
     }
 
-    // updateSummary removed
-
     // --- Core Logic & Execution ---
 
     setupInterceptor() {
         setupInterceptor(this);
     }
 
-    async executeParallelDistributed(promptWrapper) {
-        return executeParallelDistributed(this, promptWrapper);
-    }
-
-    startStatusChecking() {
-        this.checkAllWorkerStatuses();
-    }
-
+    // TODO: Gradually migrate external call sites to direct module functions, then remove these wrappers.
     async checkAllWorkerStatuses() {
         return checkAllWorkerStatuses(this);
-    }
-
-    async checkMasterStatus() {
-        return checkMasterStatus(this);
     }
 
     // Helper to build worker URL
@@ -321,8 +309,8 @@ class DistributedExtension {
         return getWorkerUrl(this, worker, endpoint);
     }
 
-    async checkWorkerStatus(worker) {
-        return checkWorkerStatus(this, worker);
+    updateWorkerCard(workerId, newStatus) {
+        return updateWorkerCard(this, workerId, newStatus);
     }
 
     async launchWorker(workerId) {
@@ -331,10 +319,6 @@ class DistributedExtension {
 
     async stopWorker(workerId) {
         return stopWorker(this, workerId);
-    }
-
-    async clearLaunchingFlag(workerId) {
-        return clearLaunchingFlag(this, workerId);
     }
 
     // Generic async button action handler
@@ -397,16 +381,8 @@ class DistributedExtension {
         return viewWorkerLog(this, workerId);
     }
 
-    async refreshLog(workerId, silent = false) {
-        return refreshLog(this, workerId, silent);
-    }
-
     isRemoteWorker(worker) {
         return isRemoteWorker(this, worker);
-    }
-
-    isCloudWorker(worker) {
-        return isCloudWorker(this, worker);
     }
 
     getMasterUrl() {
@@ -450,166 +426,7 @@ class DistributedExtension {
     }
 
     async detectMasterIP() {
-        try {
-            // Detect if we're running on Runpod
-            const isRunpod = window.location.hostname.endsWith('.proxy.runpod.net');
-            if (isRunpod) {
-                this.log("Detected Runpod environment", "info");
-            }
-            
-            const data = await this.api.getNetworkInfo();
-            this.log("Network info: " + JSON.stringify(data), "debug");
-            
-            // Store CUDA device info
-            if (data.cuda_device !== null && data.cuda_device !== undefined) {
-                this.masterCudaDevice = data.cuda_device;
-                
-                // Store persistently in config if not already set or changed
-                if (!this.config.master) this.config.master = {};
-                if (this.config.master.cuda_device === undefined || this.config.master.cuda_device !== data.cuda_device) {
-                    this.config.master.cuda_device = data.cuda_device;
-                    try {
-                        await this.api.updateMaster({ cuda_device: data.cuda_device });
-                        this.log(`Stored master CUDA device: ${data.cuda_device}`, "debug");
-                    } catch (error) {
-                        this.log(`Error storing master CUDA device: ${error.message}`, "error");
-                    }
-                }
-                
-                // Update the master display with CUDA info
-                this.ui.updateMasterDisplay(this);
-            }
-            
-            // Store CUDA device count for auto-population
-            if (data.cuda_device_count > 0) {
-                this.cudaDeviceCount = data.cuda_device_count;
-                this.log(`Detected ${this.cudaDeviceCount} CUDA devices`, "info");
-                
-                // Auto-populate workers if conditions are met
-                const shouldAutoPopulate = 
-                    !this.config.settings.has_auto_populated_workers && // Never populated before
-                    (!this.config.workers || this.config.workers.length === 0); // No workers exist
-                
-                this.log(`Auto-population check: has_populated=${this.config.settings.has_auto_populated_workers}, workers=${this.config.workers ? this.config.workers.length : 'null'}, should_populate=${shouldAutoPopulate}`, "debug");
-                
-                if (shouldAutoPopulate) {
-                    this.log(`Auto-populating workers based on ${this.cudaDeviceCount} CUDA devices (excluding master on CUDA ${this.masterCudaDevice})`, "info");
-                    
-                    const newWorkers = [];
-                    let workerNum = 1;
-                    let portOffset = 0;
-                    
-                    for (let i = 0; i < this.cudaDeviceCount; i++) {
-                        // Skip the CUDA device used by master
-                        if (i === this.masterCudaDevice) {
-                            this.log(`Skipping CUDA ${i} (used by master)`, "debug");
-                            continue;
-                        }
-                        
-                        const worker = {
-                            id: generateUUID(),
-                            name: `Worker ${workerNum}`,
-                            host: isRunpod ? null : "localhost",
-                            port: 8189 + portOffset,
-                            cuda_device: i,
-                            enabled: true,
-                            extra_args: isRunpod ? "--listen" : ""
-                        };
-                        newWorkers.push(worker);
-                        workerNum++;
-                        portOffset++;
-                    }
-                    
-                    // Only proceed if we have workers to add
-                    if (newWorkers.length > 0) {
-                        this.log(`Auto-populating ${newWorkers.length} workers`, "info");
-                        
-                        // Add workers to config
-                        this.config.workers = newWorkers;
-                        
-                        // Set the flag to prevent future auto-population
-                        this.config.settings.has_auto_populated_workers = true;
-                        
-                        // Save each worker using the update endpoint
-                        for (const worker of newWorkers) {
-                            try {
-                                await this.api.updateWorker(worker.id, worker);
-                            } catch (error) {
-                                this.log(`Error saving worker ${worker.name}: ${error.message}`, "error");
-                            }
-                        }
-                        
-                        // Save the updated settings
-                        try {
-                            await this.api.updateSetting('has_auto_populated_workers', true);
-                        } catch (error) {
-                            this.log(`Error saving auto-population flag: ${error.message}`, "error");
-                        }
-                        
-                        this.log(`Auto-populated ${newWorkers.length} workers and saved config`, "info");
-                        
-                        // Show success notification
-                        if (app.extensionManager?.toast) {
-                            app.extensionManager.toast.add({
-                                severity: "success",
-                                summary: "Workers Auto-populated",
-                                detail: `Automatically created ${newWorkers.length} workers based on detected CUDA devices`,
-                                life: 5000
-                            });
-                        }
-                        
-                        // Reload the config to include the new workers
-                        await this.loadConfig();
-                    } else {
-                        this.log("No additional CUDA devices available for workers (all used by master)", "debug");
-                    }
-                }
-            }
-            
-            // Check if we already have a master host configured
-            if (this.config?.master?.host) {
-                this.log(`Master host already configured: ${this.config.master.host}`, "debug");
-                return;
-            }
-            
-            // For Runpod, use the proxy hostname as master host
-            if (isRunpod) {
-                const runpodHost = window.location.hostname;
-                this.log(`Setting Runpod master host: ${runpodHost}`, "info");
-                
-                // Save the Runpod host
-                await this.api.updateMaster({ host: runpodHost });
-                
-                // Update local config
-                if (!this.config.master) this.config.master = {};
-                this.config.master.host = runpodHost;
-                
-                // Show notification
-                if (app.extensionManager?.toast) {
-                    app.extensionManager.toast.add({
-                        severity: "info",
-                        summary: "Runpod Auto-Configuration",
-                        detail: `Master host set to ${runpodHost} with --listen flag for workers`,
-                        life: 5000
-                    });
-                }
-                return; // Skip regular IP detection for Runpod
-            }
-            
-            // Use the recommended IP from the backend
-            if (data.recommended_ip && data.recommended_ip !== '127.0.0.1') {
-                this.log(`Auto-detected master IP: ${data.recommended_ip}`, "info");
-                
-                // Save the detected IP (pass true to suppress notification)
-                await this.api.updateMaster({ host: data.recommended_ip });
-                
-                // Update local config immediately
-                if (!this.config.master) this.config.master = {};
-                this.config.master.host = data.recommended_ip;
-            }
-        } catch (error) {
-            this.log("Error detecting master IP: " + error.message, "error");
-        }
+        return detectMasterIP(this);
     }
 
     async saveWorkerSettings(workerId) {

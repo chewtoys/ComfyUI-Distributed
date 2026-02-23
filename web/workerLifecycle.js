@@ -1,4 +1,23 @@
 import { BUTTON_STYLES, TIMEOUTS, STATUS_COLORS, ENDPOINTS } from './constants.js';
+import { normalizeWorkerUrl } from './urlUtils.js';
+
+export { normalizeWorkerUrl };
+
+function setStatusDotClass(dot, statusClass) {
+    if (!dot) {
+        return;
+    }
+    const classes = [
+        "worker-status--online",
+        "worker-status--offline",
+        "worker-status--unknown",
+        "worker-status--processing",
+    ];
+    dot.classList.remove(...classes);
+    if (statusClass) {
+        dot.classList.add(statusClass);
+    }
+}
 
 export async function checkAllWorkerStatuses(extension) {
     // Don't continue if panel is closed
@@ -62,17 +81,17 @@ export async function checkMasterStatus(extension) {
             if (statusDot) {
                 if (!extension.isMasterParticipating()) {
                     if (isProcessing) {
-                        statusDot.style.backgroundColor = STATUS_COLORS.PROCESSING_YELLOW;
+                        setStatusDotClass(statusDot, "worker-status--processing");
                         statusDot.title = `Orchestrating (${queueRemaining} in queue)`;
                     } else {
-                        statusDot.style.backgroundColor = STATUS_COLORS.DISABLED_GRAY;
+                        setStatusDotClass(statusDot, "worker-status--unknown");
                         statusDot.title = "Master orchestrator only";
                     }
                 } else if (isProcessing) {
-                    statusDot.style.backgroundColor = STATUS_COLORS.PROCESSING_YELLOW;
+                    setStatusDotClass(statusDot, "worker-status--processing");
                     statusDot.title = `Processing (${queueRemaining} in queue)`;
                 } else {
-                    statusDot.style.backgroundColor = STATUS_COLORS.ONLINE_GREEN;
+                    setStatusDotClass(statusDot, "worker-status--online");
                     statusDot.title = "Online";
                 }
             }
@@ -81,7 +100,10 @@ export async function checkMasterStatus(extension) {
         // Master is always online (we're running on it), so keep it green
         const statusDot = document.getElementById("master-status");
         if (statusDot) {
-            statusDot.style.backgroundColor = extension.isMasterParticipating() ? STATUS_COLORS.ONLINE_GREEN : STATUS_COLORS.DISABLED_GRAY;
+            setStatusDotClass(
+                statusDot,
+                extension.isMasterParticipating() ? "worker-status--online" : "worker-status--unknown"
+            );
             statusDot.title = extension.isMasterParticipating() ? "Online" : "Master orchestrator only";
         }
     }
@@ -122,7 +144,9 @@ export function getWorkerUrl(extension, worker, endpoint = "") {
     const needsPort = !isRunpodProxy && resolvedPort !== defaultPort;
     const portStr = needsPort ? `:${resolvedPort}` : "";
 
-    return `${protocol}://${finalHost}${portStr}${endpoint}`;
+    // NOTE: Runpod host rewriting here intentionally diverges from Python-side heuristics
+    // in utils.network.build_worker_url. Preserve current browser behavior for now.
+    return normalizeWorkerUrl(`${protocol}://${finalHost}${portStr}${endpoint}`);
 }
 
 export async function checkWorkerStatus(extension, worker) {
@@ -156,9 +180,9 @@ export async function checkWorkerStatus(extension, worker) {
 
             // Update status dot based on processing state
             if (isProcessing) {
-                extension.ui.updateStatusDot(worker.id, "#f0ad4e", `Online - Processing (${queueRemaining} in queue)`, false);
+                extension.ui.updateStatusDot(worker.id, STATUS_COLORS.PROCESSING_YELLOW, `Online - Processing (${queueRemaining} in queue)`, false);
             } else {
-                extension.ui.updateStatusDot(worker.id, "#3ca03c", "Online - Idle", false);
+                extension.ui.updateStatusDot(worker.id, STATUS_COLORS.ONLINE_GREEN, "Online - Idle", false);
             }
 
             // Clear launching state since worker is now online
@@ -184,10 +208,10 @@ export async function checkWorkerStatus(extension, worker) {
 
         // Check if worker is launching
         if (extension.state.isWorkerLaunching(worker.id)) {
-            extension.ui.updateStatusDot(worker.id, "#f0ad4e", "Launching...", true);
+            extension.ui.updateStatusDot(worker.id, STATUS_COLORS.PROCESSING_YELLOW, "Launching...", true);
         } else if (worker.enabled) {
             // Only update to red if not currently launching AND still enabled
-            extension.ui.updateStatusDot(worker.id, "#c04c4c", "Offline - Cannot connect", false);
+            extension.ui.updateStatusDot(worker.id, STATUS_COLORS.OFFLINE_RED, "Offline - Cannot connect", false);
         }
         // If disabled, don't update the dot (leave it gray)
 
@@ -195,7 +219,10 @@ export async function checkWorkerStatus(extension, worker) {
     }
 
     // Update control buttons based on new status
-    updateWorkerControls(extension, worker.id);
+    const updatedInPlace = extension.updateWorkerCard?.(worker.id, extension.state.getWorkerStatus(worker.id));
+    if (!updatedInPlace) {
+        updateWorkerControls(extension, worker.id);
+    }
 }
 
 export async function launchWorker(extension, workerId) {
@@ -215,7 +242,7 @@ export async function launchWorker(extension, workerId) {
     // Re-query button AFTER updateWorkerEnabled (which may re-render sidebar)
     const launchBtn = document.querySelector(`#controls-${workerId} button`);
 
-    extension.ui.updateStatusDot(workerId, "#f0ad4e", "Launching...", true);
+    extension.ui.updateStatusDot(workerId, STATUS_COLORS.PROCESSING_YELLOW, "Launching...", true);
     extension.state.setWorkerLaunching(workerId, true);
 
     // Allow 90 seconds for worker to launch (model loading can take time)
@@ -283,7 +310,7 @@ export async function stopWorker(extension, workerId) {
             extension.state.setWorkerManaged(workerId, null);
 
             // Immediately update status to offline
-            extension.ui.updateStatusDot(workerId, "#c04c4c", "Offline");
+            extension.ui.updateStatusDot(workerId, STATUS_COLORS.OFFLINE_RED, "Offline");
             extension.state.setWorkerStatus(workerId, { online: false });
 
             // Flash success feedback
@@ -307,7 +334,7 @@ export async function stopWorker(extension, workerId) {
 
                 // If already stopped, update status immediately
                 if (result.message.includes("already stopped")) {
-                    extension.ui.updateStatusDot(workerId, "#c04c4c", "Offline");
+                    extension.ui.updateStatusDot(workerId, STATUS_COLORS.OFFLINE_RED, "Offline");
                     extension.state.setWorkerStatus(workerId, { online: false });
                 }
 
@@ -529,8 +556,8 @@ export function stopLogAutoRefresh(extension) {
 }
 
 export function toggleWorkerExpanded(extension, workerId) {
-    const settingsDiv = document.getElementById(`settings-${workerId}`);
-    const gpuDiv = settingsDiv?.closest('[style*="margin-bottom: 12px"]');
+    const gpuDiv = document.querySelector(`[data-worker-id="${workerId}"]`);
+    const settingsDiv = gpuDiv?.querySelector(`#settings-${workerId}`) || document.getElementById(`settings-${workerId}`);
     const settingsArrow = gpuDiv?.querySelector(".settings-arrow");
 
     if (!settingsDiv) {

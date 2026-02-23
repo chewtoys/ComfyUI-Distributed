@@ -15,6 +15,134 @@ from ...utils.usdu_managment import (
 
 
 class StaticModeMixin:
+    def _poll_job_ready(self, multi_job_id, master_url, worker_id=None, max_attempts=20):
+        """Poll master for job readiness to avoid worker/master initialization race."""
+        for attempt in range(max_attempts):
+            ready = run_async_in_server_loop(
+                self._check_job_status(multi_job_id, master_url),
+                timeout=5.0
+            )
+            if ready:
+                if worker_id:
+                    debug_log(f"Worker[{worker_id[:8]}] job {multi_job_id} ready after {attempt} attempts")
+                else:
+                    debug_log(f"Job {multi_job_id} ready after {attempt} attempts")
+                return True
+            time.sleep(1.0)
+        return False
+
+    def _extract_and_process_tile(
+        self,
+        upscaled_image,
+        tile_id,
+        all_tiles,
+        tile_width,
+        tile_height,
+        padding,
+        force_uniform_tiles,
+        model,
+        positive,
+        negative,
+        vae,
+        seed,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        denoise,
+        tiled_decode,
+        width,
+        height,
+    ):
+        """Extract one tile position for the whole batch and process it."""
+        tx, ty = all_tiles[tile_id]
+        tile_batch, x1, y1, ew, eh = self.extract_batch_tile_with_padding(
+            upscaled_image, tx, ty, tile_width, tile_height, padding, force_uniform_tiles
+        )
+        region = (x1, y1, x1 + ew, y1 + eh)
+        processed_batch = self.process_tiles_batch(
+            tile_batch, model, positive, negative, vae,
+            seed, steps, cfg, sampler_name, scheduler, denoise, tiled_decode,
+            region, (width, height)
+        )
+        return processed_batch, x1, y1, ew, eh
+
+    def _flush_tiles_to_master(self, processed_tiles, multi_job_id, master_url, padding, worker_id):
+        """Send accumulated tile payloads to master and return a fresh accumulator."""
+        if not processed_tiles:
+            return processed_tiles
+        run_async_in_server_loop(
+            self.send_tiles_batch_to_master(processed_tiles, multi_job_id, master_url, padding, worker_id),
+            timeout=TILE_SEND_TIMEOUT
+        )
+        return []
+
+    def _master_process_one_tile(
+        self,
+        tile_id,
+        all_tiles,
+        upscaled_image,
+        result_images,
+        tile_masks,
+        multi_job_id,
+        batch_size,
+        num_tiles_per_image,
+        tile_width,
+        tile_height,
+        padding,
+        force_uniform_tiles,
+        model,
+        positive,
+        negative,
+        vae,
+        seed,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        denoise,
+        tiled_decode,
+        width,
+        height,
+    ):
+        """Process one tile_id across the batch and blend into result_images."""
+        processed_batch, x1, y1, ew, eh = self._extract_and_process_tile(
+            upscaled_image,
+            tile_id,
+            all_tiles,
+            tile_width,
+            tile_height,
+            padding,
+            force_uniform_tiles,
+            model,
+            positive,
+            negative,
+            vae,
+            seed,
+            steps,
+            cfg,
+            sampler_name,
+            scheduler,
+            denoise,
+            tiled_decode,
+            width,
+            height,
+        )
+        tile_mask = tile_masks[tile_id]
+        out_bs = processed_batch.shape[0] if hasattr(processed_batch, "shape") else batch_size
+        processed_items = min(batch_size, out_bs)
+        for b in range(processed_items):
+            tile_pil = tensor_to_pil(processed_batch, b)
+            if tile_pil.size != (ew, eh):
+                tile_pil = tile_pil.resize((ew, eh), Image.LANCZOS)
+            result_images[b] = self.blend_tile(result_images[b], tile_pil, x1, y1, (ew, eh), tile_mask, padding)
+            global_idx = b * num_tiles_per_image + tile_id
+            run_async_in_server_loop(
+                _mark_task_completed(multi_job_id, global_idx, {'batch_idx': b, 'tile_idx': tile_id}),
+                timeout=5.0
+            )
+        return processed_items
+
     def _process_worker_static_sync(self, upscaled_image, model, positive, negative, vae,
                                     seed, steps, cfg, sampler_name, scheduler, denoise,
                                     tile_width, tile_height, padding, mask_blur,
@@ -39,18 +167,8 @@ class StaticModeMixin:
         log(f"USDU Dist Worker[{worker_id[:8]}]: Canvas {width}x{height} | Tile {tile_width}x{tile_height} | Tiles/image {num_tiles_per_image} | Batch {batch_size}")
         processed_count = 0
 
-        # Poll for job readiness
         max_poll_attempts = 20
-        for attempt in range(max_poll_attempts):
-            ready = run_async_in_server_loop(
-                self._check_job_status(multi_job_id, master_url),
-                timeout=5.0
-            )
-            if ready:
-                debug_log(f"Worker[{worker_id[:8]}] job {multi_job_id} ready after {attempt} attempts")
-                break
-            time.sleep(1.0)
-        else:
+        if not self._poll_job_ready(multi_job_id, master_url, worker_id=worker_id, max_attempts=max_poll_attempts):
             log(f"Job {multi_job_id} not ready after {max_poll_attempts} attempts, aborting")
             return (upscaled_image,)
 
@@ -70,17 +188,27 @@ class StaticModeMixin:
             debug_log(f"Worker[{worker_id[:8]}] - Assigned tile_id {tile_idx}")
             processed_count += batch_size
             tile_id = tile_idx
-            tx, ty = all_tiles[tile_id]
-            # Extract tile for entire batch
-            tile_batch, x1, y1, ew, eh = self.extract_batch_tile_with_padding(
-                upscaled_image, tx, ty, tile_width, tile_height, padding, force_uniform_tiles
-            )
-            # Process batch
-            region = (x1, y1, x1 + ew, y1 + eh)
-            processed_batch = self.process_tiles_batch(
-                tile_batch, model, positive, negative, vae,
-                seed, steps, cfg, sampler_name, scheduler, denoise, tiled_decode,
-                region, (width, height)
+            processed_batch, x1, y1, ew, eh = self._extract_and_process_tile(
+                upscaled_image,
+                tile_id,
+                all_tiles,
+                tile_width,
+                tile_height,
+                padding,
+                force_uniform_tiles,
+                model,
+                positive,
+                negative,
+                vae,
+                seed,
+                steps,
+                cfg,
+                sampler_name,
+                scheduler,
+                denoise,
+                tiled_decode,
+                width,
+                height,
             )
             # Queue results
             for b in range(batch_size):
@@ -107,18 +235,14 @@ class StaticModeMixin:
 
             # Send tiles in batches within loop
             if len(processed_tiles) >= MAX_BATCH:
-                run_async_in_server_loop(
-                    self.send_tiles_batch_to_master(processed_tiles, multi_job_id, master_url, padding, worker_id),
-                    timeout=TILE_SEND_TIMEOUT
+                processed_tiles = self._flush_tiles_to_master(
+                    processed_tiles, multi_job_id, master_url, padding, worker_id
                 )
-                processed_tiles = []
 
         # Send any remaining tiles
-        if processed_tiles:
-            run_async_in_server_loop(
-                self.send_tiles_batch_to_master(processed_tiles, multi_job_id, master_url, padding, worker_id),
-                timeout=TILE_SEND_TIMEOUT
-            )
+        processed_tiles = self._flush_tiles_to_master(
+            processed_tiles, multi_job_id, master_url, padding, worker_id
+        )
         
         debug_log(f"Worker {worker_id} completed all assigned and requeued tiles")
         return (upscaled_image,)
@@ -222,29 +346,34 @@ class StaticModeMixin:
             )
             if tile_idx is not None:
                 consecutive_no_tile = 0
-                processed_count += batch_size
                 tile_id = tile_idx
-                tx, ty = all_tiles[tile_id]
-                tile_batch, x1, y1, ew, eh = self.extract_batch_tile_with_padding(
-                    upscaled_image, tx, ty, tile_width, tile_height, padding, force_uniform_tiles
+                processed_count += self._master_process_one_tile(
+                    tile_id,
+                    all_tiles,
+                    upscaled_image,
+                    result_images,
+                    tile_masks,
+                    multi_job_id,
+                    batch_size,
+                    num_tiles_per_image,
+                    tile_width,
+                    tile_height,
+                    padding,
+                    force_uniform_tiles,
+                    model,
+                    positive,
+                    negative,
+                    vae,
+                    seed,
+                    steps,
+                    cfg,
+                    sampler_name,
+                    scheduler,
+                    denoise,
+                    tiled_decode,
+                    width,
+                    height,
                 )
-                region = (x1, y1, x1 + ew, y1 + eh)
-                processed_batch = self.process_tiles_batch(
-                    tile_batch, model, positive, negative, vae,
-                    seed, steps, cfg, sampler_name, scheduler, denoise, tiled_decode,
-                    region, (width, height)
-                )
-                tile_mask = tile_masks[tile_id]
-                for b in range(batch_size):
-                    tile_pil = tensor_to_pil(processed_batch, b)
-                    if tile_pil.size != (ew, eh):
-                        tile_pil = tile_pil.resize((ew, eh), Image.LANCZOS)
-                    result_images[b] = self.blend_tile(result_images[b], tile_pil, x1, y1, (ew, eh), tile_mask, padding)
-                    global_idx = b * num_tiles_per_image + tile_id
-                    run_async_in_server_loop(
-                        _mark_task_completed(multi_job_id, global_idx, {'batch_idx': b, 'tile_idx': tile_id}),
-                        timeout=5.0
-                    )
                 log(f"USDU Dist: Tiles progress {processed_count}/{total_tiles} (tile {tile_id})")
             else:
                 consecutive_no_tile += 1
@@ -290,30 +419,33 @@ class StaticModeMixin:
                     if tile_id is None:
                         break
 
-                    # Extract batched tile and process across available batch
-                    tx, ty = all_tiles[tile_id]
-                    tile_batch, x1, y1, ew, eh = self.extract_batch_tile_with_padding(
-                        upscaled_image, tx, ty, tile_width, tile_height, padding, force_uniform_tiles
+                    self._master_process_one_tile(
+                        tile_id,
+                        all_tiles,
+                        upscaled_image,
+                        result_images,
+                        tile_masks,
+                        multi_job_id,
+                        batch_size,
+                        num_tiles_per_image,
+                        tile_width,
+                        tile_height,
+                        padding,
+                        force_uniform_tiles,
+                        model,
+                        positive,
+                        negative,
+                        vae,
+                        seed,
+                        steps,
+                        cfg,
+                        sampler_name,
+                        scheduler,
+                        denoise,
+                        tiled_decode,
+                        width,
+                        height,
                     )
-                    region = (x1, y1, x1 + ew, y1 + eh)
-                    processed_batch = self.process_tiles_batch(
-                        tile_batch, model, positive, negative, vae,
-                        seed, steps, cfg, sampler_name, scheduler, denoise, tiled_decode,
-                        region, (width, height)
-                    )
-                    tile_mask = tile_masks[tile_id]
-                    out_bs = processed_batch.shape[0] if hasattr(processed_batch, 'shape') else batch_size
-                    for b in range(min(batch_size, out_bs)):
-                        tile_pil = tensor_to_pil(processed_batch, b)
-                        if tile_pil.size != (ew, eh):
-                            tile_pil = tile_pil.resize((ew, eh), Image.LANCZOS)
-                        result_images[b] = self.blend_tile(result_images[b], tile_pil, x1, y1, (ew, eh), tile_mask, padding)
-                        global_idx = b * num_tiles_per_image + tile_id
-                        # Mark as completed so the collector state is consistent
-                        run_async_in_server_loop(
-                            _mark_task_completed(multi_job_id, global_idx, {'batch_idx': b, 'tile_idx': tile_id}),
-                            timeout=5.0
-                        )
         else:
             # Master processed all tiles
             collected_tasks = run_async_in_server_loop(

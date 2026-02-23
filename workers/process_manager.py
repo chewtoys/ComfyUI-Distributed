@@ -283,7 +283,7 @@ class WorkerProcessManager:
         # For restored processes without subprocess object
         if not process:
             try:
-                print(f"[Distributed] Stopping restored process (no subprocess object)")
+                debug_log(f"[Distributed] Stopping restored process (no subprocess object)")
                 if self._kill_process_tree(pid):
                     del self.processes[worker_id]
                     self.save_processes()
@@ -292,14 +292,14 @@ class WorkerProcessManager:
                 else:
                     return False, "Failed to stop worker process"
             except Exception as e:
-                print(f"[MultiGPU] Exception during stop: {e}")
+                log(f"[Distributed] Exception during stop: {e}")
                 return False, f"Error stopping worker: {str(e)}"
         
         # Normal case with subprocess object
         # Check if still running
         if process.poll() is not None:
             # Already stopped
-            print(f"[Distributed] Worker {worker_id} already stopped")
+            log(f"[Distributed] Worker {worker_id} already stopped")
             del self.processes[worker_id]
             self.save_processes()
             return False, "Worker already stopped"
@@ -315,7 +315,7 @@ class WorkerProcessManager:
                 return True, "Worker stopped"
             else:
                 # Fallback to normal termination
-                print(f"[Distributed] Process tree kill failed, trying normal termination")
+                log(f"[Distributed] Process tree kill failed, trying normal termination")
                 if process:
                     terminate_process(process, timeout=PROCESS_TERMINATION_TIMEOUT)
                 
@@ -324,7 +324,7 @@ class WorkerProcessManager:
                 return True, "Worker stopped (fallback)"
                 
         except Exception as e:
-            print(f"[Distributed] Exception during stop: {e}")
+            log(f"[Distributed] Exception during stop: {e}")
             return False, f"Error stopping worker: {str(e)}"
             
     def get_managed_workers(self):
@@ -353,7 +353,7 @@ class WorkerProcessManager:
             try:
                 self.stop_worker(worker_id)
             except Exception as e:
-                print(f"[Distributed] Error stopping worker {worker_id}: {e}")
+                log(f"[Distributed] Error stopping worker {worker_id}: {e}")
         
         # Clear all managed processes from config
         config = load_config()
@@ -377,10 +377,10 @@ class WorkerProcessManager:
                     'config': proc_info.get('config'),
                     'log_file': proc_info.get('log_file')
                 }
-                print(f"[Distributed] Restored worker {worker_id} (PID: {pid})")
+                debug_log(f"[Distributed] Restored worker {worker_id} (PID: {pid})")
             else:
                 if pid:
-                    print(f"[Distributed] Worker {worker_id} (PID: {pid}) is no longer running")
+                    debug_log(f"[Distributed] Worker {worker_id} (PID: {pid}) is no longer running")
     
     def save_processes(self):
         """Save process information to config."""
@@ -480,7 +480,7 @@ class WorkerProcessManager:
                 # Fall through to OS commands
         
         # Fallback to OS-specific commands
-        print(f"[Distributed] Using OS commands to kill process tree")
+        debug_log("[Distributed] Using OS commands to kill process tree")
         if platform.system() == "Windows":
             try:
                 # Use wmic to find child processes
@@ -490,7 +490,7 @@ class WorkerProcessManager:
                     lines = result.stdout.strip().split('\n')[1:]  # Skip header
                     child_pids = [line.strip() for line in lines if line.strip() and line.strip().isdigit()]
                     
-                    print(f"[Distributed] Found child processes: {child_pids}")
+                    debug_log(f"[Distributed] Found child processes: {child_pids}")
                     
                     # Kill each child
                     for child_pid in child_pids:
@@ -503,10 +503,10 @@ class WorkerProcessManager:
                 # Kill the parent with tree flag
                 result = subprocess.run(['taskkill', '/F', '/PID', str(pid), '/T'], 
                                       capture_output=True, text=True)
-                print(f"[Distributed] Taskkill result: {result.stdout.strip()}")
+                debug_log(f"[Distributed] Taskkill result: {result.stdout.strip()}")
                 return result.returncode == 0
             except Exception as e:
-                print(f"[Distributed] Error with taskkill: {e}")
+                log(f"[Distributed] Error with taskkill: {e}")
                 return False
         else:
             # Unix: use pkill

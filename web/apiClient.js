@@ -1,13 +1,16 @@
 import { TIMEOUTS } from './constants.js';
+import { normalizeWorkerUrl } from './urlUtils.js';
 
 export function createApiClient(baseUrl) {
+    const normalizedBaseUrl = normalizeWorkerUrl(baseUrl);
+
     const request = async (endpoint, options = {}, retries = TIMEOUTS.MAX_RETRIES) => {
         let lastError;
         let delay = TIMEOUTS.RETRY_DELAY; // Initial delay for exponential backoff
 
         for (let attempt = 0; attempt < retries; attempt++) {
             try {
-                const response = await fetch(`${baseUrl}${endpoint}`, {
+                const response = await fetch(`${normalizedBaseUrl}${endpoint}`, {
                     headers: { 'Content-Type': 'application/json' },
                     ...options
                 });
@@ -99,6 +102,13 @@ export function createApiClient(baseUrl) {
             return request('/distributed/prepare_job', {
                 method: 'POST',
                 body: JSON.stringify({ multi_job_id: multiJobId })
+            });
+        },
+
+        async queueDistributed(payload) {
+            return request('/distributed/queue', {
+                method: 'POST',
+                body: JSON.stringify(payload)
             });
         },
         

@@ -248,23 +248,67 @@ def _get_cuda_info():
         return None, 0, 0
 
 
+def _collect_network_info_sync():
+    """Collect network/cuda info in a worker thread to avoid blocking route handlers."""
+    cuda_device, cuda_device_count, physical_device_count = _get_cuda_info()
+    hostname = socket.gethostname()
+    all_ips = get_network_ips()
+    recommended_ip = get_recommended_ip(all_ips)
+    return {
+        "hostname": hostname,
+        "all_ips": all_ips,
+        "recommended_ip": recommended_ip,
+        "cuda_device": cuda_device,
+        "cuda_device_count": physical_device_count if physical_device_count > 0 else cuda_device_count,
+    }
+
+
+def _read_worker_log_sync(log_file, lines_to_read):
+    """Read worker log content from disk in a threadpool worker."""
+    file_size = os.path.getsize(log_file)
+
+    with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
+        if lines_to_read > 0 and file_size > 1024 * 1024:
+            # Read last N lines efficiently from end of file.
+            lines = []
+            f.seek(0, 2)
+            file_length = f.tell()
+            chunk_size = min(CHUNK_SIZE, file_length)
+
+            while len(lines) < lines_to_read and f.tell() > 0:
+                current_pos = max(0, f.tell() - chunk_size)
+                f.seek(current_pos)
+                chunk = f.read(chunk_size)
+                chunk_lines = chunk.splitlines()
+                if current_pos > 0:
+                    chunk_lines = chunk_lines[1:]
+                lines = chunk_lines + lines
+                f.seek(current_pos)
+
+            content = '\n'.join(lines[-lines_to_read:])
+            truncated = len(lines) > lines_to_read
+        else:
+            content = f.read()
+            truncated = False
+
+    return {
+        "content": content,
+        "file_size": file_size,
+        "truncated": truncated,
+        "lines_shown": lines_to_read if truncated else content.count('\n') + 1,
+    }
+
+
 @server.PromptServer.instance.routes.get("/distributed/network_info")
 async def get_network_info_endpoint(request):
     """Get network interfaces and recommend best IP for master."""
-    cuda_device, cuda_device_count, physical_device_count = _get_cuda_info()
-
     try:
-        hostname = socket.gethostname()
-        all_ips = get_network_ips()
-        recommended_ip = get_recommended_ip(all_ips)
+        loop = asyncio.get_running_loop()
+        info = await loop.run_in_executor(None, _collect_network_info_sync)
         
         return web.json_response({
             "status": "success",
-            "hostname": hostname,
-            "all_ips": all_ips,
-            "recommended_ip": recommended_ip,
-            "cuda_device": cuda_device,
-            "cuda_device_count": physical_device_count if physical_device_count > 0 else cuda_device_count,
+            **info,
             "message": "Auto-detected network configuration"
         })
     except Exception as e:
@@ -350,7 +394,8 @@ async def launch_worker_endpoint(request):
         
         # Launch the worker
         try:
-            pid = wm.launch_worker(worker)
+            loop = asyncio.get_running_loop()
+            pid = await loop.run_in_executor(None, wm.launch_worker, worker)
             log_file = wm.processes[worker_id_str].get('log_file')
             return web.json_response({
                 "status": "success",
@@ -499,51 +544,16 @@ async def get_worker_log_endpoint(request):
         lines_to_read = int(request.query.get('lines', 1000))
         
         try:
-            # Get file size
-            file_size = os.path.getsize(log_file)
-            
-            with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
-                if lines_to_read > 0 and file_size > 1024 * 1024:  # If file > 1MB and limited lines requested
-                    # Read last N lines efficiently
-                    lines = []
-                    # Start from end and work backwards
-                    f.seek(0, 2)  # Go to end
-                    file_length = f.tell()
-                    
-                    # Read chunks from end
-                    chunk_size = min(CHUNK_SIZE, file_length)
-                    while len(lines) < lines_to_read and f.tell() > 0:
-                        # Move back and read chunk
-                        current_pos = max(0, f.tell() - chunk_size)
-                        f.seek(current_pos)
-                        chunk = f.read(chunk_size)
-                        
-                        # Process chunk
-                        chunk_lines = chunk.splitlines()
-                        if current_pos > 0:
-                            # Partial line at beginning, combine with next chunk
-                            chunk_lines = chunk_lines[1:]
-                        
-                        lines = chunk_lines + lines
-                        
-                        # Move back for next chunk
-                        f.seek(current_pos)
-                    
-                    # Take only last N lines
-                    content = '\n'.join(lines[-lines_to_read:])
-                    truncated = len(lines) > lines_to_read
-                else:
-                    # Read entire file
-                    content = f.read()
-                    truncated = False
+            loop = asyncio.get_running_loop()
+            payload = await loop.run_in_executor(None, _read_worker_log_sync, log_file, lines_to_read)
             
             return web.json_response({
                 "status": "success",
-                "content": content,
+                "content": payload["content"],
                 "log_file": log_file,
-                "file_size": file_size,
-                "truncated": truncated,
-                "lines_shown": lines_to_read if truncated else content.count('\n') + 1
+                "file_size": payload["file_size"],
+                "truncated": payload["truncated"],
+                "lines_shown": payload["lines_shown"],
             })
             
         except Exception as e:

@@ -20,7 +20,7 @@ from urllib import request, error as urlerror
 
 from .config import load_config, save_config
 from .logging import debug_log, log
-from .network import get_server_port
+from .network import get_server_port, normalize_host
 from .process import is_process_alive, terminate_process
 
 # Regex to capture the generated public URL from cloudflared output
@@ -28,15 +28,6 @@ PUBLIC_URL_PATTERN = re.compile(r"(https?://[\w.-]+\.(?:trycloudflare\.com|cloud
 
 # Default timeout (seconds) to wait for a tunnel URL before giving up
 TUNNEL_START_TIMEOUT = 25
-
-
-def _normalize_host(value):
-    if not value or not isinstance(value, str):
-        return ""
-    value = value.strip()
-    value = re.sub(r"^https?://", "", value, flags=re.IGNORECASE)
-    return value.split("/")[0]
-
 
 class CloudflareTunnelManager:
     def __init__(self):
@@ -308,7 +299,7 @@ class CloudflareTunnelManager:
                 raise RuntimeError(error_msg)
 
             debug_log(f"Cloudflare tunnel ready at {self.public_url}")
-            master_host = _normalize_host(self.public_url)
+            master_host = normalize_host(self.public_url)
             self._persist_state(
                 status="running",
                 public_url=self.public_url,
@@ -349,8 +340,8 @@ class CloudflareTunnelManager:
             current_master_host = (config.get("master") or {}).get("host")
             restore_host = None
             if active_url:
-                active_host = _normalize_host(active_url)
-                current_host = _normalize_host(current_master_host)
+                active_host = normalize_host(active_url)
+                current_host = normalize_host(current_master_host)
                 if current_host == active_host:
                     restore_host = self.previous_master_host or ""
 

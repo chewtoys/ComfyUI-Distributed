@@ -1,19 +1,42 @@
 import asyncio
+import hashlib
 import json
+import mimetypes
+import os
+import re
 import time
 import uuid
 from collections import deque
 
 import aiohttp
 
-import execution
 import server
 
-from .utils.config import load_config
-from .utils.logging import debug_log, log
+from ..utils.config import load_config
+from ..utils.logging import debug_log, log
+from ..utils.async_helpers import queue_prompt_payload
+from ..utils.network import build_worker_url, get_client_session
 
 
 prompt_server = server.PromptServer.instance
+
+# JS parity audit (web/executionUtils.js:prepareApiPromptForParticipant) vs backend orchestration:
+# - Path conversion by worker OS path separator: partially implemented below (_convert_paths_for_platform).
+# - Worker prompt pruning to distributed-node upstream graph + PreviewImage injection: implemented below.
+# - Seed/collector/upscale hidden input overrides: implemented in _override_* helpers.
+# - Delegate-master pruning and placeholder injection: implemented in _prepare_delegate_master_prompt.
+# - Remote media synchronization (load/check/upload image/video inputs): implemented below (_sync_worker_media).
+# - Legacy frontend-only fallback path remains in web/executionUtils.js during transition.
+
+LIKELY_FILENAME_RE = re.compile(
+    r"\.(ckpt|safetensors|pt|pth|bin|yaml|json|png|jpg|jpeg|webp|gif|bmp|latent|txt|vae|lora|embedding)"
+    r"(\s*\[\w+\])?$",
+    re.IGNORECASE,
+)
+IMAGE_OR_VIDEO_RE = re.compile(
+    r"\.(png|jpg|jpeg|webp|gif|bmp|mp4|avi|mov|mkv|webm)(\s*\[\w+\])?$",
+    re.IGNORECASE,
+)
 
 
 def ensure_distributed_state():
@@ -22,15 +45,6 @@ def ensure_distributed_state():
         prompt_server.distributed_pending_jobs = {}
     if not hasattr(prompt_server, "distributed_jobs_lock"):
         prompt_server.distributed_jobs_lock = asyncio.Lock()
-    if not hasattr(prompt_server, "distributed_worker_ws"):
-        prompt_server.distributed_worker_ws = {}
-
-
-async def _get_client_session():
-    """Get or create aiohttp client session (shared with distributed.py)."""
-    if not hasattr(prompt_server, "_distributed_session"):
-        prompt_server._distributed_session = aiohttp.ClientSession()
-    return prompt_server._distributed_session
 
 
 class PromptIndex:
@@ -135,6 +149,218 @@ def _create_numeric_id_generator(prompt_obj):
         return str(counter)
 
     return _next_id
+
+
+def _convert_paths_for_platform(obj, target_separator):
+    """Recursively normalize likely file paths for the worker platform separator."""
+    if target_separator not in ("/", "\\"):
+        return obj
+
+    def _convert(value):
+        if isinstance(value, str):
+            if ("/" in value or "\\" in value) and LIKELY_FILENAME_RE.search(value):
+                trimmed = value.strip()
+                has_drive = bool(re.match(r"^[A-Za-z]:(\\\\|/)", trimmed))
+                is_absolute = trimmed.startswith("/") or trimmed.startswith("\\\\")
+                has_protocol = bool(re.match(r"^\w+://", trimmed))
+
+                # Keep relative media-style paths in forward-slash form (Comfy-style annotated paths).
+                if not has_drive and not is_absolute and not has_protocol and IMAGE_OR_VIDEO_RE.search(trimmed):
+                    return re.sub(r"[\\]+", "/", trimmed)
+
+                if target_separator == "\\":
+                    return re.sub(r"[\\/]+", r"\\", trimmed)
+                return re.sub(r"[\\/]+", "/", trimmed)
+            return value
+        if isinstance(value, list):
+            return [_convert(item) for item in value]
+        if isinstance(value, dict):
+            return {key: _convert(item) for key, item in value.items()}
+        return value
+
+    return _convert(obj)
+
+
+def _find_upstream_nodes(prompt_obj, start_ids):
+    """Return all nodes reachable upstream from start_ids, including start nodes."""
+    connected = set(str(node_id) for node_id in start_ids)
+    queue = deque(connected)
+    while queue:
+        node_id = queue.popleft()
+        node = prompt_obj.get(node_id) or {}
+        inputs = node.get("inputs", {})
+        for value in inputs.values():
+            if isinstance(value, list) and len(value) == 2:
+                source_id = str(value[0])
+                if source_id in prompt_obj and source_id not in connected:
+                    connected.add(source_id)
+                    queue.append(source_id)
+    return connected
+
+
+def _prune_prompt_for_worker(prompt_obj):
+    """Prune worker prompt to distributed nodes and their upstream dependencies."""
+    collector_ids = _find_nodes_by_class(prompt_obj, "DistributedCollector")
+    upscale_ids = _find_nodes_by_class(prompt_obj, "UltimateSDUpscaleDistributed")
+    distributed_ids = collector_ids + upscale_ids
+    if not distributed_ids:
+        return prompt_obj
+
+    connected = _find_upstream_nodes(prompt_obj, distributed_ids)
+    pruned_prompt = {}
+    for node_id in connected:
+        node = prompt_obj.get(node_id)
+        if node is not None:
+            pruned_prompt[node_id] = json.loads(json.dumps(node))
+
+    next_id = _create_numeric_id_generator(pruned_prompt)
+    for dist_id in distributed_ids:
+        if dist_id not in pruned_prompt:
+            continue
+        downstream = _find_downstream_nodes(prompt_obj, [dist_id])
+        has_removed_downstream = any(node_id != dist_id for node_id in downstream)
+        if has_removed_downstream:
+            preview_id = next_id()
+            pruned_prompt[preview_id] = {
+                "inputs": {
+                    "images": [dist_id, 0],
+                },
+                "class_type": "PreviewImage",
+                "_meta": {
+                    "title": "Preview Image (auto-added)",
+                },
+            }
+
+    return pruned_prompt
+
+
+def _find_media_references(prompt_obj):
+    """Find media file references in image/video inputs used by worker prompts."""
+    media_refs = set()
+    for _, node in _iter_prompt_nodes(prompt_obj):
+        inputs = node.get("inputs", {})
+        for key in ("image", "video"):
+            value = inputs.get(key)
+            if isinstance(value, str):
+                cleaned = re.sub(r"\s*\[\w+\]$", "", value).strip().replace("\\", "/")
+                if IMAGE_OR_VIDEO_RE.search(cleaned):
+                    media_refs.add(cleaned)
+    return sorted(media_refs)
+
+
+def _load_media_file_sync(filename):
+    """Load local media bytes and hash for worker upload sync."""
+    import folder_paths
+
+    full_path = folder_paths.get_annotated_filepath(filename)
+    if not os.path.exists(full_path):
+        raise FileNotFoundError(filename)
+
+    with open(full_path, "rb") as f:
+        file_bytes = f.read()
+
+    file_hash = hashlib.md5(file_bytes).hexdigest()
+    mime_type = mimetypes.guess_type(full_path)[0]
+    if not mime_type:
+        ext = os.path.splitext(full_path)[1].lower()
+        if ext in {".mp4", ".avi", ".mov", ".mkv", ".webm"}:
+            mime_type = "video/mp4"
+        else:
+            mime_type = "image/png"
+    return file_bytes, file_hash, mime_type
+
+
+async def _fetch_worker_path_separator(worker):
+    """Best-effort fetch of a worker's path separator from /distributed/system_info."""
+    url = build_worker_url(worker, "/distributed/system_info")
+    session = await get_client_session()
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status != 200:
+                return None
+            payload = await resp.json()
+            separator = ((payload or {}).get("platform") or {}).get("path_separator")
+            return separator if separator in ("/", "\\") else None
+    except Exception as exc:
+        debug_log(f"[Distributed] Failed to fetch worker system info ({worker.get('id')}): {exc}")
+        return None
+
+
+async def _upload_media_to_worker(worker, filename, file_bytes, file_hash, mime_type):
+    """Upload one media file to worker iff missing or hash-mismatched."""
+    session = await get_client_session()
+    normalized = filename.replace("\\", "/")
+
+    check_url = build_worker_url(worker, "/distributed/check_file")
+    try:
+        async with session.post(
+            check_url,
+            json={"filename": normalized, "hash": file_hash},
+            timeout=aiohttp.ClientTimeout(total=6),
+        ) as resp:
+            if resp.status == 200:
+                payload = await resp.json()
+                if payload.get("exists") and payload.get("hash_matches"):
+                    return False
+    except Exception as exc:
+        debug_log(f"[Distributed] Media check failed for '{normalized}' on worker {worker.get('id')}: {exc}")
+
+    parts = normalized.split("/")
+    clean_name = parts[-1]
+    subfolder = "/".join(parts[:-1])
+
+    form = aiohttp.FormData()
+    form.add_field("image", file_bytes, filename=clean_name, content_type=mime_type)
+    form.add_field("type", "input")
+    form.add_field("subfolder", subfolder)
+    form.add_field("overwrite", "true")
+
+    upload_url = build_worker_url(worker, "/upload/image")
+    async with session.post(
+        upload_url,
+        data=form,
+        timeout=aiohttp.ClientTimeout(total=30),
+    ) as resp:
+        resp.raise_for_status()
+    return True
+
+
+async def _sync_worker_media(worker, prompt_obj):
+    """Sync referenced media files from master to a remote worker before dispatch."""
+    media_refs = _find_media_references(prompt_obj)
+    if not media_refs:
+        return
+
+    loop = asyncio.get_running_loop()
+    uploaded = 0
+    skipped = 0
+    missing = 0
+    for filename in media_refs:
+        try:
+            file_bytes, file_hash, mime_type = await loop.run_in_executor(
+                None, _load_media_file_sync, filename
+            )
+        except FileNotFoundError:
+            missing += 1
+            log(f"[Distributed] Media file '{filename}' not found on master; worker may fail to load it.")
+            continue
+        except Exception as exc:
+            log(f"[Distributed] Failed to load media '{filename}' for worker sync: {exc}")
+            continue
+
+        try:
+            changed = await _upload_media_to_worker(worker, filename, file_bytes, file_hash, mime_type)
+            if changed:
+                uploaded += 1
+            else:
+                skipped += 1
+        except Exception as exc:
+            log(f"[Distributed] Failed to upload media '{filename}' to worker {worker.get('id')}: {exc}")
+
+    debug_log(
+        f"[Distributed] Media sync for worker {worker.get('id')}: "
+        f"uploaded={uploaded}, skipped={skipped}, missing={missing}, referenced={len(media_refs)}"
+    )
 
 
 def _prepare_delegate_master_prompt(prompt_obj, collector_ids):
@@ -283,30 +509,10 @@ def _resolve_master_url():
     return f"{scheme}://{address}{port_part}"
 
 
-def _build_worker_url(worker, endpoint=""):
-    """Construct the worker base URL with optional endpoint."""
-    host = (worker.get("host") or "").strip()
-    port = int(worker.get("port", 8188) or 8188)
-
-    if not host:
-        host = getattr(prompt_server, "address", "127.0.0.1") or "127.0.0.1"
-
-    if host.startswith(("http://", "https://")):
-        base = host.rstrip("/")
-    else:
-        is_cloud = worker.get("type") == "cloud" or host.endswith(".proxy.runpod.net") or port == 443
-        scheme = "https" if is_cloud else "http"
-        default_port = 443 if scheme == "https" else 80
-        port_part = "" if port == default_port else f":{port}"
-        base = f"{scheme}://{host}{port_part}"
-
-    return f"{base}{endpoint}"
-
-
 async def _worker_is_active(worker):
     """Ping worker's /prompt endpoint to confirm it's reachable."""
-    url = _build_worker_url(worker, "/prompt")
-    session = await _get_client_session()
+    url = build_worker_url(worker, "/prompt")
+    session = await get_client_session()
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
             return resp.status == 200
@@ -323,8 +529,8 @@ async def _worker_is_active(worker):
 
 async def _worker_ws_is_active(worker):
     """Ping worker's websocket endpoint to confirm it's reachable."""
-    session = await _get_client_session()
-    url = _build_worker_url(worker, "/distributed/worker_ws")
+    session = await get_client_session()
+    url = build_worker_url(worker, "/distributed/worker_ws")
     try:
         ws = await session.ws_connect(url, heartbeat=20, timeout=3)
         await ws.close()
@@ -340,30 +546,39 @@ async def _worker_ws_is_active(worker):
         return False
 
 
-async def _get_worker_ws_connection(worker):
-    """Return a cached websocket connection to a worker (creating if needed)."""
-    ensure_distributed_state()
-    worker_id = worker.get("id")
-    existing = prompt_server.distributed_worker_ws.get(worker_id)
-    if existing and not existing.closed:
-        return existing
+async def _dispatch_via_websocket(worker_url, payload, client_id, timeout=60.0):
+    """Open a fresh worker websocket, dispatch one prompt, wait for ack, then close."""
+    request_id = uuid.uuid4().hex
+    ws_payload = {
+        "type": "dispatch_prompt",
+        "request_id": request_id,
+        "prompt": payload.get("prompt"),
+        "workflow": payload.get("workflow"),
+        "client_id": client_id,
+    }
+    ws_url = worker_url.replace("http://", "ws://").replace("https://", "wss://")
+    ws_url = f"{ws_url}/distributed/worker_ws"
+    session = await get_client_session()
 
-    session = await _get_client_session()
-    url = _build_worker_url(worker, "/distributed/worker_ws")
-    ws = await session.ws_connect(url, heartbeat=20, timeout=10)
-    prompt_server.distributed_worker_ws[worker_id] = ws
-    return ws
+    async with session.ws_connect(ws_url, heartbeat=20, timeout=timeout) as ws:
+        await ws.send_json(ws_payload)
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                data = json.loads(msg.data or "{}")
+                if data.get("type") == "dispatch_ack" and data.get("request_id") == request_id:
+                    if data.get("ok"):
+                        return
+                    raise RuntimeError(data.get("error") or "Worker rejected websocket dispatch.")
+            elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                raise RuntimeError(f"Worker websocket closed unexpectedly: {msg.type}")
 
-
-async def _close_worker_ws(worker_id):
-    ws = prompt_server.distributed_worker_ws.pop(worker_id, None)
-    if ws and not ws.closed:
-        await ws.close()
+    raise RuntimeError("Worker websocket closed before dispatch_ack was received.")
 
 
 async def _dispatch_worker_prompt(worker, prompt_obj, workflow_meta, client_id=None, use_websocket=False):
     """Send the prepared prompt to a worker ComfyUI instance."""
-    url = _build_worker_url(worker, "/prompt")
+    worker_url = build_worker_url(worker)
+    url = build_worker_url(worker, "/prompt")
     payload = {"prompt": prompt_obj}
     extra_data = {}
     if workflow_meta:
@@ -372,36 +587,18 @@ async def _dispatch_worker_prompt(worker, prompt_obj, workflow_meta, client_id=N
         payload["extra_data"] = extra_data
 
     if use_websocket:
-        request_id = uuid.uuid4().hex
-        ws_payload = {
-            "type": "dispatch_prompt",
-            "request_id": request_id,
-            "prompt": prompt_obj,
-            "workflow": workflow_meta,
-            "client_id": client_id,
-        }
         try:
-            ws = await _get_worker_ws_connection(worker)
-            await ws.send_json(ws_payload)
-            response = await asyncio.wait_for(ws.receive(), timeout=60)
-            if response.type == aiohttp.WSMsgType.TEXT:
-                data = json.loads(response.data or "{}")
-                if (
-                    data.get("type") == "dispatch_ack"
-                    and data.get("request_id") == request_id
-                    and data.get("ok")
-                ):
-                    return
-                error_msg = data.get("error") or "Worker rejected websocket dispatch."
-                raise RuntimeError(error_msg)
-            raise RuntimeError("Unexpected websocket response from worker.")
+            await _dispatch_via_websocket(worker_url, {
+                "prompt": prompt_obj,
+                "workflow": workflow_meta,
+            }, client_id)
+            return
         except Exception as exc:
             worker_id = worker.get("id")
-            await _close_worker_ws(worker_id)
             log(f"[Distributed] Websocket dispatch failed for worker {worker_id}: {exc}")
             raise
 
-    session = await _get_client_session()
+    session = await get_client_session()
     async with session.post(
         url,
         json=payload,
@@ -410,39 +607,13 @@ async def _dispatch_worker_prompt(worker, prompt_obj, workflow_meta, client_id=N
         resp.raise_for_status()
 
 
-async def _queue_master_prompt(prompt_obj, workflow_meta, client_id):
-    """Queue the master prompt through ComfyUI's prompt queue."""
-    payload = {"prompt": prompt_obj}
-    payload = prompt_server.trigger_on_prompt(payload)
-    prompt = payload["prompt"]
-
-    prompt_id = str(uuid.uuid4())
-    valid = await execution.validate_prompt(prompt_id, prompt, None)
-    if not valid[0]:
-        raise RuntimeError(f"Invalid prompt: {valid[1]}")
-
-    extra_data = {}
-    if workflow_meta:
-        extra_data.setdefault("extra_pnginfo", {})["workflow"] = workflow_meta
-    if client_id:
-        extra_data["client_id"] = client_id
-
-    sensitive = {}
-    for key in getattr(execution, "SENSITIVE_EXTRA_DATA_KEYS", []):
-        if key in extra_data:
-            sensitive[key] = extra_data.pop(key)
-
-    number = getattr(prompt_server, "number", 0)
-    prompt_server.number = number + 1
-    prompt_queue_item = (number, prompt_id, prompt, extra_data, valid[2], sensitive)
-    prompt_server.prompt_queue.put(prompt_queue_item)
-    return prompt_id
-
-
 def _override_seed_nodes(prompt_copy, prompt_index, is_master, participant_id, worker_index_map):
     """Configure DistributedSeed nodes for master or worker role."""
     for node_id in prompt_index.nodes_for_class("DistributedSeed"):
-        inputs = prompt_copy.setdefault(node_id, {}).setdefault("inputs", {})
+        node = prompt_copy.get(node_id)
+        if not isinstance(node, dict):
+            continue
+        inputs = node.setdefault("inputs", {})
         inputs["is_worker"] = not is_master
         if is_master:
             inputs["worker_id"] = ""
@@ -462,11 +633,15 @@ def _override_collector_nodes(
 ):
     """Configure DistributedCollector nodes for master or worker role."""
     for node_id in prompt_index.nodes_for_class("DistributedCollector"):
-        if prompt_index.has_upstream(node_id, "UltimateSDUpscaleDistributed"):
-            prompt_copy.setdefault(node_id, {}).setdefault("inputs", {})["pass_through"] = True
+        node = prompt_copy.get(node_id)
+        if not isinstance(node, dict):
             continue
 
-        inputs = prompt_copy.setdefault(node_id, {}).setdefault("inputs", {})
+        if prompt_index.has_upstream(node_id, "UltimateSDUpscaleDistributed"):
+            node.setdefault("inputs", {})["pass_through"] = True
+            continue
+
+        inputs = node.setdefault("inputs", {})
         inputs["multi_job_id"] = job_id_map.get(node_id, node_id)
         inputs["is_worker"] = not is_master
         inputs["enabled_worker_ids"] = enabled_json
@@ -491,7 +666,10 @@ def _override_upscale_nodes(
 ):
     """Configure UltimateSDUpscaleDistributed nodes for master or worker role."""
     for node_id in prompt_index.nodes_for_class("UltimateSDUpscaleDistributed"):
-        inputs = prompt_copy.setdefault(node_id, {}).setdefault("inputs", {})
+        node = prompt_copy.get(node_id)
+        if not isinstance(node, dict):
+            continue
+        inputs = node.setdefault("inputs", {})
         inputs["multi_job_id"] = job_id_map.get(node_id, node_id)
         inputs["is_worker"] = not is_master
         inputs["enabled_worker_ids"] = enabled_json
@@ -601,7 +779,7 @@ async def orchestrate_distributed_execution(
     job_id_map = _generate_job_id_map(prompt_index, discovery_prefix)
 
     if not job_id_map:
-        prompt_id = await _queue_master_prompt(prompt_obj, workflow_meta, client_id)
+        prompt_id = await queue_prompt_payload(prompt_obj, workflow_meta, client_id)
         return prompt_id, 0
 
     for job_id in job_id_map.values():
@@ -641,6 +819,14 @@ async def orchestrate_distributed_execution(
     worker_payloads = []
     for worker in active_workers:
         worker_prompt = prompt_index.copy_prompt()
+
+        is_remote_like = bool(worker.get("host"))
+        if is_remote_like:
+            path_separator = await _fetch_worker_path_separator(worker)
+            if path_separator:
+                worker_prompt = _convert_paths_for_platform(worker_prompt, path_separator)
+
+        worker_prompt = _prune_prompt_for_worker(worker_prompt)
         worker_prompt = _apply_participant_overrides(
             worker_prompt,
             worker["id"],
@@ -650,6 +836,10 @@ async def orchestrate_distributed_execution(
             delegate_master,
             prompt_index,
         )
+
+        if is_remote_like:
+            await _sync_worker_media(worker, worker_prompt)
+
         worker_payloads.append((worker, worker_prompt))
 
     if worker_payloads:
@@ -660,5 +850,5 @@ async def orchestrate_distributed_execution(
             ]
         )
 
-    prompt_id = await _queue_master_prompt(master_prompt, workflow_meta, client_id)
+    prompt_id = await queue_prompt_payload(master_prompt, workflow_meta, client_id)
     return prompt_id, len(worker_payloads)

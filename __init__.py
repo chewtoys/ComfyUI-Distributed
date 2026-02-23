@@ -9,7 +9,7 @@ from .utils.config import ensure_config_exists, CONFIG_FILE
 from .utils.logging import debug_log
 
 # Import distributed upscale nodes
-from .distributed_upscale import (
+from .nodes.distributed_upscale import (
     NODE_CLASS_MAPPINGS as UPSCALE_CLASS_MAPPINGS,
     NODE_DISPLAY_NAME_MAPPINGS as UPSCALE_DISPLAY_NAME_MAPPINGS
 )

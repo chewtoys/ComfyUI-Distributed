@@ -4,6 +4,7 @@ import io
 import json
 import asyncio
 import time
+import base64
 
 import aiohttp
 import server as _server
@@ -15,7 +16,6 @@ from ..utils.config import get_worker_timeout_seconds, load_config, is_master_de
 from ..utils.image import tensor_to_pil, pil_to_tensor, ensure_contiguous
 from ..utils.network import get_client_session, normalize_host
 from ..utils.async_helpers import run_async_in_server_loop
-from ..utils.constants import MAX_BATCH
 from ..workers.detection import is_local_worker, get_comms_channel
 
 prompt_server = _server.PromptServer.instance
@@ -62,55 +62,39 @@ class DistributedCollectorNode:
         return result
 
     async def send_batch_to_master(self, image_batch, audio, multi_job_id, master_url, worker_id):
-        """Send image batch and optional audio to master, chunked if large."""
+        """Send image batch to master via canonical JSON envelopes."""
         batch_size = image_batch.shape[0]
-        if batch_size == 0 and audio is None:
+        if batch_size == 0:
             return
 
-        for start in range(0, batch_size, MAX_BATCH):
-            chunk = image_batch[start:start + MAX_BATCH]
-            chunk_size = chunk.shape[0]
-            is_chunk_last = (start + chunk_size == batch_size)  # True only for final chunk
+        if audio is not None:
+            # Canonical /distributed/job_complete transport currently only carries image payloads.
+            debug_log("Worker - Audio payload is not submitted via /distributed/job_complete canonical envelope")
 
-            data = aiohttp.FormData()
-            data.add_field('multi_job_id', multi_job_id)
-            data.add_field('worker_id', str(worker_id))
-            data.add_field('is_last', str(is_chunk_last))
-            data.add_field('batch_size', str(chunk_size))
-
-            # Chunk metadata: Absolute index from full batch
-            metadata = [{'index': start + j} for j in range(chunk_size)]
-            data.add_field('images_metadata', json.dumps(metadata), content_type='application/json')
-
-            # Add chunk images
-            for j in range(chunk_size):
-                # Convert tensor slice to PIL
-                img = tensor_to_pil(chunk[j:j+1], 0)
-                byte_io = io.BytesIO()
-                img.save(byte_io, format='PNG', compress_level=0)
-                byte_io.seek(0)
-                data.add_field(f'image_{j}', byte_io, filename=f'image_{j}.png', content_type='image/png')
-
-            # Add audio data only on the final chunk to avoid duplication
-            if is_chunk_last and audio is not None:
-                waveform = audio.get("waveform")
-                sample_rate = audio.get("sample_rate", 44100)
-                if waveform is not None and waveform.numel() > 0:
-                    # Serialize waveform tensor to bytes
-                    audio_bytes = io.BytesIO()
-                    torch.save(waveform, audio_bytes)
-                    audio_bytes.seek(0)
-                    data.add_field('audio_waveform', audio_bytes, filename='audio.pt', content_type='application/octet-stream')
-                    data.add_field('audio_sample_rate', str(sample_rate))
-                    debug_log(f"Worker - Including audio: shape={waveform.shape}, sample_rate={sample_rate}")
+        session = await get_client_session()
+        url = f"{master_url}/distributed/job_complete"
+        for batch_idx in range(batch_size):
+            img = tensor_to_pil(image_batch[batch_idx:batch_idx+1], 0)
+            byte_io = io.BytesIO()
+            img.save(byte_io, format='PNG', compress_level=0)
+            encoded_image = base64.b64encode(byte_io.getvalue()).decode('utf-8')
+            payload = {
+                "job_id": str(multi_job_id),
+                "worker_id": str(worker_id),
+                "batch_idx": int(batch_idx),
+                "image": f"data:image/png;base64,{encoded_image}",
+                "is_last": bool(batch_idx == batch_size - 1),
+            }
 
             try:
-                session = await get_client_session()
-                url = f"{master_url}/distributed/job_complete"
-                async with session.post(url, data=data) as response:
+                async with session.post(
+                    url,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as response:
                     response.raise_for_status()
             except Exception as e:
-                log(f"Worker - Failed to send chunk to master: {e}")
+                log(f"Worker - Failed to send canonical image envelope to master: {e}")
                 debug_log(f"Worker - Full error details: URL={url}")
                 raise  # Re-raise to handle at caller level
 
@@ -151,30 +135,21 @@ class DistributedCollectorNode:
             return empty_audio
 
     def _store_worker_result(self, worker_images: dict, item: dict) -> int:
-        """Store one queue item (batch or single image) in worker_images in-place.
+        """Store one canonical queue item in worker_images in-place.
 
-        Handles two formats:
-        - Batch mode: item has 'tensors' list and optional 'indices' list (index-aware)
-        - Single mode: item has 'image_index' int and 'tensor'
-
-        Returns the number of images stored.
+        Canonical format:
+        - item has 'worker_id', 'image_index', and 'tensor'
+        Returns 1 when stored, otherwise 0.
         """
         worker_id = item['worker_id']
-        tensors = item.get('tensors', [])
-        if tensors:
-            worker_images.setdefault(worker_id, {})
-            indices = item.get('indices', [])
-            if indices:
-                for i, tensor in enumerate(tensors):
-                    worker_images[worker_id][indices[i]] = tensor
-            else:
-                for idx, tensor in enumerate(tensors):
-                    worker_images[worker_id][idx] = tensor
-            return len(tensors)
-        else:
-            worker_images.setdefault(worker_id, {})
-            worker_images[worker_id][item['image_index']] = item['tensor']
-            return 1
+        tensor = item.get('tensor')
+        image_index = item.get('image_index')
+        if tensor is None or image_index is None:
+            return 0
+
+        worker_images.setdefault(worker_id, {})
+        worker_images[worker_id][image_index] = tensor
+        return 1
 
     def _reorder_and_combine_tensors(
         self,
@@ -280,15 +255,12 @@ class DistributedCollectorNode:
                         result = await asyncio.wait_for(q.get(), timeout=slice_timeout)
                         worker_id = result['worker_id']
                         is_last = result.get('is_last', False)
-                        
-                        # Check if batch mode
-                        tensors = result.get('tensors', [])
                         count = self._store_worker_result(worker_images, result)
                         collected_count += count
-                        if tensors:
-                            debug_log(f"Master - Got batch from worker {worker_id}, size={len(tensors)}, is_last={is_last}")
-                        else:
-                            debug_log(f"Master - Got single result from worker {worker_id}, image {result.get('image_index', 0)}, is_last={is_last}")
+                        debug_log(
+                            f"Master - Got canonical result from worker {worker_id}, "
+                            f"image {result.get('image_index', 0)}, is_last={is_last}"
+                        )
 
                         # Collect audio data if present
                         result_audio = result.get('audio')

@@ -1,4 +1,30 @@
-import { BUTTON_STYLES } from './constants.js';
+import { BUTTON_STYLES, STATUS_COLORS } from './constants.js';
+import { createCheckboxSetting, createNumberSetting } from './ui/buttonHelpers.js';
+
+export function updateWorkerCard(extension, workerId, newStatus = {}) {
+    const card = document.querySelector(`[data-worker-id="${workerId}"]`);
+    if (!card) {
+        return false;
+    }
+
+    const worker = extension.config?.workers?.find((w) => w.id === workerId);
+    if (!worker) {
+        return false;
+    }
+
+    if (newStatus.online && newStatus.processing) {
+        const queue = newStatus.queueCount || 0;
+        extension.ui.updateStatusDot(workerId, STATUS_COLORS.PROCESSING_YELLOW, `Online - Processing (${queue} in queue)`, false);
+    } else if (newStatus.online) {
+        extension.ui.updateStatusDot(workerId, STATUS_COLORS.ONLINE_GREEN, "Online - Idle", false);
+    } else if (worker.enabled) {
+        extension.ui.updateStatusDot(workerId, STATUS_COLORS.OFFLINE_RED, "Offline - Cannot connect", false);
+    }
+
+    extension.updateWorkerControls(workerId);
+    return true;
+}
+
 export async function renderSidebarContent(extension, el) {
     // Panel is being opened/rendered
     extension.log("Panel opened", "debug");
@@ -12,43 +38,6 @@ export async function renderSidebarContent(extension, el) {
         return;
     }
     extension._isRendering = true;
-    function createCheckboxSetting(id, label, tooltip, checked, onChange) {
-        const group = document.createElement("div");
-        group.style.cssText = "grid-column: 1 / span 2; display: flex; align-items: center; gap: 8px;";
-        const checkbox = document.createElement("input");
-        checkbox.type = "checkbox";
-        checkbox.id = id;
-        checkbox.checked = checked;
-        checkbox.onchange = onChange;
-        const lbl = document.createElement("label");
-        lbl.htmlFor = id;
-        lbl.textContent = label;
-        lbl.style.cssText = "font-size: 12px; color: #ccc; cursor: pointer;";
-        if (tooltip) lbl.title = tooltip;
-        group.appendChild(checkbox);
-        group.appendChild(lbl);
-        return group;
-    }
-    function createNumberSetting(id, label, tooltip, value, min, step, onChange) {
-        const group = document.createElement("div");
-        group.style.cssText = "grid-column: 1 / span 2; display: flex; align-items: center; gap: 6px;";
-        const lbl = document.createElement("label");
-        lbl.htmlFor = id;
-        lbl.textContent = label;
-        lbl.style.cssText = "font-size: 12px; color: #ccc;";
-        if (tooltip) lbl.title = tooltip;
-        const input = document.createElement("input");
-        input.type = "number";
-        input.id = id;
-        input.min = String(min);
-        input.step = String(step);
-        input.style.cssText = "width: 80px; padding: 2px 6px; background: #222; color: #ddd; border: 1px solid #333; border-radius: 3px;";
-        input.value = value;
-        input.onchange = onChange;
-        group.appendChild(lbl);
-        group.appendChild(input);
-        return group;
-    }
     try {
         // Store reference to the panel element
         extension.panelElement = el;
@@ -71,9 +60,11 @@ export async function renderSidebarContent(extension, el) {
         document.head.appendChild(style);
         loadingDiv.querySelector('svg').style.animation = 'rotate 1s linear infinite';
         // Preload data outside render
-        await extension.loadConfig();
-        await extension.loadManagedWorkers();
-        await extension.refreshTunnelStatus();
+        await Promise.all([
+            extension.loadConfig(),
+            extension.loadManagedWorkers(),
+            extension.refreshTunnelStatus(),
+        ]);
         extension.tunnelElements = {};
         el.innerHTML = '';
         // Create toolbar header to match ComfyUI style

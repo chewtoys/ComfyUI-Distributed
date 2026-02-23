@@ -1,4 +1,4 @@
-import asyncio, time, torch
+import asyncio, torch
 from PIL import Image
 import comfy.model_management
 from ...utils.logging import debug_log, log
@@ -236,16 +236,7 @@ class DynamicModeMixin:
 
         # Poll for job readiness to avoid races during master init
         max_poll_attempts = 20  # ~20s at 1s sleep
-        for attempt in range(max_poll_attempts):
-            ready = run_async_in_server_loop(
-                self._check_job_status(multi_job_id, master_url),
-                timeout=5.0
-            )
-            if ready:
-                debug_log(f"Worker[{worker_id[:8]}] job {multi_job_id} ready after {attempt} attempts")
-                break
-            time.sleep(1.0)  # Poll every 1s
-        else:
+        if not self._poll_job_ready(multi_job_id, master_url, worker_id=worker_id, max_attempts=max_poll_attempts):
             log(f"Job {multi_job_id} not ready after {max_poll_attempts} attempts, aborting")
             return (upscaled_image,)
 

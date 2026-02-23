@@ -8,10 +8,83 @@ from ..utils.logging import debug_log, log
 from ..utils.network import handle_api_error, normalize_host
 
 
+def _positive_int(value):
+    return value > 0
+
+
+CONFIG_SCHEMA = {
+    "workers": (list, None),
+    "master": (dict, None),
+    "settings": (dict, None),
+    "tunnel": (dict, None),
+    "managed_processes": (dict, None),
+    "worker_timeout_seconds": (int, _positive_int),
+    "debug": (bool, None),
+    "auto_launch_workers": (bool, None),
+    "stop_workers_on_master_exit": (bool, None),
+    "master_delegate_only": (bool, None),
+    "websocket_orchestration": (bool, None),
+    "has_auto_populated_workers": (bool, None),
+}
+
+_SETTINGS_FIELDS = {
+    "worker_timeout_seconds",
+    "debug",
+    "auto_launch_workers",
+    "stop_workers_on_master_exit",
+    "master_delegate_only",
+    "websocket_orchestration",
+    "has_auto_populated_workers",
+}
+
+
 @server.PromptServer.instance.routes.get("/distributed/config")
 async def get_config_endpoint(request):
     config = load_config()
     return web.json_response(config)
+
+
+@server.PromptServer.instance.routes.post("/distributed/config")
+async def update_config_endpoint(request):
+    """Bulk config update with schema validation."""
+    try:
+        data = await request.json()
+    except Exception as e:
+        return await handle_api_error(request, f"Invalid JSON payload: {e}", 400)
+
+    if not isinstance(data, dict):
+        return await handle_api_error(request, "Config payload must be an object", 400)
+
+    config = load_config()
+    settings = config.setdefault("settings", {})
+    errors = []
+
+    for key, value in data.items():
+        if key not in CONFIG_SCHEMA:
+            errors.append(f"Unknown field: {key}")
+            continue
+
+        expected_type, validator = CONFIG_SCHEMA[key]
+        if not isinstance(value, expected_type):
+            errors.append(f"{key}: expected {expected_type.__name__}")
+            continue
+
+        if validator and not validator(value):
+            errors.append(f"{key}: value {value!r} failed validation")
+            continue
+
+        if key in _SETTINGS_FIELDS:
+            settings[key] = value
+        else:
+            config[key] = value
+
+    if errors:
+        return web.json_response({"error": errors}, status=400)
+
+    if save_config(config):
+        return web.json_response({"status": "success", "config": config})
+    return await handle_api_error(request, "Failed to save config")
+
 
 @server.PromptServer.instance.routes.get("/distributed/queue_status/{job_id}")
 async def queue_status_endpoint(request):
@@ -20,7 +93,7 @@ async def queue_status_endpoint(request):
         job_id = request.match_info['job_id']
         
         # Import to ensure initialization
-        from ..distributed_upscale import ensure_tile_jobs_initialized
+        from ..nodes.distributed_upscale import ensure_tile_jobs_initialized
         prompt_server = ensure_tile_jobs_initialized()
         
         async with prompt_server.distributed_tile_jobs_lock:

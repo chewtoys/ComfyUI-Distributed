@@ -62,6 +62,22 @@ export const PULSE_ANIMATION_CSS = `
         animation: pulse 1.2s ease-in-out infinite;
         transform-origin: center;
     }
+
+    .worker-status--online {
+        background: var(--status-online, #3ca03c) !important;
+    }
+
+    .worker-status--offline {
+        background: var(--status-offline, #c04c4c) !important;
+    }
+
+    .worker-status--unknown {
+        background: var(--status-unknown, #888) !important;
+    }
+
+    .worker-status--processing {
+        background: var(--status-processing, #f0ad4e) !important;
+    }
     
     /* Button hover effects */
     .distributed-button:hover:not(:disabled) {
