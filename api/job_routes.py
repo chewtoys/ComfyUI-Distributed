@@ -4,6 +4,7 @@ import io
 import os
 import base64
 import binascii
+import time
 
 from aiohttp import web
 import server
@@ -11,12 +12,13 @@ import server as _server
 import torch
 from PIL import Image
 
-from ..utils.logging import debug_log, log
+from ..utils.logging import debug_log
 from ..utils.image import pil_to_tensor, ensure_contiguous
 from ..utils.network import handle_api_error
-from ..utils.constants import MEMORY_CLEAR_DELAY
+from ..utils.constants import JOB_INIT_GRACE_PERIOD, MEMORY_CLEAR_DELAY
 from ..utils.async_helpers import queue_prompt_payload
 from .queue_orchestration import orchestrate_distributed_execution
+from .queue_request import parse_queue_request_payload
 
 prompt_server = _server.PromptServer.instance
 
@@ -193,54 +195,23 @@ async def clear_memory_endpoint(request):
 async def distributed_queue_endpoint(request):
     """Queue a distributed workflow, mirroring the UI orchestration pipeline."""
     try:
-        data = await request.json()
+        raw_payload = await request.json()
     except Exception as exc:
         return await handle_api_error(request, f"Invalid JSON payload: {exc}", 400)
 
-    auto_prepare = bool(data.get("auto_prepare"))
-    prompt = data.get("prompt")
-    if prompt is None and auto_prepare:
-        # Transitional compatibility: allow payload.workflow.prompt when auto_prepare is enabled.
-        workflow_payload = data.get("workflow")
-        if isinstance(workflow_payload, dict):
-            candidate_prompt = workflow_payload.get("prompt")
-            if isinstance(candidate_prompt, dict):
-                prompt = candidate_prompt
-
-    if not isinstance(prompt, dict):
-        return await handle_api_error(request, "Field 'prompt' must be an object", 400)
-
-    # Accept either enabled_worker_ids (legacy) or workers list (auto-prepare path).
-    workers_field = data.get("workers")
-    if workers_field is not None and data.get("enabled_worker_ids") is None:
-        if isinstance(workers_field, list):
-            enabled_ids = []
-            for entry in workers_field:
-                if isinstance(entry, dict):
-                    worker_id = entry.get("id")
-                else:
-                    worker_id = entry
-                if worker_id is not None:
-                    enabled_ids.append(str(worker_id))
-            data["enabled_worker_ids"] = enabled_ids
-
-    workflow_meta = data.get("workflow")
-    client_id = data.get("client_id")
-    delegate_master = data.get("delegate_master")
-    enabled_ids = data.get("enabled_worker_ids")
-
-    if enabled_ids is not None:
-        if not isinstance(enabled_ids, list):
-            return await handle_api_error(request, "enabled_worker_ids must be a list of worker IDs", 400)
-        enabled_ids = [str(worker_id) for worker_id in enabled_ids]
+    try:
+        payload = parse_queue_request_payload(raw_payload)
+    except ValueError as exc:
+        return await handle_api_error(request, exc, 400)
 
     try:
         prompt_id, worker_count = await orchestrate_distributed_execution(
-            prompt,
-            workflow_meta,
-            client_id,
-            enabled_worker_ids=enabled_ids,
-            delegate_master=delegate_master,
+            payload.prompt,
+            payload.workflow_meta,
+            payload.client_id,
+            enabled_worker_ids=payload.enabled_worker_ids,
+            delegate_master=payload.delegate_master,
+            trace_execution_id=payload.trace_execution_id,
         )
         return web.json_response({
             "prompt_id": prompt_id,
@@ -320,26 +291,34 @@ async def job_complete_endpoint(request):
         multi_job_id = job_id.strip()
         worker_id = worker_id.strip()
 
-        async with prompt_server.distributed_jobs_lock:
-            pending = prompt_server.distributed_pending_jobs.get(multi_job_id)
-            if pending is None:
-                log(f"ERROR: Job {multi_job_id} not found in distributed_pending_jobs")
-                return await handle_api_error(request, "Job not found or already complete", 404)
+        pending = None
+        queue_size = 0
+        deadline = time.monotonic() + float(JOB_INIT_GRACE_PERIOD)
+        while pending is None:
+            async with prompt_server.distributed_jobs_lock:
+                pending = prompt_server.distributed_pending_jobs.get(multi_job_id)
+                if pending is not None:
+                    await pending.put(
+                        {
+                            "tensor": tensor,
+                            "worker_id": worker_id,
+                            "image_index": int(batch_idx),
+                            "is_last": is_last,
+                            "audio": None,
+                        }
+                    )
+                    queue_size = pending.qsize()
+                    break
 
-            await pending.put(
-                {
-                    "tensor": tensor,
-                    "worker_id": worker_id,
-                    "image_index": int(batch_idx),
-                    "is_last": is_last,
-                    "audio": None,
-                }
-            )
-            debug_log(
-                f"job_complete received canonical envelope - job_id: {multi_job_id}, "
-                f"worker: {worker_id}, batch_idx: {batch_idx}, is_last: {is_last}, "
-                f"queue_size: {pending.qsize()}"
-            )
+            if time.monotonic() > deadline:
+                return await handle_api_error(request, "job not initialized", 404)
+            await asyncio.sleep(0.05)
+
+        debug_log(
+            f"job_complete received canonical envelope - job_id: {multi_job_id}, "
+            f"worker: {worker_id}, batch_idx: {batch_idx}, is_last: {is_last}, "
+            f"queue_size: {queue_size}"
+        )
 
         return web.json_response({"status": "success"})
     except Exception as e:

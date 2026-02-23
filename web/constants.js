@@ -17,6 +17,7 @@ export const BUTTON_STYLES = {
     launch: "background-color: #4a7c4a;",
     stop: "background-color: #7c4a4a;",
     log: "background-color: #685434;",
+    working: "background-color: #666;",
     clearMemory: "background-color: #555; padding: 6px 14px;",
     interrupt: "background-color: #555; padding: 6px 14px;",
 };

@@ -26,7 +26,11 @@ def get_default_config():
             "auto_launch_workers": False,
             "stop_workers_on_master_exit": True,
             "master_delegate_only": False,
-            "websocket_orchestration": True
+            "websocket_orchestration": True,
+            "worker_probe_concurrency": 8,
+            "worker_prep_concurrency": 4,
+            "media_sync_concurrency": 2,
+            "media_sync_timeout_seconds": 120
         },
         "tunnel": {
             "status": "stopped",

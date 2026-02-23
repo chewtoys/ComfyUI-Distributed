@@ -7,17 +7,16 @@ import { createApiClient } from './apiClient.js';
 import { renderSidebarContent, updateWorkerCard } from './sidebarRenderer.js';
 import { handleInterruptWorkers, handleClearMemory } from './workerUtils.js';
 import { setupInterceptor } from './executionUtils.js';
-import { BUTTON_STYLES, PULSE_ANIMATION_CSS, TIMEOUTS, STATUS_COLORS } from './constants.js';
+import { PULSE_ANIMATION_CSS, TIMEOUTS, STATUS_COLORS } from './constants.js';
 import { updateTunnelUIElements, refreshTunnelStatus, handleTunnelToggle } from './tunnelManager.js';
-import { checkAllWorkerStatuses, getWorkerUrl, checkWorkerStatus, launchWorker, stopWorker, loadManagedWorkers, updateWorkerControls, viewWorkerLog, startLogAutoRefresh, stopLogAutoRefresh, toggleWorkerExpanded } from './workerLifecycle.js';
-import { isRemoteWorker, saveWorkerSettings, cancelWorkerSettings, deleteWorker, addNewWorker } from './workerSettings.js';
+import { checkAllWorkerStatuses, checkWorkerStatus, loadManagedWorkers } from './workerLifecycle.js';
 import { detectMasterIP } from './masterDetection.js';
+import { parseHostInput, getMasterUrl as buildMasterUrl } from './urlUtils.js';
 
 class DistributedExtension {
     constructor() {
         this.config = null;
         this.originalQueuePrompt = api.queuePrompt.bind(api);
-        this.statusCheckInterval = null;
         this.logAutoRefreshInterval = null;
         this.masterSettingsExpanded = false;
         this.app = app; // Store app reference for toast notifications
@@ -47,7 +46,7 @@ class DistributedExtension {
             this.setupInterceptor();
             // Don't start polling until panel opens
             // this.startStatusChecking();
-            this.loadManagedWorkers();
+            loadManagedWorkers(this);
             // Detect master IP after everything is set up
             this.detectMasterIP();
         });
@@ -69,6 +68,21 @@ class DistributedExtension {
             const style = document.createElement('style');
             style.id = styleId;
             style.textContent = PULSE_ANIMATION_CSS;
+            document.head.appendChild(style);
+        }
+
+        const fileStyleId = 'distributed-file-styles';
+        if (!document.getElementById(fileStyleId)) {
+            const style = document.createElement('style');
+            style.id = fileStyleId;
+            fetch(new URL('./distributed.css', import.meta.url))
+                .then((response) => response.text())
+                .then((cssText) => {
+                    style.textContent = cssText;
+                })
+                .catch((error) => {
+                    this.log(`Failed to load distributed.css: ${error.message}`, "error");
+                });
             document.head.appendChild(style);
         }
     }
@@ -150,21 +164,7 @@ class DistributedExtension {
     }
 
     _parseHostInput(value) {
-        if (!value) {
-            return { host: "", port: null };
-        }
-        let cleaned = value.trim().replace(/^https?:\/\//i, "");
-        cleaned = cleaned.split("/")[0];
-        try {
-            const url = new URL(`http://${cleaned}`);
-            const port = url.port ? parseInt(url.port, 10) : null;
-            return {
-                host: url.hostname || cleaned,
-                port: Number.isFinite(port) ? port : null,
-            };
-        } catch (error) {
-            return { host: cleaned, port: null };
-        }
+        return parseHostInput(value);
     }
 
     updateTunnelUIElements(isRunning, isStarting) {
@@ -271,7 +271,7 @@ class DistributedExtension {
     onPanelOpen() {
         this.log("Panel opened - starting status polling", "debug");
         if (!this.statusCheckTimeout) {
-            this.checkAllWorkerStatuses();
+            checkAllWorkerStatuses(this);
         }
     }
     
@@ -299,63 +299,14 @@ class DistributedExtension {
         setupInterceptor(this);
     }
 
-    // TODO: Gradually migrate external call sites to direct module functions, then remove these wrappers.
-    async checkAllWorkerStatuses() {
-        return checkAllWorkerStatuses(this);
-    }
-
-    // Helper to build worker URL
-    getWorkerUrl(worker, endpoint = '') {
-        return getWorkerUrl(this, worker, endpoint);
-    }
-
     updateWorkerCard(workerId, newStatus) {
         return updateWorkerCard(this, workerId, newStatus);
-    }
-
-    async launchWorker(workerId) {
-        return launchWorker(this, workerId);
-    }
-
-    async stopWorker(workerId) {
-        return stopWorker(this, workerId);
-    }
-
-    // Generic async button action handler
-    async handleAsyncButtonAction(button, action, successText, errorText, resetDelay = TIMEOUTS.BUTTON_RESET) {
-        const originalText = button.textContent;
-        const originalStyle = button.style.cssText;
-        button.disabled = true;
-        
-        try {
-            await action();
-            button.textContent = successText;
-            button.style.cssText = originalStyle;
-            button.style.backgroundColor = BUTTON_STYLES.success;
-            return true;
-        } catch (error) {
-            button.textContent = errorText || `Error: ${error.message}`;
-            button.style.cssText = originalStyle;
-            button.style.backgroundColor = BUTTON_STYLES.error;
-            throw error;
-        } finally {
-            setTimeout(() => {
-                button.textContent = originalText;
-                button.style.cssText = originalStyle;
-                button.disabled = false;
-            }, resetDelay);
-        }
     }
 
     /**
      * Cleanup method to stop intervals and listeners
      */
     cleanup() {
-        if (this.statusCheckInterval) {
-            clearInterval(this.statusCheckInterval);
-            this.statusCheckInterval = null;
-        }
-        
         if (this.logAutoRefreshInterval) {
             clearInterval(this.logAutoRefreshInterval);
             this.logAutoRefreshInterval = null;
@@ -369,92 +320,12 @@ class DistributedExtension {
         this.log("Cleaned up intervals", "debug");
     }
 
-    async loadManagedWorkers() {
-        return loadManagedWorkers(this);
-    }
-
-    updateWorkerControls(workerId) {
-        return updateWorkerControls(this, workerId);
-    }
-
-    async viewWorkerLog(workerId) {
-        return viewWorkerLog(this, workerId);
-    }
-
-    isRemoteWorker(worker) {
-        return isRemoteWorker(this, worker);
-    }
-
     getMasterUrl() {
-        // Always use the detected/configured master IP for consistency
-        if (this.config?.master?.host) {
-            const configuredHost = this.config.master.host;
-            
-            // If the configured host already includes protocol, use as-is
-            if (configuredHost.startsWith('http://') || configuredHost.startsWith('https://')) {
-                return configuredHost;
-            }
-            
-            // For domain names (not IPs), default to HTTPS
-            const isIP = /^(\d{1,3}\.){3}\d{1,3}$/.test(configuredHost);
-            const isLocalhost = configuredHost === 'localhost' || configuredHost === '127.0.0.1';
-            
-            if (!isIP && !isLocalhost && configuredHost.includes('.')) {
-                // It's a domain name, use HTTPS
-                return `https://${configuredHost}`;
-            } else {
-                // For IPs and localhost, use current access method
-                const port = window.location.port || (window.location.protocol === 'https:' ? '443' : '80');
-                if ((window.location.protocol === 'https:' && port === '443') || 
-                    (window.location.protocol === 'http:' && port === '80')) {
-                    return `${window.location.protocol}//${configuredHost}`;
-                }
-                return `${window.location.protocol}//${configuredHost}:${port}`;
-            }
-        }
-        
-        // If no master IP is set but we're on a network address, use it
-        const hostname = window.location.hostname;
-        if (hostname !== 'localhost' && hostname !== '127.0.0.1') {
-            return window.location.origin;
-        }
-        
-        // Fallback warning - this won't work for remote workers
-        this.log("No master host configured - remote workers won't be able to connect. " +
-                     "Master host should be auto-detected on startup.", "debug");
-        return window.location.origin;
+        return buildMasterUrl(this.config, window.location, (message, level) => this.log(message, level));
     }
 
     async detectMasterIP() {
         return detectMasterIP(this);
-    }
-
-    async saveWorkerSettings(workerId) {
-        return saveWorkerSettings(this, workerId);
-    }
-
-    cancelWorkerSettings(workerId) {
-        return cancelWorkerSettings(this, workerId);
-    }
-
-    async deleteWorker(workerId) {
-        return deleteWorker(this, workerId);
-    }
-
-    async addNewWorker() {
-        return addNewWorker(this);
-    }
-
-    startLogAutoRefresh(workerId) {
-        return startLogAutoRefresh(this, workerId);
-    }
-
-    stopLogAutoRefresh() {
-        return stopLogAutoRefresh(this);
-    }
-
-    toggleWorkerExpanded(workerId) {
-        return toggleWorkerExpanded(this, workerId);
     }
 
     _handleInterruptWorkers(button) {

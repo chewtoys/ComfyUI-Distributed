@@ -13,9 +13,10 @@ import server
 
 from ..utils.config import load_config
 from ..utils.logging import debug_log, log
-from ..utils.network import handle_api_error, normalize_host, get_client_session
+from ..utils.network import build_worker_url, handle_api_error, normalize_host, probe_worker
 from ..utils.constants import CHUNK_SIZE
 from ..workers import get_worker_manager
+from .schemas import require_fields, validate_worker_id
 from ..workers.detection import (
     is_local_worker,
     is_same_physical_host,
@@ -96,10 +97,14 @@ async def clear_launching_state(request):
     try:
         wm = get_worker_manager()
         data = await request.json()
-        worker_id = str(data.get('worker_id'))
-        
-        if not worker_id:
-            return await handle_api_error(request, "worker_id is required", 400)
+        missing = require_fields(data, "worker_id")
+        if missing:
+            return await handle_api_error(request, f"Missing required field(s): {', '.join(missing)}", 400)
+
+        worker_id = str(data.get("worker_id")).strip()
+        config = load_config()
+        if not validate_worker_id(worker_id, config):
+            return await handle_api_error(request, f"Worker {worker_id} not found", 404)
         
         # Clear launching flag in managed processes
         if worker_id in wm.processes:
@@ -353,19 +358,22 @@ async def launch_worker_endpoint(request):
     try:
         wm = get_worker_manager()
         data = await request.json()
-        worker_id = data.get("worker_id")
-        
-        if not worker_id:
-            return await handle_api_error(request, "Missing worker_id", 400)
+        missing = require_fields(data, "worker_id")
+        if missing:
+            return await handle_api_error(request, f"Missing required field(s): {', '.join(missing)}", 400)
+
+        worker_id = str(data.get("worker_id")).strip()
         
         # Find worker config
         config = load_config()
-        worker = next((w for w in config.get("workers", []) if w["id"] == worker_id), None)
+        if not validate_worker_id(worker_id, config):
+            return await handle_api_error(request, f"Worker {worker_id} not found", 404)
+        worker = next((w for w in config.get("workers", []) if str(w.get("id")) == worker_id), None)
         if not worker:
             return await handle_api_error(request, f"Worker {worker_id} not found", 404)
         
         # Ensure consistent string ID
-        worker_id_str = str(worker_id)
+        worker_id_str = worker_id
         
         # Check if already running (managed by this instance)
         if worker_id_str in wm.processes:
@@ -416,11 +424,15 @@ async def stop_worker_endpoint(request):
     try:
         wm = get_worker_manager()
         data = await request.json()
-        worker_id = data.get("worker_id")
-        
-        if not worker_id:
-            return await handle_api_error(request, "Missing worker_id", 400)
-        
+        missing = require_fields(data, "worker_id")
+        if missing:
+            return await handle_api_error(request, f"Missing required field(s): {', '.join(missing)}", 400)
+
+        worker_id = str(data.get("worker_id")).strip()
+        config = load_config()
+        if not validate_worker_id(worker_id, config):
+            return await handle_api_error(request, f"Worker {worker_id} not found", 404)
+
         success, message = wm.stop_worker(worker_id)
         
         if success:
@@ -472,28 +484,24 @@ async def get_local_worker_status_endpoint(request):
                 
                 # Try to connect to worker
                 try:
-                    session = await get_client_session()
-                    async with session.get(
-                        f"http://localhost:{port}/prompt",
-                        timeout=aiohttp.ClientTimeout(total=2)
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            queue_remaining = data.get("exec_info", {}).get("queue_remaining", 0)
-                            worker_statuses[worker_id] = {
-                                "online": True,
-                                "enabled": True,
-                                "processing": queue_remaining > 0,
-                                "queue_count": queue_remaining
-                            }
-                        else:
-                            worker_statuses[worker_id] = {
-                                "online": False,
-                                "enabled": True,
-                                "processing": False,
-                                "queue_count": 0,
-                                "error": f"HTTP {resp.status}"
-                            }
+                    worker_url = build_worker_url(worker)
+                    data = await probe_worker(worker_url, timeout=2.0)
+                    if data is None:
+                        worker_statuses[worker_id] = {
+                            "online": False,
+                            "enabled": True,
+                            "processing": False,
+                            "queue_count": 0,
+                            "error": "Unavailable",
+                        }
+                        continue
+                    queue_remaining = data.get("exec_info", {}).get("queue_remaining", 0)
+                    worker_statuses[worker_id] = {
+                        "online": True,
+                        "enabled": True,
+                        "processing": queue_remaining > 0,
+                        "queue_count": queue_remaining
+                    }
                 except asyncio.TimeoutError:
                     worker_statuses[worker_id] = {
                         "online": False,

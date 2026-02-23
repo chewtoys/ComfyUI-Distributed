@@ -3,6 +3,8 @@ import { createButtonHelper as createButtonHelperFn } from './ui/buttonHelpers.j
 import { showCloudflareWarning as showCloudflareWarningFn } from './ui/cloudflareWarning.js';
 import { createWorkerSettingsForm as createWorkerSettingsFormFn } from './ui/settingsForm.js';
 import { renderEntityCard as renderEntityCardFn } from './ui/entityCard.js';
+import { launchWorker, startLogAutoRefresh, stopLogAutoRefresh, stopWorker, updateWorkerControls, viewWorkerLog } from './workerLifecycle.js';
+import { isRemoteWorker } from './workerSettings.js';
 
 const cardConfigs = {
     master: {
@@ -56,7 +58,7 @@ const cardConfigs = {
             id: (data) => `status-${data.id}`
         },
         infoText: (data, extension) => {
-            const isRemote = extension.isRemoteWorker(data);
+            const isRemote = isRemoteWorker(extension, data);
             const isCloud = data.type === 'cloud';
             
             if (isCloud) {
@@ -454,9 +456,9 @@ export class DistributedUI {
         refreshCheckbox.style.cssText = 'cursor: pointer;';
         refreshCheckbox.onchange = (e) => {
             if (e.target.checked) {
-                extension.startLogAutoRefresh(workerId);
+                startLogAutoRefresh(extension, workerId);
             } else {
-                extension.stopLogAutoRefresh();
+                stopLogAutoRefresh(extension);
             }
         };
         
@@ -472,7 +474,7 @@ export class DistributedUI {
         // Close button
         const closeBtn = this.createButton('✕', 
             () => {
-                extension.stopLogAutoRefresh();
+                stopLogAutoRefresh(extension);
                 modal.remove();
             }, 
             'background-color: #c04c4c;');
@@ -528,7 +530,7 @@ export class DistributedUI {
         // Close on background click
         modal.onclick = (e) => {
             if (e.target === modal) {
-                extension.stopLogAutoRefresh();
+                stopLogAutoRefresh(extension);
                 modal.remove();
             }
         };
@@ -536,7 +538,7 @@ export class DistributedUI {
         // Close on Escape key
         const handleEscape = (e) => {
             if (e.key === 'Escape') {
-                extension.stopLogAutoRefresh();
+                stopLogAutoRefresh(extension);
                 modal.remove();
                 document.removeEventListener('keydown', handleEscape);
             }
@@ -546,7 +548,7 @@ export class DistributedUI {
         document.body.appendChild(modal);
         
         // Start auto-refresh
-        extension.startLogAutoRefresh(workerId);
+        startLogAutoRefresh(extension, workerId);
     }
 
     formatFileSize(bytes) {
@@ -736,22 +738,25 @@ export class DistributedUI {
                 controlsWrapper.appendChild(remoteInfo);
             } else {
                 const controls = this.createWorkerControls(data.id, {
-                    launch: () => extension.launchWorker(data.id),
-                    stop: () => extension.stopWorker(data.id),
-                    viewLog: () => extension.viewWorkerLog(data.id)
+                    launch: () => launchWorker(extension, data.id),
+                    stop: () => stopWorker(extension, data.id),
+                    viewLog: () => viewWorkerLog(extension, data.id)
                 });
                 
                 const launchBtn = controls.querySelector(`#launch-${data.id}`);
                 const stopBtn = controls.querySelector(`#stop-${data.id}`);
                 const logBtn = controls.querySelector(`#log-${data.id}`);
                 
-                launchBtn.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.workerControl + BUTTON_STYLES.launch;
+                launchBtn.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.workerControl;
+                launchBtn.classList.add("btn--launch");
                 launchBtn.title = "Launch worker (runs in background with logging)";
                 
-                stopBtn.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.workerControl + BUTTON_STYLES.stop + BUTTON_STYLES.hidden;
+                stopBtn.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.workerControl + BUTTON_STYLES.hidden;
+                stopBtn.classList.add("btn--stop");
                 stopBtn.title = "Stop worker";
                 
-                logBtn.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.workerControl + BUTTON_STYLES.log + BUTTON_STYLES.hidden;
+                logBtn.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.workerControl + BUTTON_STYLES.hidden;
+                logBtn.classList.add("btn--log");
                 
                 while (controls.firstChild) {
                     controlsWrapper.appendChild(controls.firstChild);

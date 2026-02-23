@@ -1,4 +1,5 @@
 import { BUTTON_STYLES } from '../constants.js';
+import { cancelWorkerSettings, deleteWorker, isRemoteWorker, saveWorkerSettings } from '../workerSettings.js';
 
 export function createWorkerSettingsForm(ui, extension, worker) {
     const form = document.createElement("div");
@@ -95,7 +96,7 @@ export function createWorkerSettingsForm(ui, extension, worker) {
 
     const hostGroup = ui.createFormGroup("Host:", worker.host || "", `host-${worker.id}`, "text", "e.g., 192.168.1.100");
     hostGroup.group.id = `host-group-${worker.id}`;
-    hostGroup.group.style.display = (extension.isRemoteWorker(worker) || worker.type === "cloud") ? "flex" : "none";
+    hostGroup.group.style.display = (isRemoteWorker(extension, worker) || worker.type === "cloud") ? "flex" : "none";
     form.appendChild(hostGroup.group);
 
     const portGroup = ui.createFormGroup("Port:", worker.port, `port-${worker.id}`, "number");
@@ -104,21 +105,21 @@ export function createWorkerSettingsForm(ui, extension, worker) {
 
     const cudaGroup = ui.createFormGroup("CUDA Device:", worker.cuda_device || 0, `cuda-${worker.id}`, "number");
     cudaGroup.group.id = `cuda-group-${worker.id}`;
-    cudaGroup.group.style.display = (extension.isRemoteWorker(worker) || worker.type === "cloud") ? "none" : "flex";
+    cudaGroup.group.style.display = (isRemoteWorker(extension, worker) || worker.type === "cloud") ? "none" : "flex";
     form.appendChild(cudaGroup.group);
 
     const argsGroup = ui.createFormGroup("Extra Args:", worker.extra_args || "", `args-${worker.id}`);
     argsGroup.group.id = `args-group-${worker.id}`;
-    argsGroup.group.style.display = (extension.isRemoteWorker(worker) || worker.type === "cloud") ? "none" : "flex";
+    argsGroup.group.style.display = (isRemoteWorker(extension, worker) || worker.type === "cloud") ? "none" : "flex";
     form.appendChild(argsGroup.group);
 
-    const saveBtn = ui.createButton("Save", () => extension.saveWorkerSettings(worker.id), "background-color: #4a7c4a;");
+    const saveBtn = ui.createButton("Save", () => saveWorkerSettings(extension, worker.id), "background-color: #4a7c4a;");
     saveBtn.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.success;
 
-    const cancelBtn = ui.createButton("Cancel", () => extension.cancelWorkerSettings(worker.id), "background-color: #555;");
+    const cancelBtn = ui.createButton("Cancel", () => cancelWorkerSettings(extension, worker.id), "background-color: #555;");
     cancelBtn.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.cancel;
 
-    const deleteBtn = ui.createButton("Delete", () => extension.deleteWorker(worker.id), "background-color: #7c4a4a;");
+    const deleteBtn = ui.createButton("Delete", () => deleteWorker(extension, worker.id), "background-color: #7c4a4a;");
     deleteBtn.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.error + BUTTON_STYLES.marginLeftAuto;
 
     const buttonGroup = ui.createButtonGroup([saveBtn, cancelBtn, deleteBtn], " margin-top: 8px;");
@@ -129,7 +130,7 @@ export function createWorkerSettingsForm(ui, extension, worker) {
     if (worker.type === "cloud") {
         typeSelect.value = "cloud";
         runpodText.style.display = "block";
-    } else if (extension.isRemoteWorker(worker)) {
+    } else if (isRemoteWorker(extension, worker)) {
         typeSelect.value = "remote";
     } else {
         typeSelect.value = "local";

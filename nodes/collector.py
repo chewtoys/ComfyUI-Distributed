@@ -13,8 +13,9 @@ from comfy.utils import ProgressBar
 
 from ..utils.logging import debug_log, log
 from ..utils.config import get_worker_timeout_seconds, load_config, is_master_delegate_only
+from ..utils.constants import HEARTBEAT_INTERVAL
 from ..utils.image import tensor_to_pil, pil_to_tensor, ensure_contiguous
-from ..utils.network import get_client_session, normalize_host
+from ..utils.network import build_worker_url, get_client_session, probe_worker
 from ..utils.async_helpers import run_async_in_server_loop
 from ..workers.detection import is_local_worker, get_comms_channel
 
@@ -196,6 +197,15 @@ class DistributedCollectorNode:
             if num_workers == 0:
                 return (images, audio if audio is not None else self.EMPTY_AUDIO)
 
+            # Create the queue before any expensive local work to avoid job_complete race.
+            async with prompt_server.distributed_jobs_lock:
+                if multi_job_id not in prompt_server.distributed_pending_jobs:
+                    prompt_server.distributed_pending_jobs[multi_job_id] = asyncio.Queue()
+                    debug_log(f"Master - Initialized queue early for job {multi_job_id}")
+                else:
+                    existing_size = prompt_server.distributed_pending_jobs[multi_job_id].qsize()
+                    debug_log(f"Master - Using existing queue for job {multi_job_id} (current size: {existing_size})")
+
             if delegate_mode:
                 master_batch_size = 0
                 images_on_cpu = None
@@ -215,22 +225,13 @@ class DistributedCollectorNode:
             worker_images = {}  # Dict to store images by worker_id and index
             worker_audio = {}   # Dict to store audio by worker_id
             
-            # Get the existing queue - it should already exist from prepare_job
-            async with prompt_server.distributed_jobs_lock:
-                if multi_job_id not in prompt_server.distributed_pending_jobs:
-                    log(f"Master - WARNING: Queue doesn't exist for job {multi_job_id}, creating one")
-                    prompt_server.distributed_pending_jobs[multi_job_id] = asyncio.Queue()
-                else:
-                    existing_size = prompt_server.distributed_pending_jobs[multi_job_id].qsize()
-                    debug_log(f"Master - Using existing queue for job {multi_job_id} (current size: {existing_size})")
-            
             # Collect images until all workers report they're done
             collected_count = 0
             workers_done = set()
             
             # Use unified worker timeout from config/UI with simple sliced waits
             base_timeout = float(get_worker_timeout_seconds())
-            slice_timeout = min(0.5, base_timeout)  # small per-wait slice to recheck interrupt
+            slice_timeout = min(max(0.1, HEARTBEAT_INTERVAL / 20.0), base_timeout)
             last_activity = time.time()
             
             
@@ -284,37 +285,44 @@ class DistributedCollectorNode:
                         # Re-check for user interruption after timeout expiry
                         comfy.model_management.throw_exception_if_processing_interrupted()
                         missing_workers = set(str(w) for w in enabled_workers) - workers_done
-                        log(f"Master - Timeout. Still waiting for workers: {list(missing_workers)}")
+                        elapsed = time.time() - last_activity
+                        for missing_worker_id in sorted(missing_workers):
+                            log(
+                                "Master - Heartbeat timeout: "
+                                f"worker={missing_worker_id}, elapsed={elapsed:.1f}s"
+                            )
+                        log(
+                            f"Master - Heartbeat timeout. Still waiting for workers: {list(missing_workers)} "
+                            f"(elapsed={elapsed:.1f}s)"
+                        )
 
                         # Probe missing workers' /prompt endpoints to check if they are actively processing
                         any_busy = False
                         try:
                             cfg = load_config()
                             cfg_workers = cfg.get('workers', [])
-                            session = await get_client_session()
                             for wid in list(missing_workers):
                                 wrec = next((w for w in cfg_workers if str(w.get('id')) == str(wid)), None)
                                 if not wrec:
                                     debug_log(f"Collector probe: worker {wid} not found in config")
                                     continue
-                                host = normalize_host(wrec.get('host') or 'localhost') or 'localhost'
-                                port = int(wrec.get('port', 8188))
-                                url = f"http://{host}:{port}/prompt"
+                                worker_url = build_worker_url(wrec)
                                 try:
-                                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=2.0)) as resp:
-                                        status = resp.status
-                                        q = None
-                                        if status == 200:
-                                            try:
-                                                payload = await resp.json()
-                                                q = int(payload.get('exec_info', {}).get('queue_remaining', 0))
-                                            except Exception:
-                                                q = 0
-                                        debug_log(f"Collector probe: worker {wid} status={status} queue_remaining={q}")
-                                        if status == 200 and q and q > 0:
-                                            any_busy = True
-                                            log(f"Master - Probe grace: worker {wid} appears busy (queue_remaining={q}). Continuing to wait.")
-                                            break
+                                    payload = await probe_worker(worker_url, timeout=2.0)
+                                    queue_remaining = None
+                                    if payload is not None:
+                                        queue_remaining = int(payload.get('exec_info', {}).get('queue_remaining', 0))
+                                    debug_log(
+                                        "Collector probe: worker "
+                                        f"{wid} online={payload is not None} queue_remaining={queue_remaining}"
+                                    )
+                                    if payload is not None and queue_remaining and queue_remaining > 0:
+                                        any_busy = True
+                                        log(
+                                            f"Master - Probe grace: worker {wid} appears busy "
+                                            f"(queue_remaining={queue_remaining}). Continuing to wait."
+                                        )
+                                        break
                                 except Exception as e:
                                     debug_log(f"Collector probe failed for worker {wid}: {e}")
                         except Exception as e:

@@ -10,9 +10,11 @@ from ..utils.image import tensor_to_pil
 
 class WorkerCommsMixin:
     async def send_tiles_batch_to_master(self, processed_tiles, multi_job_id, master_url, 
-                                       padding, worker_id):
+                                       padding, worker_id, is_final_flush=False):
         """Send all processed tiles to master, chunked if large."""
         if not processed_tiles:
+            if is_final_flush:
+                await self._send_tiles_completion_signal(multi_job_id, master_url, worker_id)
             return  # Early exit if empty
 
         total_tiles = len(processed_tiles)
@@ -75,7 +77,7 @@ class WorkerCommsMixin:
 
             chunk_size = j - i
             is_chunk_last = (j >= total_tiles)
-            data.add_field('is_last', str(is_chunk_last))
+            data.add_field('is_last', str(bool(is_final_flush and is_chunk_last)))
             data.add_field('batch_size', str(chunk_size))
             data.add_field('tiles_metadata', json.dumps(metadata), content_type='application/json')
 
@@ -101,100 +103,85 @@ class WorkerCommsMixin:
             chunk_index += 1
             i = j
 
-    async def _request_image_from_master(self, multi_job_id, master_url, worker_id):
-        """Request an image index to process from master in dynamic mode."""
-        # Enhanced retries with 404-specific delay, backoff cap, and total timeout to handle init races
+    async def _send_tiles_completion_signal(self, multi_job_id, master_url, worker_id):
+        """Send completion signal to master in static mode when no tiles are left."""
+        data = aiohttp.FormData()
+        data.add_field('multi_job_id', multi_job_id)
+        data.add_field('worker_id', str(worker_id))
+        data.add_field('is_last', 'true')
+        data.add_field('batch_size', '0')
+
+        session = await get_client_session()
+        url = f"{master_url}/distributed/submit_tiles"
+        async with session.post(url, data=data) as response:
+            response.raise_for_status()
+            debug_log(f"Worker {worker_id} sent static completion signal")
+
+    async def _request_work_item_from_master(
+        self,
+        multi_job_id,
+        master_url,
+        worker_id,
+        endpoint="/distributed/request_image",
+    ):
+        """Request one work item from master with retry/backoff and total timeout."""
         max_retries = 10
         retry_delay = 0.5
-        start_time = time.time()
-        
+        start_time = time.monotonic()
+        url = f"{master_url}{endpoint}"
+
         for attempt in range(max_retries):
-            # Check total timeout
-            if time.time() - start_time > 30:
+            if time.monotonic() - start_time > 30:
                 log(f"Total request timeout after 30s for worker {worker_id}")
-                return None, 0
-                
+                return None
+
             try:
                 session = await get_client_session()
-                url = f"{master_url}/distributed/request_image"
-                
                 async with session.post(url, json={
                     'worker_id': str(worker_id),
                     'multi_job_id': multi_job_id
                 }) as response:
                     if response.status == 200:
-                        data = await response.json()
-                        image_idx = data.get('image_idx')
-                        estimated_remaining = data.get('estimated_remaining', 0)
-                        return image_idx, estimated_remaining
-                    elif response.status == 404:
-                        # Special handling for 404 - job not found yet
+                        return await response.json()
+                    if response.status == 404:
                         text = await response.text()
                         debug_log(f"Job not found (404), will retry: {text}")
                         await asyncio.sleep(1.0)
                     else:
                         text = await response.text()
-                        debug_log(f"Request image failed: {response.status} - {text}")
-                        
-            except Exception as e:
+                        debug_log(
+                            f"Request work item failed ({response.status}) for worker {worker_id}: {text}"
+                        )
+
+            except Exception as exc:
                 if attempt < max_retries - 1:
-                    debug_log(f"Retry {attempt + 1}/{max_retries} after error: {e}")
+                    debug_log(f"Retry {attempt + 1}/{max_retries} after error: {exc}")
                     await asyncio.sleep(retry_delay)
-                    retry_delay *= 2
-                    retry_delay = min(retry_delay, 5.0)  # Cap backoff at 5s
+                    retry_delay = min(retry_delay * 2, 5.0)
                 else:
-                    log(f"Failed to request image after {max_retries} attempts: {e}")
+                    log(f"Failed to request work item after {max_retries} attempts: {exc}")
                     raise
-        
-        return None, 0
+
+        return None
+
+    async def _request_image_from_master(self, multi_job_id, master_url, worker_id):
+        """Request an image index to process from master in dynamic mode."""
+        data = await self._request_work_item_from_master(multi_job_id, master_url, worker_id)
+        if not data:
+            return None, 0
+        image_idx = data.get('image_idx')
+        estimated_remaining = data.get('estimated_remaining', 0)
+        return image_idx, estimated_remaining
 
     async def _request_tile_from_master(self, multi_job_id, master_url, worker_id):
         """Request a tile index to process from master in static mode (reusing dynamic infrastructure)."""
-        # Reuse the same retry logic as dynamic mode
-        max_retries = 10
-        retry_delay = 0.5
-        start_time = time.time()
-        
-        for attempt in range(max_retries):
-            # Check total timeout
-            if time.time() - start_time > 30:
-                log(f"Total request timeout after 30s for worker {worker_id}")
-                return None, 0
-                
-            try:
-                session = await get_client_session()
-                url = f"{master_url}/distributed/request_image"  # Same endpoint
-                
-                async with session.post(url, json={
-                    'worker_id': str(worker_id),
-                    'multi_job_id': multi_job_id
-                }) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        tile_idx = data.get('tile_idx')
-                        estimated_remaining = data.get('estimated_remaining', 0)
-                        batched_static = data.get('batched_static', False)
-                        return tile_idx, estimated_remaining, batched_static
-                    elif response.status == 404:
-                        # Special handling for 404 - job not found yet
-                        text = await response.text()
-                        debug_log(f"Job not found (404), will retry: {text}")
-                        await asyncio.sleep(1.0)
-                    else:
-                        text = await response.text()
-                        debug_log(f"Request tile failed: {response.status} - {text}")
-                        
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    debug_log(f"Retry {attempt + 1}/{max_retries} after error: {e}")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2
-                    retry_delay = min(retry_delay, 5.0)  # Cap backoff at 5s
-                else:
-                    log(f"Failed to request tile after {max_retries} attempts: {e}")
-                    raise
-        
-        return None, 0, False
+        data = await self._request_work_item_from_master(multi_job_id, master_url, worker_id)
+        if not data:
+            return None, 0, False
+        tile_idx = data.get('tile_idx')
+        estimated_remaining = data.get('estimated_remaining', 0)
+        batched_static = data.get('batched_static', False)
+        return tile_idx, estimated_remaining, batched_static
 
     async def _send_full_image_to_master(self, image_pil, image_idx, multi_job_id, 
                                         master_url, worker_id, is_last):

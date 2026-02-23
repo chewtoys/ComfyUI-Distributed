@@ -1,5 +1,7 @@
 import { renderSidebarContent } from './sidebarRenderer.js';
 import { generateUUID } from './constants.js';
+import { parseHostInput } from './urlUtils.js';
+import { toggleWorkerExpanded } from './workerLifecycle.js';
 
 export function isRemoteWorker(extension, worker) {
     // Check if explicitly marked as cloud worker
@@ -7,7 +9,7 @@ export function isRemoteWorker(extension, worker) {
         return true;
     }
     // Otherwise check by host (backward compatibility)
-    const parsed = extension._parseHostInput(worker.host || window.location.hostname);
+    const parsed = parseHostInput(worker.host || window.location.hostname);
     const host = parsed.host || window.location.hostname;
     return host !== "localhost" && host !== "127.0.0.1" && host !== window.location.hostname;
 }
@@ -28,7 +30,7 @@ export async function saveWorkerSettings(extension, workerId) {
     const isRemote = workerType === "remote" || workerType === "cloud";
     const isCloud = workerType === "cloud";
     const rawHost = isRemote ? document.getElementById(`host-${workerId}`).value : window.location.hostname;
-    const parsedHost = isRemote ? extension._parseHostInput(rawHost) : { host: window.location.hostname, port: null };
+    const parsedHost = isRemote ? parseHostInput(rawHost) : { host: window.location.hostname, port: null };
     const host = isRemote ? parsedHost.host : window.location.hostname;
     let port = parseInt(document.getElementById(`port-${workerId}`).value);
     const cudaDevice = isRemote ? undefined : parseInt(document.getElementById(`cuda-${workerId}`).value);
@@ -163,7 +165,7 @@ export async function saveWorkerSettings(extension, workerId) {
 
 export function cancelWorkerSettings(extension, workerId) {
     // Collapse the settings panel
-    extension.toggleWorkerExpanded(workerId);
+    toggleWorkerExpanded(extension, workerId);
 
     // Reset form values to original
     const worker = extension.config.workers.find((w) => w.id === workerId);
@@ -177,7 +179,7 @@ export function cancelWorkerSettings(extension, workerId) {
         // Reset remote checkbox
         const remoteCheckbox = document.getElementById(`remote-${workerId}`);
         if (remoteCheckbox) {
-            remoteCheckbox.checked = extension.isRemoteWorker(worker);
+            remoteCheckbox.checked = isRemoteWorker(extension, worker);
         }
     }
 }

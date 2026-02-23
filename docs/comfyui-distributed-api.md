@@ -48,34 +48,38 @@ Queue a workflow for distributed execution.
 {
   "prompt": { "<node_id>": { "class_type": "...", "inputs": { } } },
   "workflow": { },
-  "client_id": "optional",
+  "client_id": "external-client",
   "delegate_master": false,
   "enabled_worker_ids": ["1", "2"],
   "workers": ["1", "2"],
-  "auto_prepare": true
+  "auto_prepare": true,
+  "trace_execution_id": "exec_1700000000_ab12cd"
 }
 ```
 
 #### Fields
 
-- `prompt` (required, object)
+- `prompt` (required unless `workflow.prompt` is present, object)
   - The ComfyUI prompt/workflow graph, same shape as used by `POST /prompt`.
 - `workflow` (optional, object)
   - Workflow metadata that ComfyUI normally stores in `extra_pnginfo.workflow`.
   - If you don’t care about UI metadata, you can omit it.
-- `client_id` (optional, string)
+- `client_id` (required, string)
   - Passed through as `extra_data.client_id` (useful if you consume ComfyUI websocket events).
 - `delegate_master` (optional, boolean)
   - If `true`, attempts “workers-only” execution for workflows based on `DistributedCollector`.
   - Current limitation: delegate-only mode **does not support** `UltimateSDUpscaleDistributed` and will fall back to running the full prompt on master.
-- `enabled_worker_ids` (optional, array of strings)
-  - If provided, only these worker IDs will be considered.
-  - If omitted, the plugin uses workers marked as enabled in the UI config.
+- `enabled_worker_ids` (required, array of strings)
+  - The explicit worker IDs to consider for this run.
 - `workers` (optional, array of strings or objects with `id`)
-  - Transitional alias for `enabled_worker_ids` used by the frontend auto-prepare path.
+  - Transitional alias for `enabled_worker_ids` used by older clients.
 - `auto_prepare` (optional, boolean)
-  - Feature flag used by newer clients. Current backend still requires `prompt`, but can also read
-    `workflow.prompt` when this flag is true.
+  - Kept for wire compatibility.
+  - Backend orchestration always runs with auto-prepare semantics.
+  - If top-level `prompt` is omitted, backend will attempt `workflow.prompt`.
+- `trace_execution_id` (optional, string)
+  - Passed through to orchestration logs.
+  - Server log lines include the marker as `[exec:<trace_execution_id>]`.
 
 ##### How to get `enabled_worker_ids`
 
@@ -184,7 +188,9 @@ Where `payload.json` contains at least:
 {
   "prompt": {
     "1": {"class_type": "KSampler", "inputs": {} }
-  }
+  },
+  "enabled_worker_ids": [],
+  "client_id": "external-client"
 }
 ```
 
@@ -197,6 +203,7 @@ url = "http://127.0.0.1:8188/distributed/queue"
 payload = {
     "prompt": {...},
     "workflow": {...},
+    "client_id": "external-client",
     "delegate_master": False,
     "enabled_worker_ids": ["1", "2"],
 }
@@ -214,6 +221,7 @@ const url = "http://127.0.0.1:8188/distributed/queue";
 const payload = {
   prompt: {/* ... */},
   workflow: {/* ... */},
+  client_id: "external-client",
   delegate_master: false,
   enabled_worker_ids: ["1", "2"],
 };

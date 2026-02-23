@@ -30,6 +30,7 @@ TILE_TRANSFER_TIMEOUT = 30.0
 PROCESS_WAIT_TIMEOUT = 3.0
 QUEUE_INIT_TIMEOUT = 5.0
 TILE_SEND_TIMEOUT = 60.0
+JOB_INIT_GRACE_PERIOD = 10.0
 
 # Memory operations  
 MEMORY_CLEAR_DELAY = 0.5
@@ -38,4 +39,19 @@ MEMORY_CLEAR_DELAY = 0.5
 MAX_BATCH = int(os.environ.get('COMFYUI_MAX_BATCH', '20'))  # Maximum items per batch to prevent timeouts/OOM (~100MB chunks for 512x512 PNGs)
 
 # Heartbeat monitoring
+HEARTBEAT_INTERVAL = float(os.environ.get('COMFYUI_HEARTBEAT_INTERVAL', '10'))  # Heartbeat/check interval in seconds
 HEARTBEAT_TIMEOUT = int(os.environ.get('COMFYUI_HEARTBEAT_TIMEOUT', '60'))  # Worker heartbeat timeout in seconds (default 60s)
+
+# Orchestration pipeline
+ORCHESTRATION_WORKER_PROBE_CONCURRENCY = int(
+    os.environ.get('COMFYUI_ORCHESTRATION_WORKER_PROBE_CONCURRENCY', '8')
+)
+ORCHESTRATION_WORKER_PREP_CONCURRENCY = int(
+    os.environ.get('COMFYUI_ORCHESTRATION_WORKER_PREP_CONCURRENCY', '4')
+)
+ORCHESTRATION_MEDIA_SYNC_CONCURRENCY = int(
+    os.environ.get('COMFYUI_ORCHESTRATION_MEDIA_SYNC_CONCURRENCY', '2')
+)
+ORCHESTRATION_MEDIA_SYNC_TIMEOUT = float(
+    os.environ.get('COMFYUI_ORCHESTRATION_MEDIA_SYNC_TIMEOUT', '120')
+)

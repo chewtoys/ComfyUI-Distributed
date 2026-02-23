@@ -1,9 +1,12 @@
+import { updateWorkerControls, toggleWorkerExpanded } from "../workerLifecycle.js";
+import { isRemoteWorker } from "../workerSettings.js";
+
 export function renderEntityCard(ui, cardConfigs, entityType, data, extension) {
     const config = cardConfigs[entityType] || {};
     const isPlaceholder = entityType === 'blueprint' || entityType === 'add';
     const isWorker = entityType === 'worker';
     const isMaster = entityType === 'master';
-    const isRemote = isWorker && extension.isRemoteWorker(data);
+    const isRemote = isWorker && isRemoteWorker(extension, data);
 
     const cardOptions = {
         onClick: isPlaceholder ? data?.onClick : null,
@@ -52,7 +55,7 @@ export function renderEntityCard(ui, cardConfigs, entityType, data, extension) {
                     arrow.style.transform = "rotate(0deg)";
                 }
             } else {
-                extension.toggleWorkerExpanded(data.id);
+                toggleWorkerExpanded(extension, data.id);
             }
         };
     }
@@ -115,7 +118,7 @@ export function renderEntityCard(ui, cardConfigs, entityType, data, extension) {
     }
 
     if (isWorker && !isRemote) {
-        extension.updateWorkerControls(data.id);
+        updateWorkerControls(extension, data.id);
     }
 
     return card;

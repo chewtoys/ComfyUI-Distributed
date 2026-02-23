@@ -1,7 +1,10 @@
-import { BUTTON_STYLES, TIMEOUTS, STATUS_COLORS, ENDPOINTS } from './constants.js';
-import { normalizeWorkerUrl } from './urlUtils.js';
+import { TIMEOUTS, STATUS_COLORS, ENDPOINTS } from './constants.js';
+import { buildWorkerUrl, normalizeWorkerUrl } from './urlUtils.js';
+import { isRemoteWorker } from './workerSettings.js';
 
 export { normalizeWorkerUrl };
+
+let _statusCheckRunning = false;
 
 function setStatusDotClass(dot, statusClass) {
     if (!dot) {
@@ -19,46 +22,54 @@ function setStatusDotClass(dot, statusClass) {
     }
 }
 
+function setButtonClass(button, className) {
+    if (!button) {
+        return;
+    }
+    button.classList.remove("btn--stop", "btn--launch", "btn--log", "btn--working", "btn--success", "btn--error");
+    if (className) {
+        button.classList.add(className);
+    }
+}
+
 export async function checkAllWorkerStatuses(extension) {
-    // Don't continue if panel is closed
-    if (!extension.panelElement) {
+    if (_statusCheckRunning || !extension.panelElement) {
         return;
     }
+    _statusCheckRunning = true;
+    let nextInterval = 5000;
 
-    // Create new abort controller for this round of checks
-    extension.statusCheckAbortController = new AbortController();
+    try {
+        // Create a fresh AbortController for this poll cycle.
+        extension.statusCheckAbortController = new AbortController();
 
-    // Check master status
-    checkMasterStatus(extension);
+        await checkMasterStatus(extension);
 
-    if (!extension.config || !extension.config.workers) {
-        return;
-    }
+        if (extension.config?.workers) {
+            await Promise.all(
+                extension.config.workers.map(async (worker) => {
+                    if (worker.enabled || extension.state.isWorkerLaunching(worker.id)) {
+                        await checkWorkerStatus(extension, worker);
+                    }
+                })
+            );
+        }
 
-    for (const worker of extension.config.workers) {
-        // Check status for enabled workers OR workers that are launching
-        if (worker.enabled || extension.state.isWorkerLaunching(worker.id)) {
-            checkWorkerStatus(extension, worker);
+        let isActive = extension.state.getMasterStatus() === "processing";
+        extension.config?.workers?.forEach((worker) => {
+            const workerState = extension.state.getWorker(worker.id);
+            if (workerState.launching || workerState.status?.processing) {
+                isActive = true;
+            }
+        });
+
+        nextInterval = isActive ? 1000 : 5000;
+    } finally {
+        _statusCheckRunning = false;
+        if (extension.panelElement) {
+            extension.statusCheckTimeout = setTimeout(() => checkAllWorkerStatuses(extension), nextInterval);
         }
     }
-
-    // Determine next interval based on current state
-    let isActive = extension.state.getMasterStatus() === "processing"; // Master is busy
-
-    // Check workers for activity
-    extension.config.workers.forEach((worker) => {
-        const ws = extension.state.getWorker(worker.id); // Get worker state
-        if (ws.launching || ws.status?.processing) {
-            // Launching or processing
-            isActive = true;
-        }
-    });
-
-    // Set next delay: 1s if active, 5s if idle
-    const nextInterval = isActive ? 1000 : 5000;
-
-    // Schedule the next check
-    extension.statusCheckTimeout = setTimeout(() => checkAllWorkerStatuses(extension), nextInterval);
 }
 
 export async function checkMasterStatus(extension) {
@@ -111,42 +122,7 @@ export async function checkMasterStatus(extension) {
 
 // Helper to build worker URL
 export function getWorkerUrl(extension, worker, endpoint = "") {
-    const parsed = extension._parseHostInput(worker.host || window.location.hostname);
-    const host = parsed.host || window.location.hostname;
-    const resolvedPort = parsed.port || worker.port;
-
-    // Cloud workers always use HTTPS
-    const isCloud = worker.type === "cloud";
-
-    // Detect if we're running on Runpod (for local workers on Runpod infrastructure)
-    const isRunpodProxy = host.endsWith(".proxy.runpod.net");
-
-    // For local workers on Runpod, construct the port-specific proxy URL
-    let finalHost = host;
-    if (!worker.host && isRunpodProxy) {
-        const match = host.match(/^(.*)\.proxy\.runpod\.net$/);
-        if (match) {
-            const podId = match[1];
-            const domain = "proxy.runpod.net";
-            finalHost = `${podId}-${worker.port}.${domain}`;
-        } else {
-            // Fallback or log error if no match (shouldn't happen)
-            console.error(`[Distributed] Failed to parse Runpod proxy host: ${host}`);
-        }
-    }
-
-    // Determine protocol: HTTPS for cloud, Runpod proxies, or port 443
-    const useHttps = isCloud || isRunpodProxy || resolvedPort === 443;
-    const protocol = useHttps ? "https" : "http";
-
-    // Only add port if non-standard
-    const defaultPort = useHttps ? 443 : 80;
-    const needsPort = !isRunpodProxy && resolvedPort !== defaultPort;
-    const portStr = needsPort ? `:${resolvedPort}` : "";
-
-    // NOTE: Runpod host rewriting here intentionally diverges from Python-side heuristics
-    // in utils.network.build_worker_url. Preserve current browser behavior for now.
-    return normalizeWorkerUrl(`${protocol}://${finalHost}${portStr}${endpoint}`);
+    return buildWorkerUrl(worker, endpoint, window.location);
 }
 
 export async function checkWorkerStatus(extension, worker) {
@@ -300,7 +276,7 @@ export async function stopWorker(extension, workerId) {
     if (stopBtn) {
         stopBtn.disabled = true;
         stopBtn.textContent = "Stopping...";
-        stopBtn.style.backgroundColor = "#666";
+        setButtonClass(stopBtn, "btn--working");
     }
 
     try {
@@ -315,7 +291,7 @@ export async function stopWorker(extension, workerId) {
 
             // Flash success feedback
             if (stopBtn) {
-                stopBtn.style.backgroundColor = BUTTON_STYLES.success;
+                setButtonClass(stopBtn, "btn--success");
                 stopBtn.textContent = "Stopped!";
                 setTimeout(() => {
                     updateWorkerControls(extension, workerId);
@@ -329,7 +305,7 @@ export async function stopWorker(extension, workerId) {
 
             // Flash error feedback
             if (stopBtn) {
-                stopBtn.style.backgroundColor = BUTTON_STYLES.error;
+                setButtonClass(stopBtn, "btn--error");
                 stopBtn.textContent = result.message.includes("already stopped") ? "Not Running" : "Failed";
 
                 // If already stopped, update status immediately
@@ -348,7 +324,7 @@ export async function stopWorker(extension, workerId) {
 
         // Reset button on error
         if (stopBtn) {
-            stopBtn.style.backgroundColor = BUTTON_STYLES.error;
+            setButtonClass(stopBtn, "btn--error");
             stopBtn.textContent = "Error";
             setTimeout(() => {
                 updateWorkerControls(extension, workerId);
@@ -403,7 +379,7 @@ export function updateWorkerControls(extension, workerId) {
     }
 
     // Skip button updates for remote workers
-    if (extension.isRemoteWorker(worker)) {
+    if (isRemoteWorker(extension, worker)) {
         return;
     }
 
@@ -419,6 +395,7 @@ export function updateWorkerControls(extension, workerId) {
     // Show log button immediately if we have log file info (even if worker is still starting)
     if (managedInfo?.log_file && logBtn) {
         logBtn.style.display = "";
+        setButtonClass(logBtn, "btn--log");
     } else if (logBtn && !managedInfo) {
         logBtn.style.display = "none";
     }
@@ -432,7 +409,7 @@ export function updateWorkerControls(extension, workerId) {
             stopBtn.style.display = "";
             stopBtn.disabled = false;
             stopBtn.textContent = "Stop";
-            stopBtn.style.backgroundColor = "#7c4a4a"; // Red when enabled
+            setButtonClass(stopBtn, "btn--stop");
         } else {
             // Hide stop button for workers launched outside UI
             stopBtn.style.display = "none";
@@ -442,7 +419,7 @@ export function updateWorkerControls(extension, workerId) {
         launchBtn.style.display = ""; // Show launch button
         launchBtn.disabled = false;
         launchBtn.textContent = "Launch";
-        launchBtn.style.backgroundColor = "#4a7c4a"; // Always green
+        setButtonClass(launchBtn, "btn--launch");
 
         stopBtn.style.display = "none"; // Hide stop button when not running
     }
@@ -460,7 +437,7 @@ export async function viewWorkerLog(extension, workerId) {
     if (logBtn) {
         logBtn.disabled = true;
         logBtn.textContent = "Loading...";
-        logBtn.style.backgroundColor = "#666";
+        setButtonClass(logBtn, "btn--working");
     }
 
     try {
@@ -474,7 +451,7 @@ export async function viewWorkerLog(extension, workerId) {
         if (logBtn) {
             logBtn.disabled = false;
             logBtn.textContent = "View Log";
-            logBtn.style.backgroundColor = "#685434"; // Keep the yellow color
+            setButtonClass(logBtn, "btn--log");
         }
     } catch (error) {
         extension.log("Error viewing log: " + error.message, "error");
@@ -487,12 +464,12 @@ export async function viewWorkerLog(extension, workerId) {
 
         // Flash error and restore button
         if (logBtn) {
-            logBtn.style.backgroundColor = BUTTON_STYLES.error;
+            setButtonClass(logBtn, "btn--error");
             logBtn.textContent = "Error";
             setTimeout(() => {
                 logBtn.disabled = false;
                 logBtn.textContent = "View Log";
-                logBtn.style.backgroundColor = "#685434"; // Keep the yellow color
+                setButtonClass(logBtn, "btn--log");
             }, TIMEOUTS.FLASH_LONG);
         }
     }

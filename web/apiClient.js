@@ -97,27 +97,48 @@ export function createApiClient(baseUrl) {
             });
         },
         
-        // Job preparation
-        async prepareJob(multiJobId) {
-            return request('/distributed/prepare_job', {
-                method: 'POST',
-                body: JSON.stringify({ multi_job_id: multiJobId })
-            });
-        },
-
         async queueDistributed(payload) {
             return request('/distributed/queue', {
                 method: 'POST',
                 body: JSON.stringify(payload)
             });
         },
-        
-        // Image loading
-        async loadImage(imagePath) {
-            return request('/distributed/load_image', {
-                method: 'POST',
-                body: JSON.stringify({ image_path: imagePath })
+
+        async probeWorker(workerUrl, timeoutMs = TIMEOUTS.STATUS_CHECK) {
+            const normalizedWorkerUrl = normalizeWorkerUrl(workerUrl);
+            const response = await fetch(`${normalizedWorkerUrl}/prompt`, {
+                method: 'GET',
+                mode: 'cors',
+                cache: 'no-store',
+                signal: AbortSignal.timeout(timeoutMs)
             });
+
+            if (!response.ok) {
+                return { ok: false, status: response.status, queueRemaining: null };
+            }
+
+            const data = await response.json().catch(() => ({}));
+            return {
+                ok: true,
+                status: response.status,
+                queueRemaining: data.exec_info?.queue_remaining || 0,
+            };
+        },
+
+        async dispatchToWorker(workerUrl, promptPayload) {
+            const normalizedWorkerUrl = normalizeWorkerUrl(workerUrl);
+            const response = await fetch(`${normalizedWorkerUrl}/prompt`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                mode: 'cors',
+                body: JSON.stringify(promptPayload),
+            });
+
+            if (!response.ok) {
+                throw new Error(`Worker returned ${response.status}`);
+            }
+
+            return response.json();
         },
         
         // Network info

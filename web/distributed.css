@@ -1,0 +1,32 @@
+:root {
+    --btn-stop: #7c4a4a;
+    --btn-launch: #4a7c4a;
+    --btn-log: #685434;
+    --btn-working: #666;
+    --btn-success: #3a6a3a;
+    --btn-error: #6a3a3a;
+}
+
+.btn--stop {
+    background-color: var(--btn-stop) !important;
+}
+
+.btn--launch {
+    background-color: var(--btn-launch) !important;
+}
+
+.btn--log {
+    background-color: var(--btn-log) !important;
+}
+
+.btn--working {
+    background-color: var(--btn-working) !important;
+}
+
+.btn--success {
+    background-color: var(--btn-success) !important;
+}
+
+.btn--error {
+    background-color: var(--btn-error) !important;
+}

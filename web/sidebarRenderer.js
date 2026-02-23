@@ -1,5 +1,8 @@
-import { BUTTON_STYLES, STATUS_COLORS } from './constants.js';
-import { createCheckboxSetting, createNumberSetting } from './ui/buttonHelpers.js';
+import { STATUS_COLORS } from './constants.js';
+import { checkAllWorkerStatuses, loadManagedWorkers, updateWorkerControls } from './workerLifecycle.js';
+import { renderActionsSection } from './sidebar/actionsSection.js';
+import { renderSettingsSection } from './sidebar/settingsSection.js';
+import { renderWorkersSection } from './sidebar/workersSection.js';
 
 export function updateWorkerCard(extension, workerId, newStatus = {}) {
     const card = document.querySelector(`[data-worker-id="${workerId}"]`);
@@ -21,7 +24,7 @@ export function updateWorkerCard(extension, workerId, newStatus = {}) {
         extension.ui.updateStatusDot(workerId, STATUS_COLORS.OFFLINE_RED, "Offline - Cannot connect", false);
     }
 
-    extension.updateWorkerControls(workerId);
+    updateWorkerControls(extension, workerId);
     return true;
 }
 
@@ -60,11 +63,7 @@ export async function renderSidebarContent(extension, el) {
         document.head.appendChild(style);
         loadingDiv.querySelector('svg').style.animation = 'rotate 1s linear infinite';
         // Preload data outside render
-        await Promise.all([
-            extension.loadConfig(),
-            extension.loadManagedWorkers(),
-            extension.refreshTunnelStatus(),
-        ]);
+        await Promise.all([extension.loadConfig(), loadManagedWorkers(extension), extension.refreshTunnelStatus()]);
         extension.tunnelElements = {};
         el.innerHTML = '';
         // Create toolbar header to match ComfyUI style
@@ -99,145 +98,12 @@ export async function renderSidebarContent(extension, el) {
         // Master Node Section
         const masterDiv = extension.ui.renderEntityCard('master', extension.config?.master, extension);
         container.appendChild(masterDiv);
-        // Workers Section (no heading)
-        const gpuSection = document.createElement("div");
-        gpuSection.style.cssText = "flex: 1; overflow-y: auto; margin-bottom: 15px;";
-        const gpuList = document.createElement("div");
-        const workers = extension.config?.workers || [];
-        // If no workers exist, show a full blueprint placeholder first
-        if (workers.length === 0) {
-            const blueprintDiv = extension.ui.renderEntityCard('blueprint', { onClick: () => extension.addNewWorker() }, extension);
-            gpuList.appendChild(blueprintDiv);
-        }
-        // Show existing workers
-        workers.forEach(worker => {
-            const gpuDiv = extension.ui.renderEntityCard('worker', worker, extension);
-            gpuList.appendChild(gpuDiv);
-        });
-        gpuSection.appendChild(gpuList);
-        // Only show the minimal "Add Worker" box if there are existing workers
-        if (workers.length > 0) {
-            const addWorkerDiv = extension.ui.renderEntityCard('add', { onClick: () => extension.addNewWorker() }, extension);
-            gpuSection.appendChild(addWorkerDiv);
-        }
-        container.appendChild(gpuSection);
-        const actionsSection = document.createElement("div");
-        actionsSection.style.cssText = "padding-top: 10px; margin-bottom: 15px; border-top: 1px solid #444;";
-        // Create a row for both buttons
-        const buttonRow = document.createElement("div");
-        buttonRow.style.cssText = "display: flex; gap: 8px;";
-        const clearMemButton = extension.ui.createButtonHelper(
-            "Clear Worker VRAM",
-            (e) => extension._handleClearMemory(e.target),
-            BUTTON_STYLES.clearMemory
-        );
-        clearMemButton.title = "Clear VRAM on all enabled worker GPUs (not master)";
-        clearMemButton.style.cssText = BUTTON_STYLES.base + " flex: 1;" + BUTTON_STYLES.clearMemory;
-        const interruptButton = extension.ui.createButtonHelper(
-            "Interrupt Workers",
-            (e) => extension._handleInterruptWorkers(e.target),
-            BUTTON_STYLES.interrupt
-        );
-        interruptButton.title = "Cancel/interrupt execution on all enabled worker GPUs";
-        interruptButton.style.cssText = BUTTON_STYLES.base + " flex: 1;" + BUTTON_STYLES.interrupt;
-        buttonRow.appendChild(clearMemButton);
-        buttonRow.appendChild(interruptButton);
-        actionsSection.appendChild(buttonRow);
-        container.appendChild(actionsSection);
-        // Settings section
-        const settingsSection = document.createElement("div");
-        // Top separator only; spacing handled by the clickable toggle area for equal top/bottom spacing
-        settingsSection.style.cssText = "border-top: 1px solid #444; margin-bottom: 10px;";
-        // Settings header with toggle (full-area clickable between separators)
-        const settingsToggleArea = document.createElement("div");
-        // Equal spacing above header (to top separator) and below header (to bottom separator)
-        settingsToggleArea.style.cssText = "padding: 16.5px 0; cursor: pointer; user-select: none;";
-        const settingsHeader = document.createElement("div");
-        settingsHeader.style.cssText = "display: flex; align-items: center; justify-content: space-between;";
-        const workerSettingsTitle = document.createElement("h4");
-        workerSettingsTitle.textContent = "Settings";
-        workerSettingsTitle.style.cssText = "margin: 0; font-size: 14px;";
-        const workerSettingsToggle = document.createElement("span");
-        workerSettingsToggle.textContent = "▶"; // Right arrow when collapsed
-        workerSettingsToggle.style.cssText = "font-size: 12px; color: #888; transition: all 0.2s ease;";
-        settingsHeader.appendChild(workerSettingsTitle);
-        settingsHeader.appendChild(workerSettingsToggle);
-        settingsToggleArea.appendChild(settingsHeader);
-        // Hover effect for toggle area
-        settingsToggleArea.onmouseover = () => { workerSettingsToggle.style.color = "#fff"; };
-        settingsToggleArea.onmouseout = () => { workerSettingsToggle.style.color = "#888"; };
-        // A small separator shown only when collapsed (to make the section boundary obvious)
-        const settingsSeparator = document.createElement("div");
-        // No margin so the bottom spacing is controlled by settingsToggleArea padding-bottom
-        settingsSeparator.style.cssText = "border-bottom: 1px solid #444; margin: 0;";
-        // Collapsible settings content
-        const settingsContent = document.createElement("div");
-        settingsContent.style.cssText = "max-height: 0; overflow: hidden; opacity: 0; transition: max-height 0.3s ease, opacity 0.3s ease;";
-        const settingsDiv = document.createElement("div");
-        settingsDiv.style.cssText = "display: grid; grid-template-columns: 1fr auto; row-gap: 10px; column-gap: 10px; padding-top: 10px; align-items: center;";
-        // Toggle functionality
-        let settingsExpanded = false;
-        settingsToggleArea.onclick = () => {
-            settingsExpanded = !settingsExpanded;
-            if (settingsExpanded) {
-                settingsContent.style.maxHeight = "200px";
-                settingsContent.style.opacity = "1";
-                workerSettingsToggle.style.transform = "rotate(90deg)";
-                settingsSeparator.style.display = "none";
-            } else {
-                settingsContent.style.maxHeight = "0";
-                settingsContent.style.opacity = "0";
-                workerSettingsToggle.style.transform = "rotate(0deg)";
-                settingsSeparator.style.display = "block";
-            }
-        };
-        // Section: General
-        const generalLabel = document.createElement("div");
-        generalLabel.textContent = "GENERAL";
-        generalLabel.style.cssText = "grid-column: 1 / span 2; font-size: 11px; color: #888; letter-spacing: 0.06em; padding-top: 2px;";
-        // Section: Timeouts
-        const timeoutsLabel = document.createElement("div");
-        timeoutsLabel.textContent = "TIMEOUTS";
-        timeoutsLabel.style.cssText = "grid-column: 1 / span 2; font-size: 11px; color: #888; letter-spacing: 0.06em; padding-top: 4px;";
-        settingsDiv.appendChild(generalLabel);
-        settingsDiv.appendChild(createCheckboxSetting(
-            "setting-debug", "Debug Mode",
-            "Enable verbose logging in the browser console.",
-            extension.config?.settings?.debug || false,
-            (e) => extension._updateSetting('debug', e.target.checked)
-        ));
-        settingsDiv.appendChild(createCheckboxSetting(
-            "setting-auto-launch", "Auto-launch Local Workers on Startup",
-            "Start local worker processes automatically when the master starts.",
-            extension.config?.settings?.auto_launch_workers || false,
-            (e) => extension._updateSetting('auto_launch_workers', e.target.checked)
-        ));
-        settingsDiv.appendChild(createCheckboxSetting(
-            "setting-stop-on-exit", "Stop Local Workers on Master Exit",
-            "Stop local worker processes automatically when the master exits.",
-            extension.config?.settings?.stop_workers_on_master_exit !== false,
-            (e) => extension._updateSetting('stop_workers_on_master_exit', e.target.checked)
-        ));
-        settingsDiv.appendChild(timeoutsLabel);
-        settingsDiv.appendChild(createNumberSetting(
-            "setting-worker-timeout", "Worker Timeout",
-            "Seconds without a heartbeat before a worker is considered timed out. Default 60.",
-            extension.config?.settings?.worker_timeout_seconds ?? 60,
-            10, 1,
-            (e) => {
-                const v = parseInt(e.target.value, 10);
-                if (!Number.isFinite(v) || v <= 0) return;
-                extension._updateSetting('worker_timeout_seconds', v);
-            }
-        ));
-        settingsContent.appendChild(settingsDiv);
-        settingsSection.appendChild(settingsToggleArea);
-        settingsSection.appendChild(settingsSeparator);
-        settingsSection.appendChild(settingsContent);
-        container.appendChild(settingsSection);
+        container.appendChild(renderWorkersSection(extension));
+        container.appendChild(renderActionsSection(extension));
+        container.appendChild(renderSettingsSection(extension));
         el.appendChild(container);
         // Start checking worker statuses immediately in parallel
-        setTimeout(() => extension.checkAllWorkerStatuses(), 0);
+        setTimeout(() => checkAllWorkerStatuses(extension), 0);
     } finally {
         // Always reset the rendering flag
         extension._isRendering = false;
