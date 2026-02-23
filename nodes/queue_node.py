@@ -94,8 +94,8 @@ class DistributedQueueNode:
 
     async def _fetch_worker_statuses(self, workers):
         session = await get_client_session()
-        statuses = []
-        for worker in workers:
+        
+        async def _probe(worker):
             url = build_worker_url(worker, "/prompt")
             try:
                 async with session.get(
@@ -103,17 +103,18 @@ class DistributedQueueNode:
                     timeout=aiohttp.ClientTimeout(total=3),
                 ) as resp:
                     if resp.status != 200:
-                        continue
+                        return None
                     data = await resp.json()
-                    queue_remaining = int(data.get("exec_info", {}).get("queue_remaining", 0))
-                    statuses.append({
+                    return {
                         "worker": worker,
-                        "queue_remaining": queue_remaining,
-                    })
+                        "queue_remaining": int(data.get("exec_info", {}).get("queue_remaining", 0)),
+                    }
             except Exception as e:
                 debug_log(f"DistributedQueue: Worker status check failed ({url}): {e}")
+                return None
 
-        return statuses
+        results = await asyncio.gather(*[_probe(worker) for worker in workers])
+        return [result for result in results if result is not None]
 
     def _select_worker(self, statuses):
         idle_workers = [status for status in statuses if status["queue_remaining"] == 0]

@@ -52,7 +52,7 @@ class DistributedCollectorNode:
 
         if not multi_job_id or pass_through:
             if pass_through:
-                print(f"[Distributed Collector] Pass-through mode enabled, returning images unchanged")
+                debug_log("Collector: pass-through mode enabled, returning images unchanged")
             return (images, audio if audio is not None else empty_audio)
 
         # Use async helper to run in server loop

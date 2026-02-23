@@ -226,6 +226,8 @@ async def update_setting_endpoint(request):
 
         if not key or value is None:
             return await handle_api_error(request, "Missing 'key' or 'value' in request", 400)
+        if key not in _SETTINGS_FIELDS:
+            return await handle_api_error(request, f"Unknown setting: {key}", 400)
 
         config = load_config()
         if 'settings' not in config:
@@ -254,7 +256,10 @@ async def update_master_endpoint(request):
         if "name" in data:
             config['master']['name'] = data['name']
         if "host" in data:
-            config['master']['host'] = data['host']
+            if data["host"] is None:
+                config['master'].pop('host', None)
+            else:
+                config['master']['host'] = normalize_host(data["host"])
         if "port" in data:
             config['master']['port'] = data['port']
         if "cuda_device" in data:
