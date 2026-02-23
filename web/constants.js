@@ -168,3 +168,49 @@ export const TIMEOUTS = {
     LOG_REFRESH: 2000, // log auto-refresh interval
     IMAGE_CACHE_CLEAR: 30000 // delay before clearing image cache
 };
+
+export const ENDPOINTS = {
+    // ComfyUI core
+    PROMPT: '/prompt',
+    INTERRUPT: '/interrupt',
+    UPLOAD_IMAGE: '/upload/image',
+    SYSTEM_INFO: '/system_stats',
+
+    // Distributed API
+    CONFIG: '/distributed/config',
+    UPDATE_WORKER: '/distributed/config/update_worker',
+    DELETE_WORKER: '/distributed/config/delete_worker',
+    UPDATE_SETTING: '/distributed/config/update_setting',
+    UPDATE_MASTER: '/distributed/config/update_master',
+    LAUNCH_WORKER: '/distributed/launch_worker',
+    STOP_WORKER: '/distributed/stop_worker',
+    MANAGED_WORKERS: '/distributed/managed_workers',
+    WORKER_LOG: '/distributed/worker_log',
+    CLEAR_LAUNCHING: '/distributed/worker/clear_launching',
+    PREPARE_JOB: '/distributed/prepare_job',
+    LOAD_IMAGE: '/distributed/load_image',
+    NETWORK_INFO: '/distributed/network_info',
+    CHECK_FILE: '/distributed/check_file',
+    CLEAR_MEMORY: '/distributed/clear_memory',
+    SYSTEM_INFO_DIST: '/distributed/system_info',
+    TUNNEL_START: '/distributed/tunnel/start',
+    TUNNEL_STOP: '/distributed/tunnel/stop',
+    TUNNEL_STATUS: '/distributed/tunnel/status',
+};
+
+export const NODE_CLASSES = {
+    DISTRIBUTED_COLLECTOR: 'DistributedCollector',
+    DISTRIBUTED_QUEUE: 'DistributedQueue',
+    DISTRIBUTED_SEED: 'DistributedSeed',
+    DISTRIBUTED_EMPTY_IMAGE: 'DistributedEmptyImage',
+    UPSCALE_DISTRIBUTED: 'UltimateSDUpscaleDistributed',
+    PREVIEW_IMAGE: 'PreviewImage',
+};
+
+export function generateUUID() {
+    if (crypto.randomUUID) return crypto.randomUUID();
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+        const r = Math.random() * 16 | 0;
+        return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+    });
+}

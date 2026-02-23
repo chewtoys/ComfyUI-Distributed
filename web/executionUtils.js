@@ -1,6 +1,6 @@
 import { api } from "../../scripts/api.js";
 import { findNodesByClass, findImageReferences, hasUpstreamNode, pruneWorkflowForWorker, getCachedWorkerSystemInfo, findCollectorDownstreamNodes } from './workerUtils.js';
-import { TIMEOUTS } from './constants.js';
+import { TIMEOUTS, NODE_CLASSES, generateUUID } from './constants.js';
 
 /**
  * Convert paths in the API prompt to match the target platform's separator
@@ -58,9 +58,9 @@ function convertPathsForPlatform(apiPrompt, targetSeparator) {
 export function setupInterceptor(extension) {
     api.queuePrompt = async (number, prompt) => {
         if (extension.isEnabled) {
-            const hasCollector = findNodesByClass(prompt.output, "DistributedCollector").length > 0;
-            const hasDistUpscale = findNodesByClass(prompt.output, "UltimateSDUpscaleDistributed").length > 0;
-            const hasDistQueue = findNodesByClass(prompt.output, "DistributedQueue").length > 0;
+            const hasCollector = findNodesByClass(prompt.output, NODE_CLASSES.DISTRIBUTED_COLLECTOR).length > 0;
+            const hasDistUpscale = findNodesByClass(prompt.output, NODE_CLASSES.UPSCALE_DISTRIBUTED).length > 0;
+            const hasDistQueue = findNodesByClass(prompt.output, NODE_CLASSES.DISTRIBUTED_QUEUE).length > 0;
 
             if (hasCollector || hasDistUpscale) {
                 const result = await executeParallelDistributed(extension, prompt);
@@ -137,8 +137,8 @@ export async function executeParallelDistributed(extension, promptWrapper) {
         }
 
         // Find all distributed nodes in the workflow
-        const collectorNodes = findNodesByClass(promptWrapper.output, "DistributedCollector");
-        const upscaleNodes = findNodesByClass(promptWrapper.output, "UltimateSDUpscaleDistributed");
+        const collectorNodes = findNodesByClass(promptWrapper.output, NODE_CLASSES.DISTRIBUTED_COLLECTOR);
+        const upscaleNodes = findNodesByClass(promptWrapper.output, NODE_CLASSES.UPSCALE_DISTRIBUTED);
         const allDistributedNodes = [...collectorNodes, ...upscaleNodes];
 
         const wantsDelegate = Boolean(extension.config?.settings?.master_delegate_only);
@@ -322,7 +322,7 @@ function selectLeastBusyWorker(extension, statuses) {
 
 function markSkipDispatch(promptObj) {
     for (const node of Object.values(promptObj)) {
-        if (node && typeof node === 'object' && node.class_type === 'DistributedQueue') {
+        if (node && typeof node === 'object' && node.class_type === NODE_CLASSES.DISTRIBUTED_QUEUE) {
             node.inputs = node.inputs || {};
             node.inputs.skip_dispatch = true;
         }
@@ -335,8 +335,8 @@ export async function prepareApiPromptForParticipant(extension, baseApiPrompt, p
     const delegateMaster = Boolean(options.delegate_master);
     
     // Find all distributed nodes once (before pruning)
-    let collectorNodes = findNodesByClass(jobApiPrompt, "DistributedCollector");
-    const upscaleNodes = findNodesByClass(jobApiPrompt, "UltimateSDUpscaleDistributed");
+    let collectorNodes = findNodesByClass(jobApiPrompt, NODE_CLASSES.DISTRIBUTED_COLLECTOR);
+    const upscaleNodes = findNodesByClass(jobApiPrompt, NODE_CLASSES.UPSCALE_DISTRIBUTED);
     let allDistributedNodes = [...collectorNodes, ...upscaleNodes];
 
     if (isMaster && delegateMaster) {
@@ -346,7 +346,7 @@ export async function prepareApiPromptForParticipant(extension, baseApiPrompt, p
             extension.log("Delegate-only master mode requested but no collectors found in master prompt. Using full prompt.", "debug");
         } else {
             jobApiPrompt = prepareMasterDelegatePrompt(extension, jobApiPrompt, collectorNodes);
-            collectorNodes = findNodesByClass(jobApiPrompt, "DistributedCollector");
+            collectorNodes = findNodesByClass(jobApiPrompt, NODE_CLASSES.DISTRIBUTED_COLLECTOR);
             allDistributedNodes = [...collectorNodes, ...upscaleNodes];
         }
     }
@@ -400,7 +400,7 @@ export async function prepareApiPromptForParticipant(extension, baseApiPrompt, p
     }
     
     // Handle Distributed seed nodes
-    const distributorNodes = findNodesByClass(jobApiPrompt, "DistributedSeed");
+    const distributorNodes = findNodesByClass(jobApiPrompt, NODE_CLASSES.DISTRIBUTED_SEED);
     if (distributorNodes.length > 0) {
         extension.log(`Found ${distributorNodes.length} seed node(s)`, "debug");
     }
@@ -423,7 +423,7 @@ export async function prepareApiPromptForParticipant(extension, baseApiPrompt, p
         const hasUpstreamDistributedUpscaler = hasUpstreamNode(
             jobApiPrompt, 
             collector.id, 
-            'UltimateSDUpscaleDistributed'
+            NODE_CLASSES.UPSCALE_DISTRIBUTED
         );
         
         if (hasUpstreamDistributedUpscaler) {
@@ -536,7 +536,7 @@ function prepareMasterDelegatePrompt(extension, apiPrompt, collectorNodes) {
 
         const placeholderId = nextId();
         prunedPrompt[placeholderId] = {
-            class_type: "DistributedEmptyImage",
+            class_type: NODE_CLASSES.DISTRIBUTED_EMPTY_IMAGE,
             inputs: {
                 height: 64,
                 width: 64,
@@ -660,19 +660,8 @@ function buildWorkerWebSocketUrl(workerUrl) {
     return url.toString();
 }
 
-function generateRequestId() {
-    if (crypto.randomUUID) {
-        return crypto.randomUUID();
-    }
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-        const r = Math.random() * 16 | 0;
-        const v = c === 'x' ? r : (r & 0x3 | 0x8);
-        return v.toString(16);
-    });
-}
-
 async function dispatchPromptViaWebSocket(extension, wsUrl, payload) {
-    const requestId = generateRequestId();
+    const requestId = generateUUID();
     const message = {
         type: 'dispatch_prompt',
         request_id: requestId,

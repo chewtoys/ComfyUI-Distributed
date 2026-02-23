@@ -5,9 +5,12 @@ import { DistributedUI } from './ui.js';
 import { createStateManager } from './stateManager.js';
 import { createApiClient } from './apiClient.js';
 import { renderSidebarContent } from './sidebarRenderer.js';
-import { handleWorkerOperation, handleInterruptWorkers, handleClearMemory } from './workerUtils.js';
+import { handleInterruptWorkers, handleClearMemory } from './workerUtils.js';
 import { setupInterceptor, executeParallelDistributed } from './executionUtils.js';
-import { BUTTON_STYLES, PULSE_ANIMATION_CSS, TIMEOUTS, STATUS_COLORS } from './constants.js';
+import { BUTTON_STYLES, PULSE_ANIMATION_CSS, TIMEOUTS, STATUS_COLORS, generateUUID } from './constants.js';
+import { updateTunnelUIElements, refreshTunnelStatus, handleTunnelToggle } from './tunnelManager.js';
+import { checkAllWorkerStatuses, checkMasterStatus, getWorkerUrl, checkWorkerStatus, launchWorker, stopWorker, clearLaunchingFlag, loadManagedWorkers, updateWorkerControls, viewWorkerLog, refreshLog, startLogAutoRefresh, stopLogAutoRefresh, toggleWorkerExpanded } from './workerLifecycle.js';
+import { isRemoteWorker, isCloudWorker, saveWorkerSettings, cancelWorkerSettings, deleteWorker, addNewWorker } from './workerSettings.js';
 
 class DistributedExtension {
     constructor() {
@@ -57,19 +60,6 @@ class DistributedExtension {
         } else {
             console.log(`[Distributed] ${message}`);
         }
-    }
-
-    // Generate UUID with fallback for non-secure contexts
-    generateUUID() {
-        if (crypto.randomUUID) {
-            return crypto.randomUUID();
-        }
-        // Fallback for non-secure contexts
-        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-            const r = Math.random() * 16 | 0;
-            const v = c == 'x' ? r : (r & 0x3 | 0x8);
-            return v.toString(16);
-        });
     }
 
     injectStyles() {
@@ -176,132 +166,16 @@ class DistributedExtension {
         }
     }
 
-    updateTunnelUIElements() {
-        const elements = this.tunnelElements || {};
-        const status = (this.tunnelStatus?.status || "stopped").toLowerCase();
-        const enableColor = "#665533"; // requested yellow/brown tone
-        const disableColor = "#7c4a4a"; // match worker delete button
-        const colors = {
-            running: disableColor,
-            starting: enableColor,
-            stopped: enableColor,
-            error: disableColor,
-            unknown: enableColor,
-            stopping: disableColor
-        };
-
-        if (elements.button) {
-            elements.button.disabled = status === "starting" || status === "stopping";
-            if (status === "starting") {
-                elements.button.innerHTML = `<span class="tunnel-spinner"></span> Starting...`;
-                elements.button.style.backgroundColor = enableColor;
-            } else if (status === "running") {
-                elements.button.textContent = "Disable Cloudflare Tunnel";
-                elements.button.style.backgroundColor = disableColor;
-            } else if (status === "error") {
-                elements.button.textContent = "Retry Cloudflare Tunnel";
-                elements.button.style.backgroundColor = disableColor;
-            } else {
-                elements.button.textContent = "Enable Cloudflare Tunnel";
-                elements.button.style.backgroundColor = enableColor;
-            }
-        }
-
-        if (elements.status) {
-            elements.status.textContent = status.toUpperCase();
-            elements.status.style.backgroundColor = colors[status] || colors.stopped;
-        }
-
-        if (elements.url) {
-            const url = this.tunnelStatus?.public_url;
-            if (url) {
-                elements.url.innerHTML = `<a href="${url}" target="_blank" style="color: #eee; text-decoration: none;">${url}</a>`;
-            } else {
-                elements.url.textContent = status === "starting" ? "Requesting public URL..." : "No tunnel active";
-            }
-        }
-
-        if (elements.copyBtn) {
-            const hasUrl = Boolean(this.tunnelStatus?.public_url);
-            elements.copyBtn.disabled = !hasUrl;
-            elements.copyBtn.style.opacity = hasUrl ? "1" : "0.5";
-        }
+    updateTunnelUIElements(isRunning, isStarting) {
+        return updateTunnelUIElements(this, isRunning, isStarting);
     }
 
     async refreshTunnelStatus() {
-        try {
-            const data = await this.api.getTunnelStatus();
-            this.tunnelStatus = data.tunnel || { status: "stopped" };
-            if (data.master_host !== undefined) {
-                this._applyMasterHost(data.master_host);
-            }
-            return this.tunnelStatus;
-        } catch (error) {
-            this.tunnelStatus = { status: "error", last_error: error.message };
-            this.log("Failed to fetch tunnel status: " + error.message, "error");
-            return this.tunnelStatus;
-        } finally {
-            this.updateTunnelUIElements();
-        }
+        return refreshTunnelStatus(this);
     }
 
     async handleTunnelToggle(button) {
-        const currentStatus = (this.tunnelStatus?.status || "stopped").toLowerCase();
-        if (currentStatus === "starting" || currentStatus === "stopping") {
-            return;
-        }
-
-        const setStatus = (status) => {
-            this.tunnelStatus = { ...(this.tunnelStatus || {}), status };
-            this.updateTunnelUIElements();
-        };
-
-        if (currentStatus === "running") {
-            setStatus("stopping");
-            try {
-                if (button) {
-                    button.innerHTML = `<span class="tunnel-spinner"></span> Stopping...`;
-                    button.disabled = true;
-                }
-                const data = await this.api.stopTunnel();
-                this.tunnelStatus = data.tunnel || { status: "stopped" };
-                if (data.master_host !== undefined) {
-                    this._applyMasterHost(data.master_host);
-                }
-                this.updateTunnelUIElements();
-                this.ui.showToast(this.app, "info", "Cloudflare Tunnel Disabled", "Master address restored", 4000);
-            } catch (error) {
-                this.tunnelStatus = { status: "error", last_error: error.message };
-                this.updateTunnelUIElements();
-                this.ui.showToast(this.app, "error", "Failed to stop tunnel", error.message, 5000);
-            } finally {
-                if (button) button.disabled = false;
-            }
-            return;
-        }
-
-        // Start tunnel
-        setStatus("starting");
-        if (button) {
-            button.innerHTML = `<span class="tunnel-spinner"></span> Starting...`;
-            button.disabled = true;
-        }
-        try {
-            const data = await this.api.startTunnel();
-            this.tunnelStatus = data.tunnel || { status: "running" };
-            if (data.master_host !== undefined) {
-                this._applyMasterHost(data.master_host);
-            }
-            this.updateTunnelUIElements();
-            const url = data.tunnel?.public_url || data.master_host;
-            this.ui.showToast(this.app, "success", "Cloudflare Tunnel Ready", url || "Public URL created", 4500);
-        } catch (error) {
-            this.tunnelStatus = { status: "error", last_error: error.message };
-            this.updateTunnelUIElements();
-            this.ui.showToast(this.app, "error", "Failed to start tunnel", error.message, 5000);
-        } finally {
-            if (button) button.disabled = false;
-        }
+        return handleTunnelToggle(this, button);
     }
 
     async updateWorkerEnabled(workerId, enabled) {
@@ -435,342 +309,32 @@ class DistributedExtension {
     }
 
     async checkAllWorkerStatuses() {
-        // Don't continue if panel is closed
-        if (!this.panelElement) return;
-        
-        // Create new abort controller for this round of checks
-        this.statusCheckAbortController = new AbortController();
-        
-        
-        // Check master status
-        this.checkMasterStatus();
-        
-        if (!this.config || !this.config.workers) return;
-        
-        for (const worker of this.config.workers) {
-            // Check status for enabled workers OR workers that are launching
-            if (worker.enabled || this.state.isWorkerLaunching(worker.id)) {
-                this.checkWorkerStatus(worker);
-            }
-        }
-        
-        // Determine next interval based on current state
-        let isActive = this.state.getMasterStatus() === 'processing';  // Master is busy
-
-        // Check workers for activity
-        this.config.workers.forEach(worker => {
-            const ws = this.state.getWorker(worker.id);  // Get worker state
-            if (ws.launching || ws.status?.processing) {  // Launching or processing
-                isActive = true;
-            }
-        });
-
-        // Set next delay: 1s if active, 5s if idle
-        const nextInterval = isActive ? 1000 : 5000;
-
-        // Schedule the next check
-        this.statusCheckTimeout = setTimeout(() => this.checkAllWorkerStatuses(), nextInterval);
+        return checkAllWorkerStatuses(this);
     }
 
     async checkMasterStatus() {
-        try {
-            const response = await fetch(`${window.location.origin}/prompt`, {
-                method: 'GET',
-                signal: AbortSignal.timeout(TIMEOUTS.STATUS_CHECK)
-            });
-            
-            if (response.ok) {
-                const data = await response.json();
-                const queueRemaining = data.exec_info?.queue_remaining || 0;
-                const isProcessing = queueRemaining > 0;
-                
-                // Update master status in state
-                this.state.setMasterStatus(isProcessing ? 'processing' : 'online');
-                
-                // Update master status dot
-                const statusDot = document.getElementById('master-status');
-                if (statusDot) {
-                    if (!this.isMasterParticipating()) {
-                        if (isProcessing) {
-                            statusDot.style.backgroundColor = STATUS_COLORS.PROCESSING_YELLOW;
-                            statusDot.title = `Orchestrating (${queueRemaining} in queue)`;
-                        } else {
-                            statusDot.style.backgroundColor = STATUS_COLORS.DISABLED_GRAY;
-                            statusDot.title = "Master orchestrator only";
-                        }
-                    } else if (isProcessing) {
-                        statusDot.style.backgroundColor = STATUS_COLORS.PROCESSING_YELLOW;
-                        statusDot.title = `Processing (${queueRemaining} in queue)`;
-                    } else {
-                        statusDot.style.backgroundColor = STATUS_COLORS.ONLINE_GREEN;
-                        statusDot.title = "Online";
-                    }
-                }
-            }
-        } catch (error) {
-            // Master is always online (we're running on it), so keep it green
-            const statusDot = document.getElementById('master-status');
-            if (statusDot) {
-                statusDot.style.backgroundColor = this.isMasterParticipating() ? STATUS_COLORS.ONLINE_GREEN : STATUS_COLORS.DISABLED_GRAY;
-                statusDot.title = this.isMasterParticipating() ? "Online" : "Master orchestrator only";
-            }
-        }
+        return checkMasterStatus(this);
     }
 
     // Helper to build worker URL
     getWorkerUrl(worker, endpoint = '') {
-        const parsed = this._parseHostInput(worker.host || window.location.hostname);
-        const host = parsed.host || window.location.hostname;
-        const resolvedPort = parsed.port || worker.port;
-        
-        // Cloud workers always use HTTPS
-        const isCloud = worker.type === 'cloud';
-        
-        // Detect if we're running on Runpod (for local workers on Runpod infrastructure)
-        const isRunpodProxy = host.endsWith('.proxy.runpod.net');
-        
-        // For local workers on Runpod, construct the port-specific proxy URL
-        let finalHost = host;
-        if (!worker.host && isRunpodProxy) {
-            const match = host.match(/^(.*)\.proxy\.runpod\.net$/);
-            if (match) {
-                const podId = match[1];
-                const domain = 'proxy.runpod.net';
-                finalHost = `${podId}-${worker.port}.${domain}`;
-            } else {
-                // Fallback or log error if no match (shouldn't happen)
-                console.error(`[Distributed] Failed to parse Runpod proxy host: ${host}`);
-            }
-        }
-        
-        // Determine protocol: HTTPS for cloud, Runpod proxies, or port 443
-        const useHttps = isCloud || isRunpodProxy || resolvedPort === 443;
-        const protocol = useHttps ? 'https' : 'http';
-        
-        // Only add port if non-standard
-        const defaultPort = useHttps ? 443 : 80;
-        const needsPort = !isRunpodProxy && resolvedPort !== defaultPort;
-        const portStr = needsPort ? `:${resolvedPort}` : '';
-        
-        return `${protocol}://${finalHost}${portStr}${endpoint}`;
+        return getWorkerUrl(this, worker, endpoint);
     }
 
     async checkWorkerStatus(worker) {
-        // Assume caller ensured enabled; proceed with check
-        const url = this.getWorkerUrl(worker, '/prompt');
-        const statusDot = document.getElementById(`status-${worker.id}`);
-        
-        try {
-            // Combine timeout with abort controller signal
-            const timeoutSignal = AbortSignal.timeout(TIMEOUTS.STATUS_CHECK);
-            const signal = this.statusCheckAbortController 
-                ? AbortSignal.any([timeoutSignal, this.statusCheckAbortController.signal])
-                : timeoutSignal;
-            
-            const response = await fetch(url, {
-                method: 'GET',
-                mode: 'cors',
-                signal: signal
-            });
-            
-            if (response.ok) {
-                const data = await response.json();
-                const queueRemaining = data.exec_info?.queue_remaining || 0;
-                const isProcessing = queueRemaining > 0;
-                
-                // Update status
-                this.state.setWorkerStatus(worker.id, {
-                    online: true,
-                    processing: isProcessing,
-                    queueCount: queueRemaining
-                });
-                
-                // Update status dot based on processing state
-                if (isProcessing) {
-                    this.ui.updateStatusDot(
-                        worker.id,
-                        "#f0ad4e",
-                        `Online - Processing (${queueRemaining} in queue)`,
-                        false
-                    );
-                } else {
-                    this.ui.updateStatusDot(worker.id, "#3ca03c", "Online - Idle", false);
-                }
-                
-                // Clear launching state since worker is now online
-                if (this.state.isWorkerLaunching(worker.id)) {
-                    this.state.setWorkerLaunching(worker.id, false);
-                    this.clearLaunchingFlag(worker.id);
-                }
-            } else {
-                throw new Error(`HTTP ${response.status}`);
-            }
-        } catch (error) {
-            // Don't process aborted requests
-            if (error.name === 'AbortError') {
-                return;
-            }
-            
-            // Worker is offline or unreachable
-            this.state.setWorkerStatus(worker.id, {
-                online: false,
-                processing: false,
-                queueCount: 0
-            });
-            
-            // Check if worker is launching
-            if (this.state.isWorkerLaunching(worker.id)) {
-                this.ui.updateStatusDot(worker.id, "#f0ad4e", "Launching...", true);
-            } else if (worker.enabled) {
-                // Only update to red if not currently launching AND still enabled
-                this.ui.updateStatusDot(worker.id, "#c04c4c", "Offline - Cannot connect", false);
-            }
-            // If disabled, don't update the dot (leave it gray)
-            
-            this.log(`Worker ${worker.id} status check failed: ${error.message}`, "debug");
-        }
-        
-        // Update control buttons based on new status
-        this.updateWorkerControls(worker.id);
+        return checkWorkerStatus(this, worker);
     }
 
     async launchWorker(workerId) {
-        const worker = this.config.workers.find(w => w.id === workerId);
-
-        // If worker is disabled, enable it first
-        if (!worker.enabled) {
-            await this.updateWorkerEnabled(workerId, true);
-
-            // Update the checkbox UI
-            const checkbox = document.getElementById(`gpu-${workerId}`);
-            if (checkbox) {
-                checkbox.checked = true;
-            }
-        }
-
-        // Re-query button AFTER updateWorkerEnabled (which may re-render sidebar)
-        const launchBtn = document.querySelector(`#controls-${workerId} button`);
-
-        this.ui.updateStatusDot(workerId, "#f0ad4e", "Launching...", true);
-        this.state.setWorkerLaunching(workerId, true);
-
-        // Allow 90 seconds for worker to launch (model loading can take time)
-        setTimeout(() => {
-            this.state.setWorkerLaunching(workerId, false);
-        }, TIMEOUTS.LAUNCH);
-
-        if (!launchBtn) return;
-
-        try {
-            // Disable button immediately
-            launchBtn.disabled = true;
-            
-            const result = await this.api.launchWorker(workerId);
-            if (result) {
-                this.log(`Launched ${worker.name} (PID: ${result.pid})`, "info");
-                if (result.log_file) {
-                    this.log(`Log file: ${result.log_file}`, "debug");
-                }
-                
-                this.state.setWorkerManaged(workerId, {
-                    pid: result.pid,
-                    log_file: result.log_file,
-                    started_at: Date.now()
-                });
-                
-                // Update controls immediately to hide launch button and show stop/log buttons
-                this.updateWorkerControls(workerId);
-                setTimeout(() => this.checkWorkerStatus(worker), TIMEOUTS.STATUS_CHECK);
-            }
-        } catch (error) {
-            // Check if worker was already running
-            if (error.message && error.message.includes("already running")) {
-                this.log(`Worker ${worker.name} is already running`, "info");
-                this.updateWorkerControls(workerId);
-                setTimeout(() => this.checkWorkerStatus(worker), TIMEOUTS.STATUS_CHECK_DELAY);
-            } else {
-                this.log(`Error launching worker: ${error.message || error}`, "error");
-                
-                // Re-enable button on error
-                if (launchBtn) {
-                    launchBtn.disabled = false;
-                }
-            }
-        }
+        return launchWorker(this, workerId);
     }
 
     async stopWorker(workerId) {
-        const worker = this.config.workers.find(w => w.id === workerId);
-        const stopBtn = document.querySelectorAll(`#controls-${workerId} button`)[1];
-        
-        // Provide immediate feedback
-        if (stopBtn) {
-            stopBtn.disabled = true;
-            stopBtn.textContent = "Stopping...";
-            stopBtn.style.backgroundColor = "#666";
-        }
-        
-        try {
-            const result = await this.api.stopWorker(workerId);
-            if (result) {
-                this.log(`Stopped worker: ${result.message}`, "info");
-                this.state.setWorkerManaged(workerId, null);
-                
-                // Immediately update status to offline
-                this.ui.updateStatusDot(workerId, "#c04c4c", "Offline");
-                this.state.setWorkerStatus(workerId, { online: false });
-                
-                // Flash success feedback
-                if (stopBtn) {
-                    stopBtn.style.backgroundColor = BUTTON_STYLES.success;
-                    stopBtn.textContent = "Stopped!";
-                    setTimeout(() => {
-                        this.updateWorkerControls(workerId);
-                    }, TIMEOUTS.FLASH_SHORT);
-                }
-                
-                // Verify status after a short delay
-                setTimeout(() => this.checkWorkerStatus(worker), TIMEOUTS.STATUS_CHECK);
-            } else {
-                this.log(`Failed to stop worker: ${result.message}`, "error");
-                
-                // Flash error feedback
-                if (stopBtn) {
-                    stopBtn.style.backgroundColor = BUTTON_STYLES.error;
-                    stopBtn.textContent = result.message.includes("already stopped") ? "Not Running" : "Failed";
-                    
-                    // If already stopped, update status immediately
-                    if (result.message.includes("already stopped")) {
-                        this.ui.updateStatusDot(workerId, "#c04c4c", "Offline");
-                        this.state.setWorkerStatus(workerId, { online: false });
-                    }
-                    
-                    setTimeout(() => {
-                        this.updateWorkerControls(workerId);
-                    }, TIMEOUTS.FLASH_MEDIUM);
-                }
-            }
-        } catch (error) {
-            this.log(`Error stopping worker: ${error}`, "error");
-            
-            // Reset button on error
-            if (stopBtn) {
-                stopBtn.style.backgroundColor = BUTTON_STYLES.error;
-                stopBtn.textContent = "Error";
-                setTimeout(() => {
-                    this.updateWorkerControls(workerId);
-                }, TIMEOUTS.FLASH_MEDIUM);
-            }
-        }
+        return stopWorker(this, workerId);
     }
 
     async clearLaunchingFlag(workerId) {
-        try {
-            await this.api.clearLaunchingFlag(workerId);
-            this.log(`Cleared launching flag for worker ${workerId}`, "debug");
-        } catch (error) {
-            this.log(`Error clearing launching flag: ${error.message || error}`, "error");
-        }
+        return clearLaunchingFlag(this, workerId);
     }
 
     // Generic async button action handler
@@ -822,185 +386,27 @@ class DistributedExtension {
     }
 
     async loadManagedWorkers() {
-        try {
-            const result = await this.api.getManagedWorkers();
-            
-            // Check for launching workers
-            for (const [workerId, info] of Object.entries(result.managed_workers)) {
-                this.state.setWorkerManaged(workerId, info);
-                
-                // If worker is marked as launching, add to launchingWorkers set
-                if (info.launching) {
-                    this.state.setWorkerLaunching(workerId, true);
-                    this.log(`Worker ${workerId} is in launching state`, "debug");
-                }
-            }
-            
-            // Update UI for all workers
-            if (this.config?.workers) {
-                this.config.workers.forEach(w => this.updateWorkerControls(w.id));
-            }
-        } catch (error) {
-            this.log(`Error loading managed workers: ${error}`, "error");
-        }
+        return loadManagedWorkers(this);
     }
 
     updateWorkerControls(workerId) {
-        const controlsDiv = document.getElementById(`controls-${workerId}`);
-        
-        if (!controlsDiv) return;
-        
-        const worker = this.config.workers.find(w => w.id === workerId);
-        if (!worker) return;
-        
-        // Skip button updates for remote workers
-        if (this.isRemoteWorker(worker)) {
-            return;
-        }
-        
-        // Ensure we check for string ID
-        const managedInfo = this.state.getWorker(workerId).managed;
-        const status = this.state.getWorkerStatus(workerId);
-        
-        // Update button states - buttons are now inside a wrapper div
-        const buttons = controlsDiv.querySelectorAll('button');
-        const launchBtn = document.getElementById(`launch-${workerId}`);
-        const stopBtn = document.getElementById(`stop-${workerId}`);
-        const logBtn = document.getElementById(`log-${workerId}`);
-        
-        // Show log button immediately if we have log file info (even if worker is still starting)
-        if (managedInfo?.log_file && logBtn) {
-            logBtn.style.display = '';
-        } else if (logBtn && !managedInfo) {
-            logBtn.style.display = 'none';
-        }
-        
-        if (status?.online || managedInfo) {
-            // Worker is running or we just launched it
-            launchBtn.style.display = 'none'; // Hide launch button when running
-            
-            if (managedInfo) {
-                // Only show stop button if we manage this worker
-                stopBtn.style.display = '';
-                stopBtn.disabled = false;
-                stopBtn.textContent = "Stop";
-                stopBtn.style.backgroundColor = "#7c4a4a"; // Red when enabled
-            } else {
-                // Hide stop button for workers launched outside UI
-                stopBtn.style.display = 'none';
-            }
-        } else {
-            // Worker is not running
-            launchBtn.style.display = ''; // Show launch button
-            launchBtn.disabled = false;
-            launchBtn.textContent = "Launch";
-            launchBtn.style.backgroundColor = "#4a7c4a"; // Always green
-            
-            stopBtn.style.display = 'none'; // Hide stop button when not running
-        }
+        return updateWorkerControls(this, workerId);
     }
 
     async viewWorkerLog(workerId) {
-        const managedInfo = this.state.getWorker(workerId).managed;
-        if (!managedInfo?.log_file) return;
-        
-        const logBtn = document.getElementById(`log-${workerId}`);
-        
-        // Provide immediate feedback
-        if (logBtn) {
-            logBtn.disabled = true;
-            logBtn.textContent = "Loading...";
-            logBtn.style.backgroundColor = "#666";
-        }
-        
-        try {
-            // Fetch log content
-            const data = await this.api.getWorkerLog(workerId, 1000);
-            
-            // Create modal dialog
-            this.ui.showLogModal(this, workerId, data);
-            
-            // Restore button
-            if (logBtn) {
-                logBtn.disabled = false;
-                logBtn.textContent = "View Log";
-                logBtn.style.backgroundColor = "#685434"; // Keep the yellow color
-            }
-            
-        } catch (error) {
-            this.log('Error viewing log: ' + error.message, "error");
-            app.extensionManager.toast.add({
-                severity: "error",
-                summary: "Error",
-                detail: `Failed to load log: ${error.message}`,
-                life: 5000
-            });
-            
-            // Flash error and restore button
-            if (logBtn) {
-                logBtn.style.backgroundColor = BUTTON_STYLES.error;
-                logBtn.textContent = "Error";
-                setTimeout(() => {
-                    logBtn.disabled = false;
-                    logBtn.textContent = "View Log";
-                    logBtn.style.backgroundColor = "#685434"; // Keep the yellow color
-                }, TIMEOUTS.FLASH_LONG);
-            }
-        }
+        return viewWorkerLog(this, workerId);
     }
 
     async refreshLog(workerId, silent = false) {
-        const logContent = document.getElementById('distributed-log-content');
-        if (!logContent) return;
-        
-        try {
-            const data = await this.api.getWorkerLog(workerId, 1000);
-            
-            // Update content
-            const shouldAutoScroll = logContent.scrollTop + logContent.clientHeight >= logContent.scrollHeight - 50;
-            logContent.textContent = data.content;
-            
-            // Auto-scroll if was at bottom
-            if (shouldAutoScroll) {
-                logContent.scrollTop = logContent.scrollHeight;
-            }
-            
-            // Only show toast if not in silent mode (manual refresh)
-            if (!silent) {
-                app.extensionManager.toast.add({
-                    severity: "success",
-                    summary: "Log Refreshed",
-                    detail: "Log content updated",
-                    life: 2000
-                });
-            }
-            
-        } catch (error) {
-            // Only show error toast if not in silent mode
-            if (!silent) {
-                app.extensionManager.toast.add({
-                    severity: "error",
-                    summary: "Refresh Failed",
-                    detail: error.message,
-                    life: 3000
-                });
-            }
-        }
+        return refreshLog(this, workerId, silent);
     }
 
     isRemoteWorker(worker) {
-        // Check if explicitly marked as cloud worker
-        if (worker.type === "cloud") {
-            return true;
-        }
-        // Otherwise check by host (backward compatibility)
-        const parsed = this._parseHostInput(worker.host || window.location.hostname);
-        const host = parsed.host || window.location.hostname;
-        return host !== "localhost" && host !== "127.0.0.1" && host !== window.location.hostname;
+        return isRemoteWorker(this, worker);
     }
 
     isCloudWorker(worker) {
-        return worker.type === "cloud";
+        return isCloudWorker(this, worker);
     }
 
     getMasterUrl() {
@@ -1101,7 +507,7 @@ class DistributedExtension {
                         }
                         
                         const worker = {
-                            id: crypto.randomUUID(),
+                            id: generateUUID(),
                             name: `Worker ${workerNum}`,
                             host: isRunpod ? null : "localhost",
                             port: 8189 + portOffset,
@@ -1207,319 +613,31 @@ class DistributedExtension {
     }
 
     async saveWorkerSettings(workerId) {
-        const worker = this.config.workers.find(w => w.id === workerId);
-        if (!worker) return;
-        
-        // Get form values
-        const name = document.getElementById(`name-${workerId}`).value;
-        const workerType = document.getElementById(`worker-type-${workerId}`).value;
-        const isRemote = workerType === 'remote' || workerType === 'cloud';
-        const isCloud = workerType === 'cloud';
-        const rawHost = isRemote ? document.getElementById(`host-${workerId}`).value : window.location.hostname;
-        const parsedHost = isRemote ? this._parseHostInput(rawHost) : { host: window.location.hostname, port: null };
-        const host = isRemote ? parsedHost.host : window.location.hostname;
-        let port = parseInt(document.getElementById(`port-${workerId}`).value);
-        const cudaDevice = isRemote ? undefined : parseInt(document.getElementById(`cuda-${workerId}`).value);
-        const extraArgs = isRemote ? undefined : document.getElementById(`args-${workerId}`).value;
-
-        if (isRemote && Number.isFinite(parsedHost.port)) {
-            port = parsedHost.port;
-        }
-        
-        // Validate
-        if (!name.trim()) {
-            app.extensionManager.toast.add({
-                severity: "error",
-                summary: "Validation Error",
-                detail: "Worker name is required",
-                life: 3000
-            });
-            return;
-        }
-        
-        if ((workerType === 'remote' || workerType === 'cloud') && !host.trim()) {
-            app.extensionManager.toast.add({
-                severity: "error",
-                summary: "Validation Error",
-                detail: "Host is required for remote workers",
-                life: 3000
-            });
-            return;
-        }
-        
-        if (!isCloud && (isNaN(port) || port < 1 || port > 65535)) {
-            app.extensionManager.toast.add({
-                severity: "error",
-                summary: "Validation Error",
-                detail: "Port must be between 1 and 65535",
-                life: 3000
-            });
-            return;
-        }
-        
-        // Check for port conflicts
-        // Remote workers can reuse ports, but local workers cannot share ports with each other or master
-        if (!isRemote) {
-            // Check if port conflicts with master
-            const masterPort = parseInt(window.location.port) || (window.location.protocol === 'https:' ? 443 : 80);
-            if (port === masterPort) {
-                app.extensionManager.toast.add({
-                    severity: "error",
-                    summary: "Port Conflict",
-                    detail: `Port ${port} is already in use by the master server`,
-                    life: 3000
-                });
-                return;
-            }
-            
-            // Check if port conflicts with other local workers
-            const localPortConflict = this.config.workers.some(w => 
-                w.id !== workerId && 
-                w.port === port && 
-                !w.host // local workers have no host or host is null
-            );
-            
-            if (localPortConflict) {
-                app.extensionManager.toast.add({
-                    severity: "error",
-                    summary: "Port Conflict",
-                    detail: `Port ${port} is already in use by another local worker`,
-                    life: 3000
-                });
-                return;
-            }
-        } else {
-            // For remote workers, only check conflicts with other workers on the same host
-            const sameHostConflict = this.config.workers.some(w => 
-                w.id !== workerId && 
-                w.port === port && 
-                w.host === host.trim()
-            );
-            
-            if (sameHostConflict) {
-                app.extensionManager.toast.add({
-                    severity: "error",
-                    summary: "Port Conflict",
-                    detail: `Port ${port} is already in use by another worker on ${host}`,
-                    life: 3000
-                });
-                return;
-            }
-        }
-        
-        try {
-            await this.api.updateWorker(workerId, {
-                name: name.trim(),
-                type: workerType,
-                host: isRemote ? host.trim() : null,
-                port: port,
-                cuda_device: isRemote ? null : cudaDevice,
-                extra_args: isRemote ? null : (extraArgs ? extraArgs.trim() : "")
-            });
-            
-            // Update local config
-            worker.name = name.trim();
-            worker.type = workerType;
-            if (isRemote) {
-                worker.host = host.trim();
-                delete worker.cuda_device;
-                delete worker.extra_args;
-            } else {
-                delete worker.host;
-                worker.cuda_device = cudaDevice;
-                worker.extra_args = extraArgs ? extraArgs.trim() : "";
-            }
-            worker.port = port;
-            
-            // Sync to state
-            this.state.updateWorker(workerId, { enabled: worker.enabled });
-            
-            app.extensionManager.toast.add({
-                severity: "success",
-                summary: "Settings Saved",
-                detail: `Worker ${name} settings updated`,
-                life: 3000
-            });
-            
-            // Refresh the UI
-            if (this.panelElement) {
-                renderSidebarContent(this, this.panelElement);
-            }
-        } catch (error) {
-            app.extensionManager.toast.add({
-                severity: "error",
-                summary: "Save Failed",
-                detail: error.message,
-                life: 5000
-            });
-        }
+        return saveWorkerSettings(this, workerId);
     }
 
     cancelWorkerSettings(workerId) {
-        // Collapse the settings panel
-        this.toggleWorkerExpanded(workerId);
-        
-        // Reset form values to original
-        const worker = this.config.workers.find(w => w.id === workerId);
-        if (worker) {
-            document.getElementById(`name-${workerId}`).value = worker.name;
-            document.getElementById(`host-${workerId}`).value = worker.host || "";
-            document.getElementById(`port-${workerId}`).value = worker.port;
-            document.getElementById(`cuda-${workerId}`).value = worker.cuda_device || 0;
-            document.getElementById(`args-${workerId}`).value = worker.extra_args || "";
-            
-            // Reset remote checkbox
-            const remoteCheckbox = document.getElementById(`remote-${workerId}`);
-            if (remoteCheckbox) {
-                remoteCheckbox.checked = this.isRemoteWorker(worker);
-            }
-        }
+        return cancelWorkerSettings(this, workerId);
     }
 
     async deleteWorker(workerId) {
-        const worker = this.config.workers.find(w => w.id === workerId);
-        if (!worker) return;
-        
-        // Confirm deletion
-        if (!confirm(`Are you sure you want to delete worker "${worker.name}"?`)) {
-            return;
-        }
-        
-        try {
-            await this.api.deleteWorker(workerId);
-            
-            // Remove from local config
-            const index = this.config.workers.findIndex(w => w.id === workerId);
-            if (index !== -1) {
-                this.config.workers.splice(index, 1);
-            }
-            
-            app.extensionManager.toast.add({
-                severity: "success",
-                summary: "Worker Deleted",
-                detail: `Worker ${worker.name} has been removed`,
-                life: 3000
-            });
-            
-            // Refresh the UI
-            if (this.panelElement) {
-                renderSidebarContent(this, this.panelElement);
-            }
-        } catch (error) {
-            app.extensionManager.toast.add({
-                severity: "error",
-                summary: "Delete Failed",
-                detail: error.message,
-                life: 5000
-            });
-        }
+        return deleteWorker(this, workerId);
     }
 
     async addNewWorker() {
-        // Generate new worker ID using UUID (fallback for non-secure contexts)
-        const newId = this.generateUUID();
-        
-        // Find next available port
-        const usedPorts = this.config.workers.map(w => w.port);
-        let nextPort = 8189;
-        while (usedPorts.includes(nextPort)) {
-            nextPort++;
-        }
-        
-        // Create new worker object
-        const newWorker = {
-            id: newId,
-            name: `Worker ${this.config.workers.length + 1}`,
-            port: nextPort,
-            cuda_device: this.config.workers.length,
-            enabled: true,  // Default to enabled for convenience
-            extra_args: ""
-        };
-        
-        // Add to config
-        this.config.workers.push(newWorker);
-        
-        // Save immediately
-        try {
-            await this.api.updateWorker(newId, {
-                name: newWorker.name,
-                port: newWorker.port,
-                cuda_device: newWorker.cuda_device,
-                extra_args: newWorker.extra_args,
-                enabled: newWorker.enabled
-            });
-            
-            // Sync to state
-            this.state.updateWorker(newId, { enabled: true });
-            
-            app.extensionManager.toast.add({
-                severity: "success",
-                summary: "Worker Added",
-                detail: `New worker created on port ${nextPort}`,
-                life: 3000
-            });
-            
-            // Refresh UI and expand the new worker
-            this.state.setWorkerExpanded(newId, true);
-            if (this.panelElement) {
-                renderSidebarContent(this, this.panelElement);
-            }
-            
-        } catch (error) {
-            app.extensionManager.toast.add({
-                severity: "error",
-                summary: "Failed to Add Worker",
-                detail: error.message,
-                life: 5000
-            });
-        }
+        return addNewWorker(this);
     }
 
     startLogAutoRefresh(workerId) {
-        // Stop any existing auto-refresh
-        this.stopLogAutoRefresh();
-        
-        // Refresh every 2 seconds
-        this.logAutoRefreshInterval = setInterval(() => {
-            this.refreshLog(workerId, true); // silent mode
-        }, TIMEOUTS.LOG_REFRESH);
+        return startLogAutoRefresh(this, workerId);
     }
 
     stopLogAutoRefresh() {
-        if (this.logAutoRefreshInterval) {
-            clearInterval(this.logAutoRefreshInterval);
-            this.logAutoRefreshInterval = null;
-        }
+        return stopLogAutoRefresh(this);
     }
 
     toggleWorkerExpanded(workerId) {
-        const settingsDiv = document.getElementById(`settings-${workerId}`);
-        const gpuDiv = settingsDiv.closest('[style*="margin-bottom: 12px"]');
-        const settingsArrow = gpuDiv.querySelector('.settings-arrow');
-        
-        if (!settingsDiv) return;
-        
-        if (this.state.isWorkerExpanded(workerId)) {
-            this.state.setWorkerExpanded(workerId, false);
-            settingsDiv.classList.remove("expanded");
-            if (settingsArrow) {
-                settingsArrow.style.transform = "rotate(0deg)";
-            }
-            // Animate padding to 0
-            settingsDiv.style.padding = "0 12px";
-            settingsDiv.style.marginTop = "0";
-            settingsDiv.style.marginBottom = "0";
-        } else {
-            this.state.setWorkerExpanded(workerId, true);
-            settingsDiv.classList.add("expanded");
-            if (settingsArrow) {
-                settingsArrow.style.transform = "rotate(90deg)";
-            }
-            // Animate padding to full
-            settingsDiv.style.padding = "12px";
-            settingsDiv.style.marginTop = "8px";
-            settingsDiv.style.marginBottom = "8px";
-        }
+        return toggleWorkerExpanded(this, workerId);
     }
 
     _handleInterruptWorkers(button) {

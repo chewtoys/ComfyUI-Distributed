@@ -1,4 +1,4 @@
-import { BUTTON_STYLES, TIMEOUTS } from './constants.js';
+import { BUTTON_STYLES, TIMEOUTS, ENDPOINTS, NODE_CLASSES } from './constants.js';
 
 export async function handleWorkerOperation(extension, button, operation, successText, errorText) {
     const originalText = button.textContent;
@@ -58,7 +58,7 @@ export async function handleWorkerOperation(extension, button, operation, succes
 export async function handleInterruptWorkers(extension, button) {
     return handleWorkerOperation(extension, button, {
         name: "Interrupt",
-        endpoint: "/interrupt",
+        endpoint: ENDPOINTS.INTERRUPT,
         loadingText: "Interrupting...",
         onSuccess: () => setTimeout(() => extension.checkAllWorkerStatuses(), TIMEOUTS.POST_ACTION_DELAY)
     }, "Interrupted!", "Error! See Console");
@@ -67,7 +67,7 @@ export async function handleInterruptWorkers(extension, button) {
 export async function handleClearMemory(extension, button) {
     return handleWorkerOperation(extension, button, {
         name: "Clear memory",
-        endpoint: "/distributed/clear_memory",
+        endpoint: ENDPOINTS.CLEAR_MEMORY,
         loadingText: "Clearing..."
     }, "Success!", "Error! See Console");
 }
@@ -205,8 +205,8 @@ export function findCollectorDownstreamNodes(apiPrompt, collectorIds) {
 export function pruneWorkflowForWorker(extension, apiPrompt, distributedNodes = null) {
     // Find all distributed nodes if not provided
     if (!distributedNodes) {
-        const collectorNodes = findNodesByClass(apiPrompt, "DistributedCollector");
-        const upscaleNodes = findNodesByClass(apiPrompt, "UltimateSDUpscaleDistributed");
+        const collectorNodes = findNodesByClass(apiPrompt, NODE_CLASSES.DISTRIBUTED_COLLECTOR);
+        const upscaleNodes = findNodesByClass(apiPrompt, NODE_CLASSES.UPSCALE_DISTRIBUTED);
         distributedNodes = [...collectorNodes, ...upscaleNodes];
     }
     
@@ -263,7 +263,7 @@ export function pruneWorkflowForWorker(extension, apiPrompt, distributedNodes = 
                 inputs: {
                     images: [distNodeId, 0]  // Connect to first output of distributed node
                 },
-                class_type: "PreviewImage",
+                class_type: NODE_CLASSES.PREVIEW_IMAGE,
                 _meta: {
                     title: "Preview Image (auto-added)"
                 }
