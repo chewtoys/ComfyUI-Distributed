@@ -74,7 +74,7 @@ class WorkerProcessManager:
             if hasattr(folder_paths, 'base_path') and os.path.exists(os.path.join(folder_paths.base_path, "main.py")):
                 debug_log(f"Found ComfyUI root via folder_paths: {folder_paths.base_path}")
                 return folder_paths.base_path
-        except:
+        except Exception:
             pass
         
         # If all methods fail, log detailed information and return the best guess
@@ -497,8 +497,8 @@ class WorkerProcessManager:
                         try:
                             subprocess.run(['taskkill', '/F', '/PID', child_pid], 
                                          capture_output=True, check=False)
-                        except:
-                            pass
+                        except (OSError, FileNotFoundError) as e:
+                            debug_log(f"[Distributed] Warning: taskkill failed for PID {child_pid}: {e}")
                 
                 # Kill the parent with tree flag
                 result = subprocess.run(['taskkill', '/F', '/PID', str(pid), '/T'], 
@@ -516,5 +516,6 @@ class WorkerProcessManager:
                 subprocess.run(['pkill', '-KILL', '-P', str(pid)], check=False)
                 os.kill(pid, signal.SIGKILL)
                 return True
-            except:
+            except Exception as e:
+                log(f"[Distributed] Error killing process tree for PID {pid}: {e}")
                 return False

@@ -26,7 +26,7 @@ def is_debug_enabled():
             with open(CONFIG_FILE, 'r') as f:
                 config = json.load(f)
                 enabled = config.get("settings", {}).get("debug", False)
-        except:
+        except (OSError, json.JSONDecodeError, ValueError):
             pass
 
     _debug_cache = enabled

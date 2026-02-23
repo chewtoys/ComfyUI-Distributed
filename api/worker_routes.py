@@ -147,7 +147,7 @@ async def get_network_info_endpoint(request):
                             physical_device_count = len(result.stdout.strip().split('\n'))
                         else:
                             physical_device_count = max(visible_devices) + 1  # Best guess
-                    except:
+                    except (FileNotFoundError, OSError, subprocess.SubprocessError):
                         physical_device_count = max(visible_devices) + 1  # Best guess
                 else:
                     cuda_device = 0
@@ -175,7 +175,7 @@ async def get_network_info_endpoint(request):
                 ip = info[4][0]
                 if ip and ip not in ips and not ip.startswith('::'):  # Skip IPv6 for now
                     ips.append(ip)
-        except:
+        except (socket.gaierror, OSError):
             pass
         
         # Method 2: Try to connect to external server and get local IP
@@ -186,7 +186,7 @@ async def get_network_info_endpoint(request):
             s.close()
             if local_ip not in ips:
                 ips.append(local_ip)
-        except:
+        except (OSError, socket.error):
             pass
         
         # Method 3: Platform-specific commands
@@ -205,16 +205,20 @@ async def get_network_info_endpoint(request):
                 # Unix/Linux/Mac ifconfig or ip addr
                 try:
                     result = subprocess.run(["ip", "addr"], capture_output=True, text=True)
-                except:
-                    result = subprocess.run(["ifconfig"], capture_output=True, text=True)
+                except (FileNotFoundError, OSError):
+                    try:
+                        result = subprocess.run(["ifconfig"], capture_output=True, text=True)
+                    except (FileNotFoundError, OSError):
+                        result = None
                 
                 import re
                 ip_pattern = re.compile(r'inet\s+(\d+\.\d+\.\d+\.\d+)')
-                for match in ip_pattern.finditer(result.stdout):
-                    ip = match.group(1)
-                    if ip and ip not in ips:
-                        ips.append(ip)
-        except:
+                if result is not None:
+                    for match in ip_pattern.finditer(result.stdout):
+                        ip = match.group(1)
+                        if ip and ip not in ips:
+                            ips.append(ip)
+        except (OSError, subprocess.SubprocessError):
             pass
         
         return ips
@@ -551,4 +555,3 @@ async def get_worker_log_endpoint(request):
             
     except Exception as e:
         return await handle_api_error(request, e, 500)
-

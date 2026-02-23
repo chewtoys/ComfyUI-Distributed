@@ -57,12 +57,12 @@ def get_machine_id():
     try:
         # Method 1: MAC address-based UUID
         return str(uuid.getnode())
-    except:
+    except Exception:
         try:
             # Method 2: Platform + hostname
             import socket
             return f"{platform.machine()}_{socket.gethostname()}"
-        except:
+        except Exception:
             # Fallback
             return platform.machine()
 

@@ -145,7 +145,7 @@ class DistributedCollectorNode:
             debug_log(f"Master - Combined audio: {len(audio_pieces)} pieces, final shape={combined_waveform.shape}")
             return {"waveform": combined_waveform, "sample_rate": sample_rate}
         except Exception as e:
-            log(f"Master - Error combining audio: {e}")
+            log(f"[Distributed] Master - Audio combination failed, returning silence: {e}")
             return empty_audio
 
     async def execute(self, images, audio, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False):

@@ -9,7 +9,7 @@ from ...utils.constants import TILE_WAIT_TIMEOUT, TILE_SEND_TIMEOUT, MAX_BATCH
 from ...utils.usdu_managment import (
     ensure_tile_jobs_initialized, init_static_job_batched,
     _mark_task_completed, _cleanup_job, _drain_results_queue,
-    _send_heartbeat_to_master,
+    _send_heartbeat_to_master, _get_completed_count,
     JOB_PENDING_TASKS, JOB_WORKER_STATUS,
 )
 

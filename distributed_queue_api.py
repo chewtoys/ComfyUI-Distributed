@@ -310,7 +310,14 @@ async def _worker_is_active(worker):
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
             return resp.status == 200
-    except Exception:
+    except asyncio.TimeoutError:
+        debug_log(f"[Distributed] Worker probe timed out: {url}")
+        return False
+    except aiohttp.ClientConnectorError:
+        debug_log(f"[Distributed] Worker unreachable (connection refused): {url}")
+        return False
+    except Exception as e:
+        debug_log(f"[Distributed] Worker probe unexpected error: {e}")
         return False
 
 
@@ -322,7 +329,14 @@ async def _worker_ws_is_active(worker):
         ws = await session.ws_connect(url, heartbeat=20, timeout=3)
         await ws.close()
         return True
-    except Exception:
+    except asyncio.TimeoutError:
+        debug_log(f"[Distributed] Worker WS probe timed out: {url}")
+        return False
+    except aiohttp.ClientConnectorError:
+        debug_log(f"[Distributed] Worker WS unreachable: {url}")
+        return False
+    except Exception as e:
+        debug_log(f"[Distributed] Worker WS probe unexpected error: {e}")
         return False
 
 
@@ -385,6 +399,7 @@ async def _dispatch_worker_prompt(worker, prompt_obj, workflow_meta, client_id=N
             worker_id = worker.get("id")
             await _close_worker_ws(worker_id)
             log(f"[Distributed] Websocket dispatch failed for worker {worker_id}: {exc}")
+            raise
 
     session = await _get_client_session()
     async with session.post(

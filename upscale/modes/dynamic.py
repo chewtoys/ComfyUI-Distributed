@@ -1,4 +1,4 @@
-import asyncio, torch
+import asyncio, time, torch
 from PIL import Image
 import comfy.model_management
 from ...utils.logging import debug_log, log

@@ -98,7 +98,7 @@ async def async_cleanup_and_exit(signum=None):
         try:
             await cloudflare_tunnel_manager.stop_tunnel()
         except Exception as tunnel_error:
-            debug_log(f"Error stopping Cloudflare tunnel during shutdown: {tunnel_error}")
+            log(f"[Distributed] Warning: Cloudflare tunnel did not stop cleanly during shutdown: {tunnel_error}")
     except Exception as e:
         print(f"[Distributed] Error during cleanup: {e}")
     
@@ -169,6 +169,6 @@ def sync_cleanup():
             # No running loop; create a temporary one
             asyncio.run(cloudflare_tunnel_manager.stop_tunnel())
         except Exception as tunnel_error:
-            debug_log(f"Error stopping Cloudflare tunnel during sync cleanup: {tunnel_error}")
+            log(f"[Distributed] Warning: Cloudflare tunnel did not stop cleanly during sync cleanup: {tunnel_error}")
     except Exception as e:
         print(f"[Distributed] Error during cleanup: {e}")
