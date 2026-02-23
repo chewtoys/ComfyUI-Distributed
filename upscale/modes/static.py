@@ -5,13 +5,13 @@ from ...utils.logging import debug_log, log
 from ...utils.image import tensor_to_pil, pil_to_tensor
 from ...utils.async_helpers import run_async_in_server_loop
 from ...utils.config import get_worker_timeout_seconds
-from ...utils.constants import TILE_WAIT_TIMEOUT, TILE_SEND_TIMEOUT, MAX_BATCH
+from ...utils.constants import HEARTBEAT_INTERVAL, MAX_BATCH, TILE_SEND_TIMEOUT, TILE_WAIT_TIMEOUT
 from ...utils.usdu_managment import (
     ensure_tile_jobs_initialized, init_static_job_batched,
     _mark_task_completed, _cleanup_job, _drain_results_queue,
     _send_heartbeat_to_master, _get_completed_count,
-    JOB_PENDING_TASKS, JOB_WORKER_STATUS,
 )
+from ..job_models import TileJobState
 
 
 class StaticModeMixin:
@@ -67,12 +67,39 @@ class StaticModeMixin:
         )
         return processed_batch, x1, y1, ew, eh
 
-    def _flush_tiles_to_master(self, processed_tiles, multi_job_id, master_url, padding, worker_id):
+    def _flush_tiles_to_master(
+        self,
+        processed_tiles,
+        multi_job_id,
+        master_url,
+        padding,
+        worker_id,
+        is_final_flush=False,
+    ):
         """Send accumulated tile payloads to master and return a fresh accumulator."""
         if not processed_tiles:
+            if is_final_flush:
+                run_async_in_server_loop(
+                    self.send_tiles_batch_to_master(
+                        [],
+                        multi_job_id,
+                        master_url,
+                        padding,
+                        worker_id,
+                        is_final_flush=True,
+                    ),
+                    timeout=TILE_SEND_TIMEOUT,
+                )
             return processed_tiles
         run_async_in_server_loop(
-            self.send_tiles_batch_to_master(processed_tiles, multi_job_id, master_url, padding, worker_id),
+            self.send_tiles_batch_to_master(
+                processed_tiles,
+                multi_job_id,
+                master_url,
+                padding,
+                worker_id,
+                is_final_flush=is_final_flush,
+            ),
             timeout=TILE_SEND_TIMEOUT
         )
         return []
@@ -236,12 +263,12 @@ class StaticModeMixin:
             # Send tiles in batches within loop
             if len(processed_tiles) >= MAX_BATCH:
                 processed_tiles = self._flush_tiles_to_master(
-                    processed_tiles, multi_job_id, master_url, padding, worker_id
+                    processed_tiles, multi_job_id, master_url, padding, worker_id, is_final_flush=False
                 )
 
         # Send any remaining tiles
         processed_tiles = self._flush_tiles_to_master(
-            processed_tiles, multi_job_id, master_url, padding, worker_id
+            processed_tiles, multi_job_id, master_url, padding, worker_id, is_final_flush=True
         )
         
         debug_log(f"Worker {worker_id} completed all assigned and requeued tiles")
@@ -266,7 +293,7 @@ class StaticModeMixin:
             
             # Check and requeue timed-out workers periodically
             current_time = time.time()
-            if current_time - last_heartbeat_check >= 10.0:
+            if current_time - last_heartbeat_check >= HEARTBEAT_INTERVAL:
                 requeued_count = await self._check_and_requeue_timed_out_workers(multi_job_id, expected_total)
                 if requeued_count > 0:
                     log(f"Requeued {requeued_count} tasks from timed-out workers")
@@ -289,9 +316,9 @@ class StaticModeMixin:
             prompt_server = ensure_tile_jobs_initialized()
             async with prompt_server.distributed_tile_jobs_lock:
                 job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
-                if job_data:
-                    pending_queue = job_data.get(JOB_PENDING_TASKS)
-                    active_workers = list(job_data.get(JOB_WORKER_STATUS, {}).keys())
+                if isinstance(job_data, TileJobState):
+                    pending_queue = job_data.pending_tasks
+                    active_workers = list(job_data.worker_status.keys())
                     if pending_queue and not pending_queue.empty() and len(active_workers) == 0:
                         log(f"No active workers remaining with {expected_total - completed_count} tasks pending. Returning for local processing.")
                         break

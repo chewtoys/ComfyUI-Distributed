@@ -1,28 +1,27 @@
-import asyncio, time
-import server
+import asyncio
+
 from ..utils.logging import debug_log
 from ..utils.usdu_managment import (
-    ensure_tile_jobs_initialized,
     _check_and_requeue_timed_out_workers as _requeue_usdu,
-    JOB_COMPLETED_TASKS, JOB_PENDING_TASKS,
+    ensure_tile_jobs_initialized,
 )
+from .job_models import ImageJobState, TileJobState
 
 
 class JobStateMixin:
     async def _get_job_data(self, multi_job_id):
-        """Return a shallow snapshot of job data while holding the lock briefly."""
+        """Return current job data reference while holding lock briefly."""
         prompt_server = ensure_tile_jobs_initialized()
         async with prompt_server.distributed_tile_jobs_lock:
-            job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
-            if not job_data:
-                return None
-            return dict(job_data)
+            return prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
 
     async def _get_all_completed_tasks(self, multi_job_id):
         """Helper to retrieve all completed tasks from the job data."""
         job_data = await self._get_job_data(multi_job_id)
-        if job_data and JOB_COMPLETED_TASKS in job_data:
-            return dict(job_data[JOB_COMPLETED_TASKS])
+        if isinstance(job_data, TileJobState):
+            return dict(job_data.completed_tasks)
+        if isinstance(job_data, ImageJobState):
+            return dict(job_data.completed_images)
         return {}
 
     async def _get_next_image_index(self, multi_job_id):
@@ -31,15 +30,14 @@ class JobStateMixin:
         pending_queue = None
         async with prompt_server.distributed_tile_jobs_lock:
             job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
-            if job_data and 'pending_images' in job_data:
-                pending_queue = job_data['pending_images']
+            if isinstance(job_data, ImageJobState):
+                pending_queue = job_data.pending_images
 
         if pending_queue is None:
             return None
 
         try:
-            image_idx = await asyncio.wait_for(pending_queue.get(), timeout=1.0)
-            return image_idx
+            return await asyncio.wait_for(pending_queue.get(), timeout=1.0)
         except asyncio.TimeoutError:
             return None
 
@@ -49,15 +47,14 @@ class JobStateMixin:
         pending_queue = None
         async with prompt_server.distributed_tile_jobs_lock:
             job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
-            if job_data and JOB_PENDING_TASKS in job_data:
-                pending_queue = job_data[JOB_PENDING_TASKS]
+            if isinstance(job_data, TileJobState):
+                pending_queue = job_data.pending_tasks
 
         if pending_queue is None:
             return None
 
         try:
-            tile_idx = await asyncio.wait_for(pending_queue.get(), timeout=0.1)
-            return tile_idx
+            return await asyncio.wait_for(pending_queue.get(), timeout=0.1)
         except asyncio.TimeoutError:
             return None
 
@@ -66,8 +63,10 @@ class JobStateMixin:
         prompt_server = ensure_tile_jobs_initialized()
         async with prompt_server.distributed_tile_jobs_lock:
             job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
-            if job_data and 'completed_images' in job_data:
-                return len(job_data['completed_images'])
+            if isinstance(job_data, ImageJobState):
+                return len(job_data.completed_images)
+            if isinstance(job_data, TileJobState):
+                return len(job_data.completed_tasks)
             return 0
 
     async def _get_all_completed_images(self, multi_job_id):
@@ -75,8 +74,8 @@ class JobStateMixin:
         prompt_server = ensure_tile_jobs_initialized()
         async with prompt_server.distributed_tile_jobs_lock:
             job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
-            if job_data and 'completed_images' in job_data:
-                return job_data['completed_images'].copy()
+            if isinstance(job_data, ImageJobState):
+                return job_data.completed_images.copy()
             return {}
 
     async def _get_pending_count(self, multi_job_id):
@@ -84,18 +83,20 @@ class JobStateMixin:
         prompt_server = ensure_tile_jobs_initialized()
         async with prompt_server.distributed_tile_jobs_lock:
             job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
-            if job_data and 'pending_images' in job_data:
-                return job_data['pending_images'].qsize()
+            if isinstance(job_data, ImageJobState):
+                return job_data.pending_images.qsize()
+            if isinstance(job_data, TileJobState):
+                return job_data.pending_tasks.qsize()
             return 0
 
     async def _drain_worker_results_queue(self, multi_job_id):
-        """Drain pending worker results from queue and update completed_images. Returns count of drained images."""
+        """Drain pending worker results from queue and update completed images."""
         prompt_server = ensure_tile_jobs_initialized()
         worker_queue = None
         async with prompt_server.distributed_tile_jobs_lock:
             job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
-            if job_data and 'queue' in job_data and 'completed_images' in job_data:
-                worker_queue = job_data['queue']
+            if isinstance(job_data, ImageJobState):
+                worker_queue = job_data.queue
 
         if worker_queue is None:
             return 0
@@ -113,17 +114,16 @@ class JobStateMixin:
         collected = 0
         async with prompt_server.distributed_tile_jobs_lock:
             job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
-            if not job_data or 'completed_images' not in job_data:
+            if not isinstance(job_data, ImageJobState):
                 return 0
-            completed_images = job_data['completed_images']
 
             for result in drained_results:
-                worker_id = result.get('worker_id')
-                if 'image_idx' in result and 'image' in result:
-                    image_idx = result['image_idx']
-                    image_pil = result['image']
-                    if image_idx not in completed_images:
-                        completed_images[image_idx] = image_pil
+                worker_id = result.get("worker_id")
+                if "image_idx" in result and "image" in result:
+                    image_idx = result["image_idx"]
+                    image_pil = result["image"]
+                    if image_idx not in job_data.completed_images:
+                        job_data.completed_images[image_idx] = image_pil
                         collected += 1
                         debug_log(f"Drained image {image_idx} from worker {worker_id}")
 
@@ -133,6 +133,5 @@ class JobStateMixin:
         return collected
 
     async def _check_and_requeue_timed_out_workers(self, multi_job_id, batch_size):
-        """Check for timed out workers and requeue their assigned images. Returns count of requeued images."""
-        # Use the original function from usdu_managment.py
+        """Check for timed out workers and requeue their assigned images."""
         return await _requeue_usdu(multi_job_id, batch_size)

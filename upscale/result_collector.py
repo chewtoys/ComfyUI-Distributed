@@ -1,13 +1,14 @@
 import asyncio, time
 import comfy.model_management
 import server
+from ..utils.constants import HEARTBEAT_INTERVAL
 from ..utils.logging import debug_log, log
 from ..utils.config import get_worker_timeout_seconds
 from ..utils.usdu_managment import (
     ensure_tile_jobs_initialized, _mark_task_completed,
     _check_and_requeue_timed_out_workers,
-    JOB_COMPLETED_TASKS, JOB_WORKER_STATUS, JOB_PENDING_TASKS,
 )
+from .job_models import BaseJobState, ImageJobState, TileJobState
 
 
 class ResultCollectorMixin:
@@ -20,20 +21,23 @@ class ResultCollectorMixin:
             if multi_job_id not in prompt_server.distributed_pending_tile_jobs:
                 raise RuntimeError(f"Job queue not initialized for {multi_job_id}")
             job_data = prompt_server.distributed_pending_tile_jobs[multi_job_id]
-            if not isinstance(job_data, dict) or 'mode' not in job_data:
-                raise RuntimeError("Invalid job data structure")
-            if job_data['mode'] != mode:
-                raise RuntimeError(f"Mode mismatch: expected {mode}, got {job_data['mode']}")
-            q = job_data['queue']
-            
-            # For dynamic mode, get reference to completed_images
             if mode == 'dynamic':
-                completed_images = job_data['completed_images']
-                # Calculate expected count for logging
+                if not isinstance(job_data, ImageJobState):
+                    raise RuntimeError(
+                        f"Mode mismatch: expected dynamic, got {getattr(job_data, 'mode', 'unknown')}"
+                    )
+                q = job_data.queue
+                completed_images = job_data.completed_images
                 expected_count = remaining_to_collect or batch_size
+            elif mode == 'static':
+                if not isinstance(job_data, TileJobState):
+                    raise RuntimeError(
+                        f"Mode mismatch: expected static, got {getattr(job_data, 'mode', 'unknown')}"
+                    )
+                q = job_data.queue
+                expected_count = len(job_data.completed_tasks) + job_data.pending_tasks.qsize()
             else:
-                # Calculate expected count from job data for static mode
-                expected_count = job_data.get('total_items', 0) - len(job_data.get('completed_items', set()))
+                raise RuntimeError(f"Unsupported mode: {mode}")
         
         item_type = "images" if mode == 'dynamic' else "tiles"
         debug_log(f"UltimateSDUpscale Master - Starting collection, expecting {expected_count} {item_type} from {num_workers} workers")
@@ -43,6 +47,7 @@ class ResultCollectorMixin:
         # Unify collector/upscaler wait behavior with the UI worker timeout
         timeout = float(get_worker_timeout_seconds())
         last_heartbeat_check = time.time()
+        wait_started_at = time.time()
         collected_count = 0
         
         while len(workers_done) < num_workers:
@@ -65,42 +70,34 @@ class ResultCollectorMixin:
                 if mode == 'static':
                     # Handle tiles
                     tiles = result.get('tiles', [])
-                    if tiles:
-                        # Batch mode
-                        debug_log(f"UltimateSDUpscale Master - Received batch of {len(tiles)} tiles from worker '{worker_id}' (is_last={is_last})")
-                        
-                        for tile_data in tiles:
-                            # Validate required fields
-                            if 'batch_idx' not in tile_data:
-                                log(f"UltimateSDUpscale Master - Missing batch_idx in tile data, skipping")
-                                continue
-                            
-                            tile_idx = tile_data['tile_idx']
-                            # Use global_idx as key if available (for batch processing)
-                            key = tile_data.get('global_idx', tile_idx)
-                            
-                            # Store the full tile data including metadata; prefer PIL image if present
-                            entry = {
-                                'tile_idx': tile_idx,
-                                'x': tile_data['x'],
-                                'y': tile_data['y'],
-                                'extracted_width': tile_data['extracted_width'],
-                                'extracted_height': tile_data['extracted_height'],
-                                'padding': tile_data['padding'],
-                                'worker_id': worker_id,
-                                'batch_idx': tile_data.get('batch_idx', 0),
-                                'global_idx': tile_data.get('global_idx', tile_idx)
-                            }
-                            if 'image' in tile_data:
-                                entry['image'] = tile_data['image']
-                            elif 'tensor' in tile_data:
-                                entry['tensor'] = tile_data['tensor']
-                            collected_results[key] = entry
-                    else:
-                        # Single tile mode (backward compat)
-                        tile_idx = result['tile_idx']
-                        collected_results[tile_idx] = result
-                        debug_log(f"UltimateSDUpscale Master - Received single tile {tile_idx} from worker '{worker_id}' (is_last={is_last})")
+                    debug_log(
+                        f"UltimateSDUpscale Master - Received batch of {len(tiles)} tiles from worker "
+                        f"'{worker_id}' (is_last={is_last})"
+                    )
+
+                    for tile_data in tiles:
+                        if 'batch_idx' not in tile_data:
+                            log("UltimateSDUpscale Master - Missing batch_idx in tile data, skipping")
+                            continue
+
+                        tile_idx = tile_data['tile_idx']
+                        key = tile_data.get('global_idx', tile_idx)
+                        entry = {
+                            'tile_idx': tile_idx,
+                            'x': tile_data['x'],
+                            'y': tile_data['y'],
+                            'extracted_width': tile_data['extracted_width'],
+                            'extracted_height': tile_data['extracted_height'],
+                            'padding': tile_data['padding'],
+                            'worker_id': worker_id,
+                            'batch_idx': tile_data.get('batch_idx', 0),
+                            'global_idx': tile_data.get('global_idx', tile_idx),
+                        }
+                        if 'image' in tile_data:
+                            entry['image'] = tile_data['image']
+                        elif 'tensor' in tile_data:
+                            entry['tensor'] = tile_data['tensor']
+                        collected_results[key] = entry
                 
                 elif mode == 'dynamic':
                     # Handle full images
@@ -117,10 +114,10 @@ class ResultCollectorMixin:
                     debug_log(f"UltimateSDUpscale Master - Worker {worker_id} completed")
                     
             except asyncio.TimeoutError:
+                current_time = time.time()
                 if mode == 'dynamic':
                     # Check for worker timeouts periodically
-                    current_time = time.time()
-                    if current_time - last_heartbeat_check >= 10.0:
+                    if current_time - last_heartbeat_check >= HEARTBEAT_INTERVAL:
                         # Use the class method to check and requeue
                         requeued = await self._check_and_requeue_timed_out_workers(multi_job_id, batch_size)
                         if requeued > 0:
@@ -128,11 +125,39 @@ class ResultCollectorMixin:
                         last_heartbeat_check = current_time
                     
                     # Check if we've been waiting too long overall
-                    if current_time - last_heartbeat_check > timeout:
-                        log(f"UltimateSDUpscale Master - Overall timeout waiting for images")
+                    if current_time - wait_started_at > timeout:
+                        async with prompt_server.distributed_tile_jobs_lock:
+                            job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
+                            worker_status = dict(job_data.worker_status) if isinstance(job_data, BaseJobState) else {}
+                            waiting_workers = list(worker_status.keys())
+                        for worker_id, last_seen in worker_status.items():
+                            elapsed_for_worker = max(0.0, current_time - float(last_seen))
+                            log(
+                                "UltimateSDUpscale Master - Heartbeat timeout: "
+                                f"worker={worker_id}, elapsed={elapsed_for_worker:.1f}s"
+                            )
+                        elapsed = current_time - wait_started_at
+                        log(
+                            "UltimateSDUpscale Master - Heartbeat timeout while waiting for images; "
+                            f"workers={waiting_workers}, elapsed={elapsed:.1f}s"
+                        )
                         break
                 else:
-                    log(f"UltimateSDUpscale Master - Timeout waiting for {item_type}")
+                    async with prompt_server.distributed_tile_jobs_lock:
+                        job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
+                        worker_status = dict(job_data.worker_status) if isinstance(job_data, BaseJobState) else {}
+                        waiting_workers = list(worker_status.keys())
+                    for worker_id, last_seen in worker_status.items():
+                        elapsed_for_worker = max(0.0, current_time - float(last_seen))
+                        log(
+                            "UltimateSDUpscale Master - Heartbeat timeout: "
+                            f"worker={worker_id}, elapsed={elapsed_for_worker:.1f}s"
+                        )
+                    elapsed = current_time - wait_started_at
+                    log(
+                        f"UltimateSDUpscale Master - Heartbeat timeout waiting for {item_type}; "
+                        f"workers={waiting_workers}, elapsed={elapsed:.1f}s"
+                    )
                     break
         
         debug_log(f"UltimateSDUpscale Master - Collection complete. Got {len(collected_results)} {item_type} from {len(workers_done)} workers")
@@ -155,8 +180,8 @@ class ResultCollectorMixin:
         prompt_server = ensure_tile_jobs_initialized()
         async with prompt_server.distributed_tile_jobs_lock:
             job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
-            if job_data and 'completed_images' in job_data:
-                job_data['completed_images'][image_idx] = image_pil
+            if isinstance(job_data, ImageJobState):
+                job_data.completed_images[image_idx] = image_pil
 
     async def _async_collect_dynamic_images(self, multi_job_id, remaining_to_collect, num_workers, batch_size, master_processed_count):
         """Collect remaining processed images from workers."""

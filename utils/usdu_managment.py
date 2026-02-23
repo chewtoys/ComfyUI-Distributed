@@ -4,14 +4,16 @@ import json
 import copy
 import os
 import io
-from aiohttp import web, ClientTimeout
+from aiohttp import web
 import server
 from PIL import Image
 
 # Import from other utilities
 from .logging import debug_log, log
-from .network import handle_api_error, get_client_session
+from .network import build_worker_url, handle_api_error, get_client_session, probe_worker
+from ..upscale.job_models import BaseJobState, ImageJobState, TileJobState
 # We avoid converting to tensors on the master for tiles; blending uses PIL
+from typing import List, Optional
 
 # Configure maximum payload size (50MB default, configurable via environment variable)
 MAX_PAYLOAD_SIZE = int(os.environ.get('COMFYUI_MAX_PAYLOAD_SIZE', str(50 * 1024 * 1024)))
@@ -98,28 +100,11 @@ def _parse_tiles_from_form(data):
 
     return tiles
 
-
-# Unified Job Data Structure Keys
-JOB_QUEUE = 'queue'
-JOB_MODE = 'mode'
-JOB_COMPLETED_TASKS = 'completed_tasks'
-JOB_WORKER_STATUS = 'worker_status'
-JOB_ASSIGNED_TO_WORKERS = 'assigned_to_workers'
-JOB_PENDING_TASKS = 'pending_tasks'
-JOB_BATCH_SIZE = 'batch_size'  # For dynamic
-JOB_NUM_TILES_PER_IMAGE = 'num_tiles_per_image'  # For static
-
-# Task Types
-TASK_TYPE_TILE = 'tile'
-TASK_TYPE_IMAGE = 'image'
-
-from typing import List, Optional
-
 async def init_dynamic_job(multi_job_id: str, batch_size: int, enabled_workers: List[str], all_indices: Optional[List[int]] = None):
     """Initialize queue for dynamic mode (per-image), with collector fields.
 
-    - Creates JOB_PENDING_TASKS with image indices
-    - Adds 'completed_images' dict and 'pending_images' alias used by collectors
+    - Creates pending image queue entries
+    - Initializes dynamic completion/status tracking
     """
     await _init_job_queue(
         multi_job_id,
@@ -128,19 +113,13 @@ async def init_dynamic_job(multi_job_id: str, batch_size: int, enabled_workers: 
         all_indices=all_indices or list(range(batch_size)),
         enabled_workers=enabled_workers,
     )
-
-    prompt_server = ensure_tile_jobs_initialized()
-    async with prompt_server.distributed_tile_jobs_lock:
-        job_data = prompt_server.distributed_pending_tile_jobs[multi_job_id]
-        job_data['completed_images'] = {}
-        job_data['pending_images'] = job_data[JOB_PENDING_TASKS]
     debug_log(f"Job {multi_job_id} initialized with {batch_size} images")
 
 
 async def init_static_job_batched(multi_job_id: str, batch_size: int, num_tiles_per_image: int, enabled_workers: List[str]):
     """Initialize queue for static mode (batched-per-tile).
 
-    - Populates JOB_PENDING_TASKS with tile ids [0..num_tiles_per_image-1]
+    - Populates pending tile queue with tile ids [0..num_tiles_per_image-1]
     """
     await _init_job_queue(
         multi_job_id,
@@ -152,7 +131,15 @@ async def init_static_job_batched(multi_job_id: str, batch_size: int, num_tiles_
     )
     # Initialization handled by master; avoid duplicate init logs here
 
-async def _init_job_queue(multi_job_id, mode, batch_size=None, num_tiles_per_image=None, all_indices=None, enabled_workers=None, task_assignments=None, batched_static: bool = False):
+async def _init_job_queue(
+    multi_job_id,
+    mode,
+    batch_size=None,
+    num_tiles_per_image=None,
+    all_indices=None,
+    enabled_workers=None,
+    batched_static: bool = False,
+):
     """Unified initialization for job queues in static and dynamic modes."""
     prompt_server = ensure_tile_jobs_initialized()
     async with prompt_server.distributed_tile_jobs_lock:
@@ -160,48 +147,37 @@ async def _init_job_queue(multi_job_id, mode, batch_size=None, num_tiles_per_ima
             debug_log(f"Queue already exists for {multi_job_id}")
             return
 
-        job_data = {
-            JOB_QUEUE: asyncio.Queue(),
-            JOB_MODE: mode,
-            JOB_COMPLETED_TASKS: {},
-            JOB_WORKER_STATUS: {w: time.time() for w in enabled_workers or []},
-            JOB_ASSIGNED_TO_WORKERS: {w: [] for w in enabled_workers or []},
-            JOB_PENDING_TASKS: asyncio.Queue(),
-        }
+        if mode == 'dynamic':
+            job_data = ImageJobState(multi_job_id=multi_job_id)
+        elif mode == 'static':
+            job_data = TileJobState(multi_job_id=multi_job_id)
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+        job_data.worker_status = {w: time.time() for w in enabled_workers or []}
+        job_data.assigned_to_workers = {w: [] for w in enabled_workers or []}
 
         if mode == 'dynamic':
-            job_data[JOB_BATCH_SIZE] = batch_size
-            pending_queue = job_data[JOB_PENDING_TASKS]
-            for i in (all_indices or range(batch_size)):
+            job_data.batch_size = int(batch_size or 0)
+            pending_queue = job_data.pending_images
+            for i in (all_indices or range(int(batch_size or 0))):
                 await pending_queue.put(i)
             debug_log(f"Initialized image queue with {batch_size} pending items")
         elif mode == 'static':
-            job_data[JOB_NUM_TILES_PER_IMAGE] = num_tiles_per_image
-            job_data[JOB_BATCH_SIZE] = batch_size
-            job_data['batched_static'] = bool(batched_static)
+            job_data.num_tiles_per_image = int(num_tiles_per_image or 0)
+            job_data.batch_size = int(batch_size or 0)
+            job_data.batched_static = bool(batched_static)
             # For batched static distribution, populate only tile ids [0..num_tiles_per_image-1]
-            pending_queue = job_data[JOB_PENDING_TASKS]
+            pending_queue = job_data.pending_tasks
             if batched_static and num_tiles_per_image is not None:
                 for i in range(num_tiles_per_image):
                     await pending_queue.put(i)
             else:
-                total_tiles = batch_size * num_tiles_per_image
+                total_tiles = int(batch_size or 0) * int(num_tiles_per_image or 0)
                 for i in range(total_tiles):
                     await pending_queue.put(i)
             
-            # Keep backward compatibility - if task assignments provided, still track them
-            if task_assignments and enabled_workers:
-                # task_assignments[0] is for master, 1+ are for workers
-                for i, worker_id in enumerate(enabled_workers):
-                    if i + 1 < len(task_assignments):
-                        job_data[JOB_ASSIGNED_TO_WORKERS][worker_id] = task_assignments[i + 1]
-                        debug_log(f"Worker {worker_id} pre-assigned {len(task_assignments[i + 1])} tasks (legacy mode)")
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
-
         prompt_server.distributed_pending_tile_jobs[multi_job_id] = job_data
-
-# Note: legacy task distribution and queue pull helpers removed
 
 async def _drain_results_queue(multi_job_id):
     """Drain pending results from queue and update completed_tasks. Returns count drained.
@@ -211,10 +187,10 @@ async def _drain_results_queue(multi_job_id):
     prompt_server = ensure_tile_jobs_initialized()
     async with prompt_server.distributed_tile_jobs_lock:
         job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
-        if not job_data or JOB_QUEUE not in job_data or JOB_COMPLETED_TASKS not in job_data:
+        if not isinstance(job_data, BaseJobState):
             return 0
-        q = job_data[JOB_QUEUE]
-        completed_tasks = job_data[JOB_COMPLETED_TASKS]
+        q = job_data.queue
+        completed_tasks = job_data.completed_tasks
 
         collected = 0
         while True:
@@ -237,26 +213,10 @@ async def _drain_results_queue(multi_job_id):
                     if task_id not in completed_tasks:
                         completed_tasks[task_id] = tile_data
                         collected += 1
-            elif 'tensor' in result and 'tile_idx' in result:  # Single tile backward compat
-                task_id = result.get('global_idx', result['tile_idx'])
-                if task_id not in completed_tasks:
-                    completed_tasks[task_id] = {
-                        'tensor': result['tensor'],
-                        'tile_idx': result['tile_idx'],
-                        'x': result['x'],
-                        'y': result['y'],
-                        'extracted_width': result['extracted_width'],
-                        'extracted_height': result['extracted_height'],
-                        'padding': result['padding'],
-                        'batch_idx': result.get('batch_idx', 0),
-                        'global_idx': task_id
-                    }
-                    collected += 1
-
             if is_last:
                 # Track worker completion
-                if worker_id in job_data[JOB_WORKER_STATUS]:
-                    del job_data[JOB_WORKER_STATUS][worker_id]
+                if worker_id in job_data.worker_status:
+                    del job_data.worker_status[worker_id]
 
         return collected
 
@@ -269,27 +229,30 @@ async def _check_and_requeue_timed_out_workers(multi_job_id, total_tasks):
             return 0
 
         current_time = time.time()
+        if not isinstance(job_data, BaseJobState):
+            return 0
+
         requeued_count = 0
-        completed_tasks = job_data.get(JOB_COMPLETED_TASKS, {})
+        completed_tasks = job_data.completed_tasks
 
         # Allow override via config setting 'worker_timeout_seconds'
         cfg = load_config()
         hb_timeout = int(cfg.get('settings', {}).get('worker_timeout_seconds', HEARTBEAT_TIMEOUT))
 
-        for worker, last_heartbeat in list(job_data.get(JOB_WORKER_STATUS, {}).items()):
+        for worker, last_heartbeat in list(job_data.worker_status.items()):
             age = current_time - last_heartbeat
             debug_log(f"Timeout check: worker={worker} age={age:.1f}s threshold={hb_timeout}s")
             if age > hb_timeout:
                 # Busy-only grace policy: require positive signal from worker (/prompt)
                 # We also log assignment state for diagnostics but do not grace on it alone.
-                assigned = job_data.get(JOB_ASSIGNED_TO_WORKERS, {}).get(worker, [])
+                assigned = job_data.assigned_to_workers.get(worker, [])
                 incomplete_assigned = 0
                 try:
                     if assigned:
-                        batched_static = bool(job_data.get('batched_static', False))
+                        batched_static = bool(job_data.batched_static)
                         if batched_static:
-                            num_tiles_per_image = job_data.get(JOB_NUM_TILES_PER_IMAGE, 1)
-                            batch_size = job_data.get(JOB_BATCH_SIZE, 1)
+                            num_tiles_per_image = int(job_data.num_tiles_per_image or 1)
+                            batch_size = int(job_data.batch_size or 1)
                             for task_id in assigned:
                                 for b in range(batch_size):
                                     gidx = b * num_tiles_per_image + task_id
@@ -305,44 +268,37 @@ async def _check_and_requeue_timed_out_workers(multi_job_id, total_tasks):
                     debug_log(f"Assigned diagnostics failed for worker {worker}: {e}")
 
                 busy = False
-                probe_status = None
                 probe_queue = None
                 try:
                     cfg_workers = load_config().get('workers', [])
                     wrec = next((w for w in cfg_workers if str(w.get('id')) == str(worker)), None)
                     if wrec:
-                        host = wrec.get('host') or 'localhost'
-                        port = int(wrec.get('port', 8188))
-                        url = f"http://{host}:{port}/prompt"
-                        debug_log(f"Probing worker {worker} at {url}")
-                        session = await get_client_session()
-                        async with session.get(url, timeout=ClientTimeout(total=2.0)) as resp:
-                            probe_status = resp.status
-                            if resp.status == 200:
-                                try:
-                                    payload = await resp.json()
-                                    probe_queue = int(payload.get('exec_info', {}).get('queue_remaining', 0))
-                                except Exception:
-                                    probe_queue = 0
-                                busy = probe_queue is not None and probe_queue > 0
+                        worker_url = build_worker_url(wrec)
+                        debug_log(f"Probing worker {worker} at {worker_url}/prompt")
+                        payload = await probe_worker(worker_url, timeout=2.0)
+                        if payload is not None:
+                            probe_queue = int(payload.get('exec_info', {}).get('queue_remaining', 0))
+                            busy = probe_queue is not None and probe_queue > 0
                 except Exception as e:
                     debug_log(f"Probe failed for worker {worker}: {e}")
                 finally:
-                    debug_log(f"Probe diagnostics: http_status={probe_status} queue_remaining={probe_queue}")
+                    debug_log(
+                        f"Probe diagnostics: online={probe_queue is not None} queue_remaining={probe_queue}"
+                    )
 
                 if busy:
-                    job_data[JOB_WORKER_STATUS][worker] = current_time
+                    job_data.worker_status[worker] = current_time
                     debug_log(f"Heartbeat grace: worker {worker} busy via probe; skipping requeue")
                     continue
 
-                log(f"Worker {worker} timed out")
-                for task_id in job_data.get(JOB_ASSIGNED_TO_WORKERS, {}).get(worker, []):
+                log(f"Worker {worker} heartbeat timed out after {age:.1f}s")
+                for task_id in job_data.assigned_to_workers.get(worker, []):
                     # If batched_static, task_id is a tile_idx; consider it complete only if
                     # all corresponding global_idx entries are present in completed_tasks.
-                    batched_static = bool(job_data.get('batched_static', False))
+                    batched_static = bool(job_data.batched_static)
                     if batched_static:
-                        num_tiles_per_image = job_data.get(JOB_NUM_TILES_PER_IMAGE, 1)
-                        batch_size = job_data.get(JOB_BATCH_SIZE, 1)
+                        num_tiles_per_image = int(job_data.num_tiles_per_image or 1)
+                        batch_size = int(job_data.batch_size or 1)
                         # Check all global indices for this tile across the batch
                         all_done = True
                         for b in range(batch_size):
@@ -351,17 +307,15 @@ async def _check_and_requeue_timed_out_workers(multi_job_id, total_tasks):
                                 all_done = False
                                 break
                         if not all_done:
-                            await job_data[JOB_PENDING_TASKS].put(task_id)
+                            await job_data.pending_tasks.put(task_id)
                             requeued_count += 1
                     else:
-                        # Legacy/global-idx mode: task_id is a global index key
                         if task_id not in completed_tasks:
-                            await job_data[JOB_PENDING_TASKS].put(task_id)
+                            await job_data.pending_tasks.put(task_id)
                             requeued_count += 1
-                if JOB_WORKER_STATUS in job_data:
-                    del job_data[JOB_WORKER_STATUS][worker]
-                if JOB_ASSIGNED_TO_WORKERS in job_data:
-                    job_data[JOB_ASSIGNED_TO_WORKERS][worker] = []
+                job_data.worker_status.pop(worker, None)
+                if worker in job_data.assigned_to_workers:
+                    job_data.assigned_to_workers[worker] = []
 
         return requeued_count
 
@@ -370,8 +324,8 @@ async def _get_completed_count(multi_job_id):
     prompt_server = ensure_tile_jobs_initialized()
     async with prompt_server.distributed_tile_jobs_lock:
         job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
-        if job_data and JOB_COMPLETED_TASKS in job_data:
-            return len(job_data[JOB_COMPLETED_TASKS])
+        if isinstance(job_data, BaseJobState):
+            return len(job_data.completed_tasks)
         return 0
 
 async def _mark_task_completed(multi_job_id, task_id, result):
@@ -379,8 +333,8 @@ async def _mark_task_completed(multi_job_id, task_id, result):
     prompt_server = ensure_tile_jobs_initialized()
     async with prompt_server.distributed_tile_jobs_lock:
         job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
-        if job_data and JOB_COMPLETED_TASKS in job_data:
-            job_data[JOB_COMPLETED_TASKS][task_id] = result
+        if isinstance(job_data, BaseJobState):
+            job_data.completed_tasks[task_id] = result
 
 async def _send_heartbeat_to_master(multi_job_id, master_url, worker_id):
     """Send heartbeat to master."""
@@ -417,8 +371,8 @@ async def heartbeat_endpoint(request):
         async with prompt_server.distributed_tile_jobs_lock:
             if multi_job_id in prompt_server.distributed_pending_tile_jobs:
                 job_data = prompt_server.distributed_pending_tile_jobs[multi_job_id]
-                if JOB_WORKER_STATUS in job_data:
-                    job_data[JOB_WORKER_STATUS][worker_id] = time.time()
+                if isinstance(job_data, BaseJobState):
+                    job_data.worker_status[worker_id] = time.time()
                     debug_log(f"Heartbeat from worker {worker_id}")
                     return web.json_response({"status": "success"})
                 else:
@@ -454,16 +408,15 @@ async def submit_tiles_endpoint(request):
             async with prompt_server.distributed_tile_jobs_lock:
                 if multi_job_id in prompt_server.distributed_pending_tile_jobs:
                     job_data = prompt_server.distributed_pending_tile_jobs[multi_job_id]
-                    if JOB_MODE in job_data and job_data[JOB_MODE] != 'static':
+                    if not isinstance(job_data, TileJobState):
                         return await handle_api_error(request, "Job not configured for tile submissions", 400)
-                    if JOB_QUEUE in job_data:
-                        await job_data[JOB_QUEUE].put({
-                            'worker_id': worker_id,
-                            'is_last': True,
-                            'tiles': []
-                        })
-                        debug_log(f"Received completion signal from worker {worker_id}")
-                        return web.json_response({"status": "success"})
+                    await job_data.queue.put({
+                        'worker_id': worker_id,
+                        'is_last': True,
+                        'tiles': []
+                    })
+                    debug_log(f"Received completion signal from worker {worker_id}")
+                    return web.json_response({"status": "success"})
         
         try:
             tiles = _parse_tiles_from_form(data)
@@ -474,10 +427,10 @@ async def submit_tiles_endpoint(request):
         async with prompt_server.distributed_tile_jobs_lock:
             if multi_job_id in prompt_server.distributed_pending_tile_jobs:
                 job_data = prompt_server.distributed_pending_tile_jobs[multi_job_id]
-                if JOB_MODE in job_data and job_data[JOB_MODE] != 'static':
+                if not isinstance(job_data, TileJobState):
                     return await handle_api_error(request, "Job not configured for tile submissions", 400)
-                
-                q = job_data[JOB_QUEUE]
+
+                q = job_data.queue
                 if batch_size > 0 or len(tiles) > 0:
                     await q.put({
                         'worker_id': worker_id,
@@ -527,42 +480,35 @@ async def submit_image_endpoint(request):
             async with prompt_server.distributed_tile_jobs_lock:
                 if multi_job_id in prompt_server.distributed_pending_tile_jobs:
                     job_data = prompt_server.distributed_pending_tile_jobs[multi_job_id]
-                    if JOB_MODE in job_data and job_data[JOB_MODE] != 'dynamic':
+                    if not isinstance(job_data, ImageJobState):
                         return await handle_api_error(request, "Job not configured for image submissions", 400)
-                    if JOB_QUEUE in job_data:
-                        await job_data[JOB_QUEUE].put({
-                            'worker_id': worker_id,
-                            'image_idx': image_idx,
-                            'image': img,
-                            'is_last': is_last
-                        })
-                        return web.json_response({"status": "success"})
+                    await job_data.queue.put({
+                        'worker_id': worker_id,
+                        'image_idx': image_idx,
+                        'image': img,
+                        'is_last': is_last
+                    })
+                    return web.json_response({"status": "success"})
         
         # Handle completion signal (no image data)
         elif is_last:
             async with prompt_server.distributed_tile_jobs_lock:
                 if multi_job_id in prompt_server.distributed_pending_tile_jobs:
                     job_data = prompt_server.distributed_pending_tile_jobs[multi_job_id]
-                    if JOB_MODE in job_data and job_data[JOB_MODE] != 'dynamic':
+                    if not isinstance(job_data, ImageJobState):
                         return await handle_api_error(request, "Job not configured for image submissions", 400)
-                    if JOB_QUEUE in job_data:
-                        await job_data[JOB_QUEUE].put({
-                            'worker_id': worker_id,
-                            'is_last': True,
-                            'tiles': []  # For compatibility
-                        })
-                        debug_log(f"Received completion signal from worker {worker_id}")
-                        return web.json_response({"status": "success"})
+                    await job_data.queue.put({
+                        'worker_id': worker_id,
+                        'is_last': True,
+                    })
+                    debug_log(f"Received completion signal from worker {worker_id}")
+                    return web.json_response({"status": "success"})
         else:
             return await handle_api_error(request, "Missing image data or invalid request", 400)
             
         return await handle_api_error(request, "Job not found", 404)
     except Exception as e:
         return await handle_api_error(request, e, 500)
-
-# Note: Removed legacy /distributed/tile_complete endpoint. Use /distributed/submit_tiles.
-
-
 
 # Helper functions for shallow copying conditioning without duplicating models
 def clone_control_chain(control, clone_hint=True):
@@ -606,12 +552,13 @@ def ensure_tile_jobs_initialized():
         prompt_server.distributed_pending_tile_jobs = {}
         prompt_server.distributed_tile_jobs_lock = asyncio.Lock()
     else:
-        # Clean up any legacy queue structures that don't have the 'mode' field
-        # (Should be rare after fixes, but keep for safety)
-        to_remove = [job_id for job_id, job_data in prompt_server.distributed_pending_tile_jobs.items()
-                     if not isinstance(job_data, dict) or 'mode' not in job_data]
-        for job_id in to_remove:
-            debug_log(f"Removing legacy queue structure for job {job_id}")
+        invalid_job_ids = [
+            job_id
+            for job_id, job_data in prompt_server.distributed_pending_tile_jobs.items()
+            if not isinstance(job_data, BaseJobState)
+        ]
+        for job_id in invalid_job_ids:
+            debug_log(f"Removing invalid job state for {job_id}")
             del prompt_server.distributed_pending_tile_jobs[job_id]
     return prompt_server
 
@@ -631,27 +578,23 @@ async def request_image_endpoint(request):
         async with prompt_server.distributed_tile_jobs_lock:
             if multi_job_id in prompt_server.distributed_pending_tile_jobs:
                 job_data = prompt_server.distributed_pending_tile_jobs[multi_job_id]
-                if not isinstance(job_data, dict) or 'mode' not in job_data:
+                if not isinstance(job_data, BaseJobState):
                     return await handle_api_error(request, "Invalid job data structure", 500)
-                
-                mode = job_data['mode']
-                
-                # Handle both dynamic and static modes
-                if mode == 'dynamic' and 'pending_images' in job_data:
-                    pending_queue = job_data['pending_images']
-                elif mode == 'static' and JOB_PENDING_TASKS in job_data:
-                    pending_queue = job_data[JOB_PENDING_TASKS]
+
+                mode = job_data.mode
+                if isinstance(job_data, ImageJobState):
+                    pending_queue = job_data.pending_images
+                elif isinstance(job_data, TileJobState):
+                    pending_queue = job_data.pending_tasks
                 else:
                     return await handle_api_error(request, "Invalid job configuration", 400)
                 
                 try:
                     task_idx = await asyncio.wait_for(pending_queue.get(), timeout=0.1)
                     # Track assigned task
-                    if 'assigned_to_workers' in job_data and worker_id in job_data['assigned_to_workers']:
-                        job_data['assigned_to_workers'][worker_id].append(task_idx)
+                    job_data.assigned_to_workers.setdefault(worker_id, []).append(task_idx)
                     # Update worker heartbeat
-                    if 'worker_status' in job_data:
-                        job_data['worker_status'][worker_id] = time.time()
+                    job_data.worker_status[worker_id] = time.time()
                     # Get estimated remaining count
                     remaining = pending_queue.qsize()  # Approximate
                     
@@ -661,7 +604,7 @@ async def request_image_endpoint(request):
                         return web.json_response({"image_idx": task_idx, "estimated_remaining": remaining})
                     else:  # static
                         debug_log(f"UltimateSDUpscale API - Assigned tile {task_idx} to worker {worker_id}")
-                        return web.json_response({"tile_idx": task_idx, "estimated_remaining": remaining, "batched_static": job_data.get('batched_static', False)})
+                        return web.json_response({"tile_idx": task_idx, "estimated_remaining": remaining, "batched_static": job_data.batched_static})
                 except asyncio.TimeoutError:
                     if mode == 'dynamic':
                         return web.json_response({"image_idx": None})
@@ -681,7 +624,5 @@ async def job_status_endpoint(request):
     prompt_server = ensure_tile_jobs_initialized()
     async with prompt_server.distributed_tile_jobs_lock:
         job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
-        ready = bool(job_data and isinstance(job_data, dict) and 'queue' in job_data)
+        ready = bool(isinstance(job_data, BaseJobState) and job_data.queue is not None)
         return web.json_response({"ready": ready})
-
-
