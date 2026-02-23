@@ -1,39 +1,3 @@
-import os
-import sys
-
-# Add the directory to Python path
-sys.path.append(os.path.dirname(__file__))
-
-# Patch ComfyUI execution validation for DistributedVideoCollector
-try:
-    import execution
-    from .distributed import ImageBatchDivider
-    
-    # Store original validate function if it exists
-    if hasattr(execution, 'validate_outputs'):
-        original_validate_outputs = execution.validate_outputs
-        
-        def patched_validate_outputs(executor, node_id, result, node_class):
-            if node_class == ImageBatchDivider:
-                return  # Skip validation for our dynamic output node
-            return original_validate_outputs(executor, node_id, result, node_class)
-        
-        execution.validate_outputs = patched_validate_outputs
-    else:
-        # Fallback: patch the main execute method if validate_outputs doesn't exist
-        if hasattr(execution.PromptExecutor, 'execute'):
-            original_execute = execution.PromptExecutor.execute
-            
-            def patched_execute(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
-                # This is a more complex patch - for now just call original
-                # The ByPassTypeTuple should handle most validation issues
-                return original_execute(self, prompt, prompt_id, extra_data, execute_outputs)
-            
-            execution.PromptExecutor.execute = patched_execute
-            
-except ImportError:
-    pass  # ComfyUI execution module not available during import
-
 # Import everything needed from the main module
 from .distributed import (
     NODE_CLASS_MAPPINGS as DISTRIBUTED_CLASS_MAPPINGS, 

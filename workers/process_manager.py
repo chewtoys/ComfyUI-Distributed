@@ -220,7 +220,7 @@ class WorkerProcessManager:
             # Wrap command with monitor if needed
             if stop_on_master_exit and env.get('COMFYUI_MASTER_PID'):
                 # Use the monitor wrapper
-                monitor_script = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'worker_monitor.py')
+                monitor_script = os.path.join(os.path.dirname(__file__), 'worker_monitor.py')
                 monitored_cmd = [get_python_executable(), monitor_script] + cmd
                 log_handle.write(f"[Worker Monitor] Monitoring master PID: {env['COMFYUI_MASTER_PID']}\n")
                 log_handle.flush()

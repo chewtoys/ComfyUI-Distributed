@@ -10,12 +10,14 @@ import subprocess
 import platform
 import signal
 
-# Add parent directory to path to import utils
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Add package root to path so this script works when launched by file path.
+NODE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if NODE_ROOT not in sys.path:
+    sys.path.insert(0, NODE_ROOT)
 
 try:
-    from ComfyUI_Distributed.utils.process import is_process_alive, terminate_process
-    from ComfyUI_Distributed.utils.constants import WORKER_CHECK_INTERVAL, PROCESS_TERMINATION_TIMEOUT
+    from utils.process import is_process_alive, terminate_process
+    from utils.constants import WORKER_CHECK_INTERVAL, PROCESS_TERMINATION_TIMEOUT
 except ImportError:
     # Fallback if running from different context
     def is_process_alive(pid):
