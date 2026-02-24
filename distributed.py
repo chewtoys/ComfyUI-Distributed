@@ -2,7 +2,6 @@
 ComfyUI-Distributed: thin entry point.
 All implementation lives in workers/, nodes/, api/.
 """
-import asyncio
 import atexit
 import os
 
@@ -28,6 +27,7 @@ from .nodes import (
     any_type,
 )
 from . import api  # noqa: F401 - triggers all @routes.* registrations
+from .api.queue_orchestration import ensure_distributed_state
 
 ensure_config_exists()
 
@@ -40,9 +40,7 @@ atexit.register(lambda: None)  # placeholder; real cleanup in sync_cleanup
 
 # Initialize distributed job state on prompt_server
 prompt_server = server.PromptServer.instance
-if not hasattr(prompt_server, 'distributed_pending_jobs'):
-    prompt_server.distributed_pending_jobs = {}
-    prompt_server.distributed_jobs_lock = asyncio.Lock()
+ensure_distributed_state(prompt_server)
 
 if not hasattr(prompt_server, 'distributed_pending_tile_jobs'):
     prompt_server.distributed_pending_tile_jobs = {}

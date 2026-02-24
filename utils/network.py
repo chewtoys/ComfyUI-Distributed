@@ -34,8 +34,14 @@ async def cleanup_client_session():
 
 async def handle_api_error(request, error, status=500):
     """Standardized error response handler."""
-    debug_log(f"API Error: {error}")
-    return web.json_response({"status": "error", "message": str(error)}, status=status)
+    if isinstance(error, list):
+        messages = [str(item) for item in error]
+        debug_log(f"API Error [{status}]: {messages}")
+        return web.json_response({"errors": messages}, status=status)
+
+    message = str(error)
+    debug_log(f"API Error [{status}]: {message}")
+    return web.json_response({"error": message}, status=status)
 
 def get_server_port():
     """Get the ComfyUI server port."""

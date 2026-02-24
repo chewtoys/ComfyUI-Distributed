@@ -17,7 +17,6 @@ from ..utils.constants import HEARTBEAT_INTERVAL
 from ..utils.image import tensor_to_pil, pil_to_tensor, ensure_contiguous
 from ..utils.network import build_worker_url, get_client_session, probe_worker
 from ..utils.async_helpers import run_async_in_server_loop
-from ..workers.detection import is_local_worker, get_comms_channel
 
 prompt_server = _server.PromptServer.instance
 

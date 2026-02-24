@@ -92,3 +92,34 @@ export function findNodesByClass(apiPrompt, className) {
         .filter(([, nodeData]) => nodeData.class_type === className)
         .map(([nodeId, nodeData]) => ({ id: nodeId, data: nodeData }));
 }
+
+
+export function applyProbeResultToWorkerDot(workerId, probeResult) {
+    const dot = document.getElementById(`status-${workerId}`);
+    if (!dot) {
+        return;
+    }
+
+    dot.classList.remove(
+        'worker-status--online',
+        'worker-status--offline',
+        'worker-status--processing',
+        'worker-status--unknown',
+        'status-pulsing',
+    );
+
+    if (!probeResult || !probeResult.ok) {
+        dot.classList.add('worker-status--offline');
+        dot.title = 'Offline - Cannot connect';
+        return;
+    }
+
+    if ((probeResult.queueRemaining || 0) > 0) {
+        dot.classList.add('worker-status--processing');
+        dot.title = `Processing (${probeResult.queueRemaining} queued)`;
+        return;
+    }
+
+    dot.classList.add('worker-status--online');
+    dot.title = 'Online - Idle';
+}

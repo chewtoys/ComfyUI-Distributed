@@ -5,17 +5,32 @@ from ...utils.logging import debug_log, log
 from ...utils.image import tensor_to_pil, pil_to_tensor
 from ...utils.async_helpers import run_async_in_server_loop
 from ...utils.config import get_worker_timeout_seconds
-from ...utils.constants import HEARTBEAT_INTERVAL, MAX_BATCH, TILE_SEND_TIMEOUT, TILE_WAIT_TIMEOUT
-from ...utils.usdu_managment import (
+from ...utils.constants import (
+    HEARTBEAT_INTERVAL,
+    JOB_POLL_INTERVAL,
+    JOB_POLL_MAX_ATTEMPTS,
+    MAX_BATCH,
+    TILE_SEND_TIMEOUT,
+    TILE_WAIT_TIMEOUT,
+)
+from ..job_store import (
     ensure_tile_jobs_initialized, init_static_job_batched,
-    _mark_task_completed, _cleanup_job, _drain_results_queue,
-    _send_heartbeat_to_master, _get_completed_count,
+    _mark_task_completed, _cleanup_job, _drain_results_queue, _get_completed_count,
 )
 from ..job_models import TileJobState
 
 
 class StaticModeMixin:
-    def _poll_job_ready(self, multi_job_id, master_url, worker_id=None, max_attempts=20):
+    """
+    Static (tile-queue) USDU mode behaviors for master and worker roles.
+
+    Expected co-mixins on `self`:
+    - TileOpsMixin (`calculate_tiles`, tile extract/blend helpers).
+    - JobStateMixin (`_get_next_tile_index`, `_get_all_completed_tasks`, requeue checks).
+    - WorkerCommsMixin (`send_tiles_batch_to_master`, `_request_tile_from_master`, `_send_heartbeat_to_master`).
+    """
+
+    def _poll_job_ready(self, multi_job_id, master_url, worker_id=None, max_attempts=JOB_POLL_MAX_ATTEMPTS):
         """Poll master for job readiness to avoid worker/master initialization race."""
         for attempt in range(max_attempts):
             ready = run_async_in_server_loop(
@@ -28,7 +43,7 @@ class StaticModeMixin:
                 else:
                     debug_log(f"Job {multi_job_id} ready after {attempt} attempts")
                 return True
-            time.sleep(1.0)
+            time.sleep(JOB_POLL_INTERVAL)
         return False
 
     def _extract_and_process_tile(
@@ -194,7 +209,7 @@ class StaticModeMixin:
         log(f"USDU Dist Worker[{worker_id[:8]}]: Canvas {width}x{height} | Tile {tile_width}x{tile_height} | Tiles/image {num_tiles_per_image} | Batch {batch_size}")
         processed_count = 0
 
-        max_poll_attempts = 20
+        max_poll_attempts = JOB_POLL_MAX_ATTEMPTS
         if not self._poll_job_ready(multi_job_id, master_url, worker_id=worker_id, max_attempts=max_poll_attempts):
             log(f"Job {multi_job_id} not ready after {max_poll_attempts} attempts, aborting")
             return (upscaled_image,)
@@ -254,7 +269,7 @@ class StaticModeMixin:
             # Send heartbeat
             try:
                 run_async_in_server_loop(
-                    _send_heartbeat_to_master(multi_job_id, master_url, worker_id),
+                    self._send_heartbeat_to_master(multi_job_id, master_url, worker_id),
                     timeout=5.0
                 )
             except Exception as e:

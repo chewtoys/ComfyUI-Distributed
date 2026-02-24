@@ -6,18 +6,8 @@ import aiohttp
 
 from ...utils.logging import debug_log, log
 from ...utils.network import build_worker_url, get_client_session, probe_worker
-
-
-def _trace_prefix(trace_execution_id):
-    return f"[Distributed][exec:{trace_execution_id}]"
-
-
-def _trace_debug(trace_execution_id, message):
-    debug_log(f"{_trace_prefix(trace_execution_id)} {message}")
-
-
-def _trace_info(trace_execution_id, message):
-    log(f"{_trace_prefix(trace_execution_id)} {message}")
+from ...utils.trace_logger import trace_debug, trace_info
+from ..schemas import parse_positive_int
 
 
 async def worker_is_active(worker):
@@ -43,14 +33,6 @@ async def worker_ws_is_active(worker):
     except Exception as e:
         debug_log(f"[Distributed] Worker WS probe unexpected error: {e}")
         return False
-
-
-def _coerce_positive_int(value, default):
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return max(1, int(default))
-    return max(1, parsed)
 
 
 async def _probe_worker_active(worker, use_websocket, semaphore):
@@ -120,7 +102,7 @@ async def dispatch_worker_prompt(
         except Exception as exc:
             worker_id = worker.get("id")
             if trace_execution_id:
-                _trace_info(trace_execution_id, f"Websocket dispatch failed for worker {worker_id}: {exc}")
+                trace_info(trace_execution_id, f"Websocket dispatch failed for worker {worker_id}: {exc}")
             else:
                 log(f"[Distributed] Websocket dispatch failed for worker {worker_id}: {exc}")
             raise
@@ -142,11 +124,11 @@ async def select_active_workers(
     probe_concurrency=8,
 ):
     """Probe workers and return (active_workers, updated_delegate_master)."""
-    probe_limit = _coerce_positive_int(probe_concurrency, 8)
+    probe_limit = parse_positive_int(probe_concurrency, 8)
     probe_semaphore = asyncio.Semaphore(probe_limit)
 
     if trace_execution_id and workers:
-        _trace_debug(
+        trace_debug(
             trace_execution_id,
             f"Probing {len(workers)} workers with probe_concurrency={probe_limit}",
         )
@@ -164,19 +146,19 @@ async def select_active_workers(
             active_workers.append(worker)
         else:
             if trace_execution_id:
-                _trace_info(trace_execution_id, f"Worker {worker['name']} ({worker['id']}) is offline, skipping.")
+                trace_info(trace_execution_id, f"Worker {worker['name']} ({worker['id']}) is offline, skipping.")
             else:
                 log(f"[Distributed] Worker {worker['name']} ({worker['id']}) is offline, skipping.")
 
     if trace_execution_id and workers:
-        _trace_debug(
+        trace_debug(
             trace_execution_id,
             f"Worker probe complete: active={len(active_workers)}/{len(workers)}",
         )
 
     if not active_workers and delegate_master:
         if trace_execution_id:
-            _trace_debug(trace_execution_id, "All workers offline while delegate-only requested; enabling master participation.")
+            trace_debug(trace_execution_id, "All workers offline while delegate-only requested; enabling master participation.")
         else:
             debug_log("All workers offline while delegate-only requested; enabling master participation.")
         delegate_master = False

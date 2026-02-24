@@ -1,16 +1,11 @@
-import asyncio
 import os
-import socket
-import json
 import platform
 import uuid
-from multiprocessing import Queue
 
 import aiohttp
 
 from ..utils.network import normalize_host, get_client_session
-from ..utils.logging import debug_log, log
-from ..utils.config import load_config
+from ..utils.logging import debug_log
 
 
 async def is_local_worker(worker_config):
@@ -76,30 +71,3 @@ def is_runpod_environment():
     """Check if running in Runpod environment."""
     return (os.environ.get('RUNPOD_POD_ID') is not None or
             os.environ.get('RUNPOD_API_KEY') is not None)
-
-async def get_comms_channel(worker_id, worker_config):
-    """Get communication channel for a worker (HTTP URL or IPC Queue)."""
-    if await is_local_worker(worker_config):
-        comm_mode = worker_config.get('communicationMode', 'http')
-        
-        if comm_mode == 'ipc':
-            # Use multiprocessing Queue for IPC
-            from . import get_worker_manager
-            wm = get_worker_manager()
-            if worker_id not in wm.queues:
-                wm.queues[worker_id] = Queue()
-            return wm.queues[worker_id]
-        elif is_docker_environment():
-            # Docker: use host.docker.internal
-            return f"http://host.docker.internal:{worker_config['port']}"
-        else:
-            # Local: use loopback
-            return f"http://127.0.0.1:{worker_config['port']}"
-    elif worker_config.get('type') == 'cloud' and is_runpod_environment():
-        # Runpod same-host optimization (if detected)
-        host = normalize_host(worker_config.get('host', 'localhost')) or 'localhost'
-        return f"http://{host}:{worker_config['port']}"
-    else:
-        # Remote worker: use configured endpoint
-        host = normalize_host(worker_config.get('host', 'localhost')) or 'localhost'
-        return f"http://{host}:{worker_config['port']}"

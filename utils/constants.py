@@ -13,6 +13,10 @@ PROCESS_TERMINATION_TIMEOUT = 5.0
 WORKER_CHECK_INTERVAL = 2.0
 STATUS_CHECK_INTERVAL = 5.0
 
+# Cloudflare tunnel
+TUNNEL_START_TIMEOUT = float(os.environ.get("TUNNEL_START_TIMEOUT", "25"))
+CLOUDFLARE_LOG_BUFFER_SIZE = 200
+
 # Network
 CHUNK_SIZE = 8192
 LOG_TAIL_BYTES = 65536  # 64KB
@@ -41,6 +45,13 @@ MAX_BATCH = int(os.environ.get('COMFYUI_MAX_BATCH', '20'))  # Maximum items per 
 # Heartbeat monitoring
 HEARTBEAT_INTERVAL = float(os.environ.get('COMFYUI_HEARTBEAT_INTERVAL', '10'))  # Heartbeat/check interval in seconds
 HEARTBEAT_TIMEOUT = int(os.environ.get('COMFYUI_HEARTBEAT_TIMEOUT', '60'))  # Worker heartbeat timeout in seconds (default 60s)
+
+# USDU result collection
+DYNAMIC_MODE_MAX_POLL_TIMEOUT = 10.0
+
+# Static mode job poll loop
+JOB_POLL_INTERVAL = 1.0
+JOB_POLL_MAX_ATTEMPTS = 20
 
 # Orchestration pipeline
 ORCHESTRATION_WORKER_PROBE_CONCURRENCY = int(

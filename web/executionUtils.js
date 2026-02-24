@@ -1,5 +1,5 @@
 import { api } from "../../scripts/api.js";
-import { findNodesByClass } from './workerUtils.js';
+import { applyProbeResultToWorkerDot, findNodesByClass } from './workerUtils.js';
 import { TIMEOUTS, NODE_CLASSES, generateUUID } from './constants.js';
 import { markSkipDispatch, selectLeastBusyWorker } from './executionDecisionUtils.js';
 import { checkAllWorkerStatuses, getWorkerUrl } from './workerLifecycle.js';
@@ -232,13 +232,7 @@ export async function performPreflightCheck(extension, workers) {
     
     // Update UI status indicators for inactive workers
     results.filter(r => !r.active).forEach(r => {
-        const statusDot = document.getElementById(`status-${r.worker.id}`);
-        if (statusDot) {
-            // Remove pulsing animation once status is determined
-            statusDot.classList.remove('status-pulsing', 'worker-status--online', 'worker-status--unknown');
-            statusDot.classList.add('worker-status--offline');
-            statusDot.title = "Offline - Cannot connect";
-        }
+        applyProbeResultToWorkerDot(r.worker.id, { ok: false });
     });
     
     return activeWorkers;

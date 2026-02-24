@@ -5,7 +5,7 @@ import comfy.samplers, comfy.model_management
 from ..utils.logging import debug_log, log
 from ..utils.image import tensor_to_pil, pil_to_tensor
 from ..utils.usdu_utils import crop_cond, get_crop_region, expand_crop
-from ..utils.usdu_managment import clone_conditioning
+from .conditioning import clone_conditioning
 
 
 class TileOpsMixin:

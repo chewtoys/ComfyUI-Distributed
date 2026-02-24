@@ -4,29 +4,75 @@ import { normalizeWorkerUrl } from './urlUtils.js';
 export function createApiClient(baseUrl) {
     const normalizedBaseUrl = normalizeWorkerUrl(baseUrl);
 
-    const request = async (endpoint, options = {}, retries = TIMEOUTS.MAX_RETRIES) => {
+    const request = async (
+        endpoint,
+        options = {},
+        { retries = TIMEOUTS.MAX_RETRIES, retry = true } = {},
+    ) => {
+        const maxAttempts = retry ? retries : 1;
         let lastError;
         let delay = TIMEOUTS.RETRY_DELAY; // Initial delay for exponential backoff
 
-        for (let attempt = 0; attempt < retries; attempt++) {
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
             try {
+                const headers = {
+                    'Content-Type': 'application/json',
+                    ...(options.headers || {}),
+                };
                 const response = await fetch(`${normalizedBaseUrl}${endpoint}`, {
-                    headers: { 'Content-Type': 'application/json' },
-                    ...options
+                    ...options,
+                    headers,
                 });
                 
                 if (!response.ok) {
-                    const error = await response.json().catch(() => ({ message: 'Request failed' }));
-                    throw new Error(error.message || `HTTP ${response.status}`);
+                    const error = await response.json().catch(() => ({}));
+                    const message = error.message
+                        || error.error
+                        || (Array.isArray(error.errors) ? error.errors.join('; ') : null)
+                        || `HTTP ${response.status}`;
+                    throw new Error(message);
                 }
                 
                 return await response.json();
             } catch (error) {
                 lastError = error;
-                console.log(`API Error (attempt ${attempt + 1}/${retries}): ${endpoint} - ${error.message}`);
-                if (attempt < retries - 1) {
+                console.log(`API Error (attempt ${attempt + 1}/${maxAttempts}): ${endpoint} - ${error.message}`);
+                if (attempt < maxAttempts - 1) {
                     await new Promise(resolve => setTimeout(resolve, delay));
                     delay *= 2; // Exponential backoff
+                }
+            }
+        }
+        throw lastError;
+    };
+
+    const requestUrl = async (
+        url,
+        options = {},
+        { retries = TIMEOUTS.MAX_RETRIES, retry = true } = {},
+    ) => {
+        const maxAttempts = retry ? retries : 1;
+        let lastError;
+        let delay = TIMEOUTS.RETRY_DELAY;
+
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            try {
+                const response = await fetch(url, options);
+                if (!response.ok) {
+                    const error = await response.json().catch(() => ({}));
+                    const message = error.message
+                        || error.error
+                        || (Array.isArray(error.errors) ? error.errors.join('; ') : null)
+                        || `HTTP ${response.status}`;
+                    throw new Error(message);
+                }
+                return await response.json();
+            } catch (error) {
+                lastError = error;
+                console.log(`API Error (attempt ${attempt + 1}/${maxAttempts}): ${url} - ${error.message}`);
+                if (attempt < maxAttempts - 1) {
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    delay *= 2;
                 }
             }
         }
@@ -43,28 +89,28 @@ export function createApiClient(baseUrl) {
             return request('/distributed/config/update_worker', {
                 method: 'POST',
                 body: JSON.stringify({ worker_id: workerId, ...data })
-            });
+            }, { retry: false });
         },
         
         async deleteWorker(workerId) {
             return request('/distributed/config/delete_worker', {
                 method: 'POST',
                 body: JSON.stringify({ worker_id: workerId })
-            });
+            }, { retry: false });
         },
         
         async updateSetting(key, value) {
             return request('/distributed/config/update_setting', {
                 method: 'POST',
                 body: JSON.stringify({ key, value })
-            });
+            }, { retry: false });
         },
         
         async updateMaster(data) {
             return request('/distributed/config/update_master', {
                 method: 'POST',
                 body: JSON.stringify(data)
-            });
+            }, { retry: false });
         },
         
         // Worker management endpoints
@@ -72,14 +118,14 @@ export function createApiClient(baseUrl) {
             return request('/distributed/launch_worker', {
                 method: 'POST',
                 body: JSON.stringify({ worker_id: workerId })
-            });
+            }, { retry: false });
         },
         
         async stopWorker(workerId) {
             return request('/distributed/stop_worker', {
                 method: 'POST',
                 body: JSON.stringify({ worker_id: workerId })
-            });
+            }, { retry: false });
         },
         
         async getManagedWorkers() {
@@ -94,51 +140,59 @@ export function createApiClient(baseUrl) {
             return request('/distributed/worker/clear_launching', {
                 method: 'POST',
                 body: JSON.stringify({ worker_id: workerId })
-            });
+            }, { retry: false });
         },
         
         async queueDistributed(payload) {
             return request('/distributed/queue', {
                 method: 'POST',
+                headers: {
+                    ...(payload?.trace_execution_id
+                        ? { 'X-Idempotency-Key': payload.trace_execution_id }
+                        : {}),
+                },
                 body: JSON.stringify(payload)
-            });
+            }, { retry: false });
         },
 
-        async probeWorker(workerUrl, timeoutMs = TIMEOUTS.STATUS_CHECK) {
+        async probeWorker(workerUrl, timeoutMs = TIMEOUTS.STATUS_CHECK, signal = null) {
             const normalizedWorkerUrl = normalizeWorkerUrl(workerUrl);
-            const response = await fetch(`${normalizedWorkerUrl}/prompt`, {
-                method: 'GET',
-                mode: 'cors',
-                cache: 'no-store',
-                signal: AbortSignal.timeout(timeoutMs)
-            });
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+            const effectiveSignal = signal
+                ? AbortSignal.any([controller.signal, signal])
+                : controller.signal;
+            try {
+                const response = await fetch(`${normalizedWorkerUrl}/prompt`, {
+                    method: 'GET',
+                    mode: 'cors',
+                    cache: 'no-store',
+                    signal: effectiveSignal,
+                });
 
-            if (!response.ok) {
-                return { ok: false, status: response.status, queueRemaining: null };
+                if (!response.ok) {
+                    return { ok: false, status: response.status, queueRemaining: null };
+                }
+
+                const data = await response.json().catch(() => ({}));
+                return {
+                    ok: true,
+                    status: response.status,
+                    queueRemaining: data.exec_info?.queue_remaining || 0,
+                };
+            } finally {
+                clearTimeout(timeoutId);
             }
-
-            const data = await response.json().catch(() => ({}));
-            return {
-                ok: true,
-                status: response.status,
-                queueRemaining: data.exec_info?.queue_remaining || 0,
-            };
         },
 
         async dispatchToWorker(workerUrl, promptPayload) {
             const normalizedWorkerUrl = normalizeWorkerUrl(workerUrl);
-            const response = await fetch(`${normalizedWorkerUrl}/prompt`, {
+            return requestUrl(`${normalizedWorkerUrl}/prompt`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 mode: 'cors',
                 body: JSON.stringify(promptPayload),
-            });
-
-            if (!response.ok) {
-                throw new Error(`Worker returned ${response.status}`);
-            }
-
-            return response.json();
+            }, { retry: false });
         },
         
         // Network info
@@ -179,14 +233,14 @@ export function createApiClient(baseUrl) {
             return request('/distributed/tunnel/start', {
                 method: 'POST',
                 body: JSON.stringify({})
-            });
+            }, { retry: false });
         },
 
         async stopTunnel() {
             return request('/distributed/tunnel/stop', {
                 method: 'POST',
                 body: JSON.stringify({})
-            });
+            }, { retry: false });
         },
 
         async getTunnelStatus() {

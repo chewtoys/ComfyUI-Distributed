@@ -34,3 +34,21 @@ def validate_positive_int(value, field_name: str) -> str | None:
     if parsed <= 0:
         return f"Field '{field_name}' must be a positive integer."
     return None
+
+
+def parse_positive_int(value, default: int) -> int:
+    """Parse value as positive int, returning default on failure."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return max(1, int(default))
+    return max(1, parsed)
+
+
+def parse_positive_float(value, default: float) -> float:
+    """Parse value as positive float, returning default on failure."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return max(0.0, float(default))
+    return max(0.0, parsed)

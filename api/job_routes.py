@@ -8,7 +8,6 @@ import time
 
 from aiohttp import web
 import server
-import server as _server
 import torch
 from PIL import Image
 
@@ -17,10 +16,10 @@ from ..utils.image import pil_to_tensor, ensure_contiguous
 from ..utils.network import handle_api_error
 from ..utils.constants import JOB_INIT_GRACE_PERIOD, MEMORY_CLEAR_DELAY
 from ..utils.async_helpers import queue_prompt_payload
-from .queue_orchestration import orchestrate_distributed_execution
+from .queue_orchestration import ensure_distributed_state, orchestrate_distributed_execution
 from .queue_request import parse_queue_request_payload
 
-prompt_server = _server.PromptServer.instance
+prompt_server = server.PromptServer.instance
 
 # Canonical worker result envelope accepted by POST /distributed/job_complete:
 # { "job_id": str, "worker_id": str, "batch_idx": int, "image": <base64 PNG>, "is_last": bool }
@@ -136,6 +135,7 @@ async def prepare_job_endpoint(request):
         if not multi_job_id:
             return await handle_api_error(request, "Missing multi_job_id", 400)
 
+        ensure_distributed_state()
         async with prompt_server.distributed_jobs_lock:
             if multi_job_id not in prompt_server.distributed_pending_jobs:
                 prompt_server.distributed_pending_jobs[multi_job_id] = asyncio.Queue()
@@ -285,7 +285,7 @@ async def job_complete_endpoint(request):
         if not isinstance(is_last, bool):
             errors.append("is_last: expected boolean")
         if errors:
-            return web.json_response({"error": errors}, status=400)
+            return await handle_api_error(request, errors, 400)
 
         tensor = _decode_canonical_png_tensor(image_payload)
         multi_job_id = job_id.strip()

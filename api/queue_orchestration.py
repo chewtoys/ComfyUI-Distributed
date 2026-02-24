@@ -14,6 +14,8 @@ from ..utils.constants import (
 )
 from ..utils.logging import debug_log, log
 from ..utils.network import build_master_url
+from ..utils.trace_logger import trace_debug
+from .schemas import parse_positive_float, parse_positive_int
 from .orchestration.dispatch import dispatch_worker_prompt, select_active_workers
 from .orchestration.media_sync import convert_paths_for_platform, fetch_worker_path_separator, sync_worker_media
 from .orchestration.prompt_transform import (
@@ -33,20 +35,17 @@ def _generate_execution_trace_id():
     return f"exec_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
 
 
-def _trace_prefix(trace_execution_id):
-    return f"[Distributed][exec:{trace_execution_id}]"
-
-
-def _trace_debug(trace_execution_id, message):
-    debug_log(f"{_trace_prefix(trace_execution_id)} {message}")
-
-
-def ensure_distributed_state():
+def ensure_distributed_state(server_instance=None):
     """Ensure prompt_server has the state used by distributed queue orchestration."""
-    if not hasattr(prompt_server, "distributed_pending_jobs"):
-        prompt_server.distributed_pending_jobs = {}
-    if not hasattr(prompt_server, "distributed_jobs_lock"):
-        prompt_server.distributed_jobs_lock = asyncio.Lock()
+    ps = server_instance or prompt_server
+    if not hasattr(ps, "distributed_pending_jobs"):
+        ps.distributed_pending_jobs = {}
+    if not hasattr(ps, "distributed_jobs_lock"):
+        ps.distributed_jobs_lock = asyncio.Lock()
+
+
+# Initialize top-level distributed queue state at module import time.
+ensure_distributed_state()
 
 
 async def _ensure_distributed_queue(job_id):
@@ -90,40 +89,22 @@ def _resolve_enabled_workers(config, requested_ids=None):
     return workers
 
 
-def _parse_positive_int(value, default):
-    """Parse positive integer setting values with fallback."""
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return max(1, parsed)
-
-
-def _parse_positive_float(value, default):
-    """Parse positive float setting values with fallback."""
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return default
-    return max(1.0, parsed)
-
-
 def _resolve_orchestration_limits(config):
     """Resolve bounded concurrency/timeouts for worker preparation pipeline."""
     settings = (config or {}).get("settings", {}) or {}
-    worker_probe_concurrency = _parse_positive_int(
+    worker_probe_concurrency = parse_positive_int(
         settings.get("worker_probe_concurrency"),
         ORCHESTRATION_WORKER_PROBE_CONCURRENCY,
     )
-    worker_prep_concurrency = _parse_positive_int(
+    worker_prep_concurrency = parse_positive_int(
         settings.get("worker_prep_concurrency"),
         ORCHESTRATION_WORKER_PREP_CONCURRENCY,
     )
-    media_sync_concurrency = _parse_positive_int(
+    media_sync_concurrency = parse_positive_int(
         settings.get("media_sync_concurrency"),
         ORCHESTRATION_MEDIA_SYNC_CONCURRENCY,
     )
-    media_sync_timeout_seconds = _parse_positive_float(
+    media_sync_timeout_seconds = parse_positive_float(
         settings.get("media_sync_timeout_seconds"),
         ORCHESTRATION_MEDIA_SYNC_TIMEOUT,
     )
@@ -176,7 +157,7 @@ async def _prepare_worker_payload(
                         timeout=media_sync_timeout_seconds,
                     )
                 except asyncio.TimeoutError:
-                    _trace_debug(
+                    trace_debug(
                         trace_execution_id,
                         (
                             f"Media sync timed out after {media_sync_timeout_seconds:.1f}s "
@@ -214,7 +195,7 @@ async def orchestrate_distributed_execution(
     requested_ids = enabled_worker_ids if enabled_worker_ids is not None else None
     workers = _resolve_enabled_workers(config, requested_ids)
     prompt_index = PromptIndex(prompt_obj)
-    _trace_debug(
+    trace_debug(
         execution_trace_id,
         (
             f"Orchestration start: requested_workers={len(workers)}, "
@@ -232,7 +213,7 @@ async def orchestrate_distributed_execution(
         delegate_master = bool(config.get("settings", {}).get("master_delegate_only", False))
 
     if not workers and delegate_master:
-        _trace_debug(
+        trace_debug(
             execution_trace_id,
             "Delegate-only requested but no workers are enabled. Falling back to master execution.",
         )
@@ -252,7 +233,7 @@ async def orchestrate_distributed_execution(
     job_id_map = generate_job_id_map(prompt_index, discovery_prefix)
 
     if not job_id_map:
-        _trace_debug(execution_trace_id, "No distributed nodes detected; queueing prompt on master only.")
+        trace_debug(execution_trace_id, "No distributed nodes detected; queueing prompt on master only.")
         prompt_id = await queue_prompt_payload(prompt_obj, workflow_meta, client_id)
         return prompt_id, 0
 
@@ -286,7 +267,7 @@ async def orchestrate_distributed_execution(
             master_prompt = prepare_delegate_master_prompt(master_prompt, collector_ids)
 
     if active_workers:
-        _trace_debug(
+        trace_debug(
             execution_trace_id,
             "Active distributed workers: "
             + ", ".join(f"{worker['name']} ({worker['id']})" for worker in active_workers),
@@ -329,7 +310,7 @@ async def orchestrate_distributed_execution(
         )
 
     prompt_id = await queue_prompt_payload(master_prompt, workflow_meta, client_id)
-    _trace_debug(
+    trace_debug(
         execution_trace_id,
         f"Orchestration complete: prompt_id={prompt_id}, dispatched_workers={len(worker_payloads)}, delegate_master={delegate_master}",
     )

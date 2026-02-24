@@ -9,6 +9,10 @@ from ..utils.image import tensor_to_pil
 
 
 class WorkerCommsMixin:
+    async def _send_heartbeat_to_master(self, multi_job_id, master_url, worker_id):
+        """Proxy heartbeat helper used by worker processing mixins."""
+        await _send_heartbeat_to_master(multi_job_id, master_url, worker_id)
+
     async def send_tiles_batch_to_master(self, processed_tiles, multi_job_id, master_url, 
                                        padding, worker_id, is_final_flush=False):
         """Send all processed tiles to master, chunked if large."""

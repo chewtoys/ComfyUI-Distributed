@@ -1,10 +1,8 @@
 import asyncio
 
 from ..utils.logging import debug_log
-from ..utils.usdu_managment import (
-    _check_and_requeue_timed_out_workers as _requeue_usdu,
-    ensure_tile_jobs_initialized,
-)
+from .job_store import ensure_tile_jobs_initialized
+from .job_timeout import _check_and_requeue_timed_out_workers as _requeue_usdu
 from .job_models import ImageJobState, TileJobState
 
 

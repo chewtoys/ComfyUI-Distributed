@@ -1,17 +1,38 @@
 import asyncio, time
 import comfy.model_management
 import server
-from ..utils.constants import HEARTBEAT_INTERVAL
+from ..utils.constants import DYNAMIC_MODE_MAX_POLL_TIMEOUT, HEARTBEAT_INTERVAL
 from ..utils.logging import debug_log, log
 from ..utils.config import get_worker_timeout_seconds
-from ..utils.usdu_managment import (
-    ensure_tile_jobs_initialized, _mark_task_completed,
-    _check_and_requeue_timed_out_workers,
-)
+from .job_store import ensure_tile_jobs_initialized, _mark_task_completed
+from .job_timeout import _check_and_requeue_timed_out_workers
 from .job_models import BaseJobState, ImageJobState, TileJobState
 
 
 class ResultCollectorMixin:
+    """
+    Mixin for master-side result collection in USDU distributed jobs.
+
+    Expected co-mixins/attributes:
+    - JobStateMixin methods for queue/task access.
+    - `self._check_and_requeue_timed_out_workers(...)` coroutine.
+    - `self._async_yield(...)` optional helper from WorkerCommsMixin.
+    """
+
+    def _log_worker_timeout_status(self, job_data, current_time: float, multi_job_id: str) -> list[str]:
+        """Log timeout elapsed seconds for each tracked worker and return worker ids."""
+        if not isinstance(job_data, BaseJobState):
+            return []
+
+        worker_status = dict(job_data.worker_status)
+        for worker_id, last_seen in worker_status.items():
+            elapsed = max(0.0, current_time - float(last_seen))
+            log(
+                "UltimateSDUpscale Master - Heartbeat timeout: "
+                f"job={multi_job_id}, worker={worker_id}, elapsed={elapsed:.1f}s"
+            )
+        return list(worker_status.keys())
+
     async def _async_collect_results(self, multi_job_id, num_workers, mode='static', 
                                    remaining_to_collect=None, batch_size=None):
         """Unified async helper to collect results from workers (tiles or images)."""
@@ -59,10 +80,16 @@ class ResultCollectorMixin:
             # For dynamic mode with remaining_to_collect, check if we've collected enough
             if mode == 'dynamic' and remaining_to_collect and collected_count >= remaining_to_collect:
                 break
-                
+
+            job_data_snapshot = None
+            async with prompt_server.distributed_tile_jobs_lock:
+                current_job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
+                if isinstance(current_job_data, BaseJobState):
+                    job_data_snapshot = current_job_data
+
             try:
                 # Shorter poll for dynamic mode, but never exceed the configured timeout
-                wait_timeout = (min(10.0, timeout) if mode == 'dynamic' else timeout)
+                wait_timeout = (min(DYNAMIC_MODE_MAX_POLL_TIMEOUT, timeout) if mode == 'dynamic' else timeout)
                 result = await asyncio.wait_for(q.get(), timeout=wait_timeout)
                 worker_id = result['worker_id']
                 is_last = result.get('is_last', False)
@@ -115,6 +142,7 @@ class ResultCollectorMixin:
                     
             except asyncio.TimeoutError:
                 current_time = time.time()
+                waiting_workers = self._log_worker_timeout_status(job_data_snapshot, current_time, multi_job_id)
                 if mode == 'dynamic':
                     # Check for worker timeouts periodically
                     if current_time - last_heartbeat_check >= HEARTBEAT_INTERVAL:
@@ -126,16 +154,6 @@ class ResultCollectorMixin:
                     
                     # Check if we've been waiting too long overall
                     if current_time - wait_started_at > timeout:
-                        async with prompt_server.distributed_tile_jobs_lock:
-                            job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
-                            worker_status = dict(job_data.worker_status) if isinstance(job_data, BaseJobState) else {}
-                            waiting_workers = list(worker_status.keys())
-                        for worker_id, last_seen in worker_status.items():
-                            elapsed_for_worker = max(0.0, current_time - float(last_seen))
-                            log(
-                                "UltimateSDUpscale Master - Heartbeat timeout: "
-                                f"worker={worker_id}, elapsed={elapsed_for_worker:.1f}s"
-                            )
                         elapsed = current_time - wait_started_at
                         log(
                             "UltimateSDUpscale Master - Heartbeat timeout while waiting for images; "
@@ -143,16 +161,6 @@ class ResultCollectorMixin:
                         )
                         break
                 else:
-                    async with prompt_server.distributed_tile_jobs_lock:
-                        job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
-                        worker_status = dict(job_data.worker_status) if isinstance(job_data, BaseJobState) else {}
-                        waiting_workers = list(worker_status.keys())
-                    for worker_id, last_seen in worker_status.items():
-                        elapsed_for_worker = max(0.0, current_time - float(last_seen))
-                        log(
-                            "UltimateSDUpscale Master - Heartbeat timeout: "
-                            f"worker={worker_id}, elapsed={elapsed_for_worker:.1f}s"
-                        )
                     elapsed = current_time - wait_started_at
                     log(
                         f"UltimateSDUpscale Master - Heartbeat timeout waiting for {item_type}; "

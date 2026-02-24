@@ -3,7 +3,8 @@ import { createButtonHelper as createButtonHelperFn } from './ui/buttonHelpers.j
 import { showCloudflareWarning as showCloudflareWarningFn } from './ui/cloudflareWarning.js';
 import { createWorkerSettingsForm as createWorkerSettingsFormFn } from './ui/settingsForm.js';
 import { renderEntityCard as renderEntityCardFn } from './ui/entityCard.js';
-import { launchWorker, startLogAutoRefresh, stopLogAutoRefresh, stopWorker, updateWorkerControls, viewWorkerLog } from './workerLifecycle.js';
+import { createLogModal } from './ui/logModal.js';
+import { launchWorker, stopWorker, updateWorkerControls, viewWorkerLog } from './workerLifecycle.js';
 import { isRemoteWorker } from './workerSettings.js';
 
 const cardConfigs = {
@@ -377,184 +378,34 @@ export class DistributedUI {
             [STATUS_COLORS.PROCESSING_YELLOW]: "worker-status--processing",
         };
 
-        const statusClass = colorClassMap[color];
-        if (statusClass) {
-            statusDot.classList.add(statusClass);
-            statusDot.style.backgroundColor = "";
-        } else {
-            statusDot.style.backgroundColor = color;
-        }
+        const statusClass = colorClassMap[color] || "worker-status--unknown";
+        statusDot.classList.add(statusClass);
+        statusDot.style.backgroundColor = "";
         statusDot.title = title;
         statusDot.classList.toggle('status-pulsing', pulsing);
     }
 
     showLogModal(extension, workerId, logData) {
-        // Remove any existing modal
-        const existingModal = document.getElementById('distributed-log-modal');
-        if (existingModal) {
-            existingModal.remove();
+        if (this._logModal) {
+            this._logModal.unmount();
+            this._logModal = null;
         }
-        
+
         const worker = extension.config.workers.find(w => w.id === workerId);
         const workerName = worker?.name || `Worker ${workerId}`;
-        
-        // Create modal container
-        const modal = document.createElement('div');
-        modal.id = 'distributed-log-modal';
-        modal.style.cssText = `
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.8);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            z-index: 10000;
-        `;
-        
-        // Create modal content
-        const content = document.createElement('div');
-        content.style.cssText = `
-            background: #1e1e1e;
-            border-radius: 8px;
-            width: 90%;
-            max-width: 1200px;
-            height: 80%;
-            display: flex;
-            flex-direction: column;
-            border: 1px solid #444;
-        `;
-        
-        // Header
-        const header = document.createElement('div');
-        header.style.cssText = `
-            padding: 15px 20px;
-            border-bottom: 1px solid #444;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        `;
-        
-        const title = document.createElement('h3');
-        title.textContent = `${workerName} - Log Viewer`;
-        title.style.cssText = 'margin: 0; color: #fff;';
-        
-        const headerButtons = document.createElement('div');
-        headerButtons.style.cssText = 'display: flex; gap: 20px; align-items: center;';
-        
-        // Auto-refresh container
-        const refreshContainer = document.createElement('div');
-        refreshContainer.style.cssText = 'display: flex; align-items: center; gap: 4px;';
-        
-        // Auto-refresh checkbox
-        const refreshCheckbox = document.createElement('input');
-        refreshCheckbox.type = 'checkbox';
-        refreshCheckbox.id = 'log-auto-refresh';
-        refreshCheckbox.checked = true; // Enabled by default
-        refreshCheckbox.style.cssText = 'cursor: pointer;';
-        refreshCheckbox.onchange = (e) => {
-            if (e.target.checked) {
-                startLogAutoRefresh(extension, workerId);
-            } else {
-                stopLogAutoRefresh(extension);
-            }
-        };
-        
-        const refreshLabel = document.createElement('label');
-        refreshLabel.htmlFor = 'log-auto-refresh';
-        refreshLabel.style.cssText = 'font-size: 12px; color: #ccc; cursor: pointer; white-space: nowrap;';
-        refreshLabel.textContent = 'Auto-refresh';
-        
-        // Add checkbox and label to container
-        refreshContainer.appendChild(refreshCheckbox);
-        refreshContainer.appendChild(refreshLabel);
-        
-        // Close button
-        const closeBtn = this.createButton('✕', 
-            () => {
-                stopLogAutoRefresh(extension);
-                modal.remove();
-            }, 
-            'background-color: #c04c4c;');
-        closeBtn.style.cssText += ' padding: 5px 10px; font-size: 14px; font-weight: bold;';
-        
-        headerButtons.appendChild(refreshContainer);
-        headerButtons.appendChild(closeBtn);
-        
-        header.appendChild(title);
-        header.appendChild(headerButtons);
-        
-        // Log content area
-        const logContainer = document.createElement('div');
-        logContainer.style.cssText = `
-            flex: 1;
-            overflow: auto;
-            padding: 15px;
-            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-            font-size: 12px;
-            line-height: 1.4;
-            color: #ddd;
-            background: #0d0d0d;
-            white-space: pre-wrap;
-            word-wrap: break-word;
-        `;
-        logContainer.id = 'distributed-log-content';
-        logContainer.textContent = logData.content;
-        
-        // Auto-scroll to bottom
-        setTimeout(() => {
-            logContainer.scrollTop = logContainer.scrollHeight;
-        }, 0);
-        
-        // Status bar
-        const statusBar = document.createElement('div');
-        statusBar.style.cssText = `
-            padding: 10px 20px;
-            border-top: 1px solid #444;
-            font-size: 11px;
-            color: #888;
-        `;
-        statusBar.textContent = `Log file: ${logData.log_file}`;
-        if (logData.truncated) {
-            statusBar.textContent += ` (showing last ${logData.lines_shown} lines of ${this.formatFileSize(logData.file_size)})`;
-        }
-        
-        // Assemble modal
-        content.appendChild(header);
-        content.appendChild(logContainer);
-        content.appendChild(statusBar);
-        modal.appendChild(content);
-        
-        // Close on background click
-        modal.onclick = (e) => {
-            if (e.target === modal) {
-                stopLogAutoRefresh(extension);
-                modal.remove();
-            }
-        };
-        
-        // Close on Escape key
-        const handleEscape = (e) => {
-            if (e.key === 'Escape') {
-                stopLogAutoRefresh(extension);
-                modal.remove();
-                document.removeEventListener('keydown', handleEscape);
-            }
-        };
-        document.addEventListener('keydown', handleEscape);
-        
-        document.body.appendChild(modal);
-        
-        // Start auto-refresh
-        startLogAutoRefresh(extension, workerId);
-    }
 
-    formatFileSize(bytes) {
-        if (bytes < 1024) return bytes + ' B';
-        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-        return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+        const modal = createLogModal();
+        this._logModal = modal;
+        modal.mount(document.body, {
+            workerName,
+            logData,
+            fetchLog: async () => extension.api.getWorkerLog(workerId, 1000),
+            onClose: () => {
+                if (this._logModal === modal) {
+                    this._logModal = null;
+                }
+            },
+        });
     }
 
     createWorkerSettingsForm(extension, worker) {
@@ -712,17 +563,15 @@ export class DistributedUI {
             let message;
             const badge = document.createElement("div");
             badge.style.cssText = this.styles.infoBox;
+            badge.classList.add("master-info-badge");
             if (fallbackActive) {
                 message = "No workers selected. Master fallback execution active.";
                 badge.textContent = message;
-                badge.style.backgroundColor = "#243024";
-                badge.style.color = "#6bd06b";
-                badge.style.border = "1px solid #335533";
+                badge.classList.add("master-info-badge--fallback");
             } else if (!participationEnabled) {
                 message = "Master disabled: running as orchestrator only.";
                 badge.textContent = message;
-                badge.style.backgroundColor = "#3a3a3a";
-                badge.style.color = "#ffcc66";
+                badge.classList.add("master-info-badge--delegate");
             } else {
                 message = "Master participating in workflows.";
                 badge.textContent = message;
@@ -822,9 +671,10 @@ export class DistributedUI {
         settingsForm.appendChild(hostResult.group);
 
         // Cloudflare tunnel toggle (simple button inside master settings)
-        const tunnelBtn = this.createButton("Enable Cloudflare Tunnel", (e) => extension.handleTunnelToggle(e.target), "background-color: #665533;");
+        const tunnelBtn = this.createButton("Enable Cloudflare Tunnel", (e) => extension.handleTunnelToggle(e.target));
         tunnelBtn.id = "cloudflare-tunnel-button";
-        tunnelBtn.style.cssText = BUTTON_STYLES.base + " background-color: #665533; margin: 4px 0 -5px 0;";
+        tunnelBtn.style.cssText = BUTTON_STYLES.base + " margin: 4px 0 -5px 0;";
+        tunnelBtn.classList.add("tunnel-button", "tunnel-button--enable");
         settingsForm.appendChild(tunnelBtn);
         extension.tunnelElements = { button: tunnelBtn };
         extension.updateTunnelUIElements();
@@ -890,30 +740,19 @@ export class DistributedUI {
     }
 
     addPlaceholderHover(card, leftColumn, entityType) {
+        const cardTypeClass = entityType === 'blueprint' ? 'placeholder-card--blueprint' : 'placeholder-card--add';
+        const columnTypeClass = entityType === 'blueprint' ? 'placeholder-column--blueprint' : 'placeholder-column--add';
+        card.classList.add('placeholder-card', cardTypeClass);
+        leftColumn.classList.add('placeholder-column', columnTypeClass);
+
         card.onmouseover = () => {
-            if (entityType === 'blueprint') {
-                card.style.borderColor = "#777";
-                card.style.backgroundColor = "rgba(255, 255, 255, 0.05)";
-                leftColumn.style.color = "#999";
-            } else {
-                card.style.borderColor = "#666";
-                card.style.backgroundColor = "rgba(255, 255, 255, 0.02)";
-                leftColumn.style.color = "#888";
-                leftColumn.style.borderColor = "#666";
-            }
+            card.classList.add('is-hovered');
+            leftColumn.classList.add('is-hovered');
         };
         
         card.onmouseout = () => {
-            if (entityType === 'blueprint') {
-                card.style.borderColor = "#555";
-                card.style.backgroundColor = "rgba(255, 255, 255, 0.02)";
-                leftColumn.style.color = "#777";
-            } else {
-                card.style.borderColor = "#444";
-                card.style.backgroundColor = "transparent";
-                leftColumn.style.color = "#555";
-                leftColumn.style.borderColor = "#444";
-            }
+            card.classList.remove('is-hovered');
+            leftColumn.classList.remove('is-hovered');
         };
     }
 

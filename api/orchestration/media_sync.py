@@ -8,6 +8,7 @@ import aiohttp
 
 from ...utils.logging import debug_log, log
 from ...utils.network import build_worker_url, get_client_session
+from ...utils.trace_logger import trace_debug, trace_info
 
 
 LIKELY_FILENAME_RE = re.compile(
@@ -19,19 +20,6 @@ IMAGE_OR_VIDEO_RE = re.compile(
     r"\.(png|jpg|jpeg|webp|gif|bmp|mp4|avi|mov|mkv|webm)(\s*\[\w+\])?$",
     re.IGNORECASE,
 )
-
-
-def _trace_prefix(trace_execution_id):
-    return f"[Distributed][exec:{trace_execution_id}]"
-
-
-def _trace_debug(trace_execution_id, message):
-    debug_log(f"{_trace_prefix(trace_execution_id)} {message}")
-
-
-def _trace_info(trace_execution_id, message):
-    log(f"{_trace_prefix(trace_execution_id)} {message}")
-
 
 def convert_paths_for_platform(obj, target_separator):
     """Recursively normalize likely file paths for the worker platform separator."""
@@ -114,7 +102,7 @@ async def fetch_worker_path_separator(worker, trace_execution_id=None):
             return separator if separator in ("/", "\\") else None
     except Exception as exc:
         if trace_execution_id:
-            _trace_debug(trace_execution_id, f"Failed to fetch worker system info ({worker.get('id')}): {exc}")
+            trace_debug(trace_execution_id, f"Failed to fetch worker system info ({worker.get('id')}): {exc}")
         else:
             debug_log(f"[Distributed] Failed to fetch worker system info ({worker.get('id')}): {exc}")
         return None
@@ -138,7 +126,7 @@ async def _upload_media_to_worker(worker, filename, file_bytes, file_hash, mime_
                     return False
     except Exception as exc:
         if trace_execution_id:
-            _trace_debug(trace_execution_id, f"Media check failed for '{normalized}' on worker {worker.get('id')}: {exc}")
+            trace_debug(trace_execution_id, f"Media check failed for '{normalized}' on worker {worker.get('id')}: {exc}")
         else:
             debug_log(f"[Distributed] Media check failed for '{normalized}' on worker {worker.get('id')}: {exc}")
 
@@ -180,13 +168,13 @@ async def sync_worker_media(worker, prompt_obj, trace_execution_id=None):
         except FileNotFoundError:
             missing += 1
             if trace_execution_id:
-                _trace_info(trace_execution_id, f"Media file '{filename}' not found on master; worker may fail to load it.")
+                trace_info(trace_execution_id, f"Media file '{filename}' not found on master; worker may fail to load it.")
             else:
                 log(f"[Distributed] Media file '{filename}' not found on master; worker may fail to load it.")
             continue
         except Exception as exc:
             if trace_execution_id:
-                _trace_info(trace_execution_id, f"Failed to load media '{filename}' for worker sync: {exc}")
+                trace_info(trace_execution_id, f"Failed to load media '{filename}' for worker sync: {exc}")
             else:
                 log(f"[Distributed] Failed to load media '{filename}' for worker sync: {exc}")
             continue
@@ -206,7 +194,7 @@ async def sync_worker_media(worker, prompt_obj, trace_execution_id=None):
                 skipped += 1
         except Exception as exc:
             if trace_execution_id:
-                _trace_info(trace_execution_id, f"Failed to upload media '{filename}' to worker {worker.get('id')}: {exc}")
+                trace_info(trace_execution_id, f"Failed to upload media '{filename}' to worker {worker.get('id')}: {exc}")
             else:
                 log(f"[Distributed] Failed to upload media '{filename}' to worker {worker.get('id')}: {exc}")
 
@@ -215,6 +203,6 @@ async def sync_worker_media(worker, prompt_obj, trace_execution_id=None):
         f"uploaded={uploaded}, skipped={skipped}, missing={missing}, referenced={len(media_refs)}"
     )
     if trace_execution_id:
-        _trace_debug(trace_execution_id, summary)
+        trace_debug(trace_execution_id, summary)
     else:
         debug_log(f"[Distributed] {summary}")

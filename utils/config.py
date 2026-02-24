@@ -1,8 +1,10 @@
 """
 Configuration management for ComfyUI-Distributed.
 """
+import asyncio
 import os
 import json
+from contextlib import asynccontextmanager
 from .logging import log
 
 # Import defaults for timeout fallbacks
@@ -11,6 +13,7 @@ from .constants import HEARTBEAT_TIMEOUT
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "gpu_config.json")
 _config_cache = None
 _config_mtime = 0.0
+_config_lock = asyncio.Lock()
 
 
 def _config_path():
@@ -95,14 +98,35 @@ def load_config():
 
 def save_config(config):
     """Saves the configuration to file."""
+    tmp_path = f"{_config_path()}.tmp"
     try:
-        with open(_config_path(), 'w', encoding='utf-8') as f:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, _config_path())
         invalidate_config_cache()
         return True
     except Exception as e:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
         log(f"Error saving config: {e}")
         return False
+
+
+@asynccontextmanager
+async def config_transaction():
+    """Acquire config lock, yield loaded config, and save if changed."""
+    async with _config_lock:
+        config = load_config()
+        original_snapshot = json.dumps(config, sort_keys=True)
+        yield config
+        updated_snapshot = json.dumps(config, sort_keys=True)
+        if updated_snapshot != original_snapshot:
+            if not save_config(config):
+                raise RuntimeError("Failed to save config")
 
 def ensure_config_exists():
     """Creates default config file if it doesn't exist. Used by __init__.py"""

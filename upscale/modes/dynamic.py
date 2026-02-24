@@ -6,13 +6,19 @@ from ...utils.image import tensor_to_pil, pil_to_tensor
 from ...utils.async_helpers import run_async_in_server_loop
 from ...utils.config import get_worker_timeout_seconds
 from ...utils.constants import TILE_WAIT_TIMEOUT, TILE_SEND_TIMEOUT
-from ...utils.usdu_managment import (
-    ensure_tile_jobs_initialized, init_dynamic_job,
-    clone_conditioning, _send_heartbeat_to_master,
-)
+from ..job_store import ensure_tile_jobs_initialized, init_dynamic_job
 
 
 class DynamicModeMixin:
+    """
+    Dynamic (per-image queue) USDU mode behaviors for master and worker roles.
+
+    Expected co-mixins on `self`:
+    - TileOpsMixin (`calculate_tiles`, `_slice_conditioning`, `_process_and_blend_tile`).
+    - JobStateMixin (image queue/task completion helpers).
+    - WorkerCommsMixin (`_request_image_from_master`, `_send_full_image_to_master`, `_send_heartbeat_to_master`).
+    """
+
     def process_master_dynamic(self, upscaled_image, model, positive, negative, vae,
                               seed, steps, cfg, sampler_name, scheduler, denoise,
                               tile_width, tile_height, padding, mask_blur,
@@ -71,22 +77,7 @@ class DynamicModeMixin:
                 image_seed = seed + image_idx * 1000
                 
                 # Pre-slice conditioning once per image (not per tile)
-                positive_sliced = clone_conditioning(positive)
-                negative_sliced = clone_conditioning(negative)
-                for cond_list in [positive_sliced, negative_sliced]:
-                    for i in range(len(cond_list)):
-                        emb, cond_dict = cond_list[i]
-                        if emb.shape[0] > 1:
-                            cond_list[i][0] = emb[image_idx:image_idx+1]
-                        if 'control' in cond_dict:
-                            control = cond_dict['control']
-                            while control is not None:
-                                hint = control.cond_hint_original
-                                if hint.shape[0] > 1:
-                                    control.cond_hint_original = hint[image_idx:image_idx+1]
-                                control = control.previous_controlnet
-                        if 'mask' in cond_dict and cond_dict['mask'].shape[0] > 1:
-                            cond_dict['mask'] = cond_dict['mask'][image_idx:image_idx+1]
+                positive_sliced, negative_sliced = self._slice_conditioning(positive, negative, image_idx)
                 
                 for tile_idx, pos in enumerate(all_tiles):
                     local_image = self._process_and_blend_tile(
@@ -268,55 +259,40 @@ class DynamicModeMixin:
             image_seed = seed + image_idx * 1000
 
             # Pre-slice conditioning once per image (not per tile)
-            positive_sliced = clone_conditioning(positive)
-            negative_sliced = clone_conditioning(negative)
-            for cond_list in [positive_sliced, negative_sliced]:
-                for i in range(len(cond_list)):
-                        emb, cond_dict = cond_list[i]
-                        if emb.shape[0] > 1:
-                            cond_list[i][0] = emb[image_idx:image_idx+1]
-                        if 'control' in cond_dict:
-                            control = cond_dict['control']
-                            while control is not None:
-                                hint = control.cond_hint_original
-                                if hint.shape[0] > 1:
-                                    control.cond_hint_original = hint[image_idx:image_idx+1]
-                                control = control.previous_controlnet
-                        if 'mask' in cond_dict and cond_dict['mask'].shape[0] > 1:
-                            cond_dict['mask'] = cond_dict['mask'][image_idx:image_idx+1]
+            positive_sliced, negative_sliced = self._slice_conditioning(positive, negative, image_idx)
 
-                for tile_idx, pos in enumerate(all_tiles):
-                    local_image = self._process_and_blend_tile(
-                        tile_idx, pos, single_tensor, local_image,
-                        model, positive_sliced, negative_sliced, vae, image_seed, steps, cfg,
-                        sampler_name, scheduler, denoise, tile_width, tile_height,
-                        padding, mask_blur, width, height, force_uniform_tiles,
-                        tiled_decode, batch_idx=image_idx
-                    )
-                    run_async_in_server_loop(
-                        _send_heartbeat_to_master(multi_job_id, master_url, worker_id),
-                        timeout=5.0
-                    )
+            for tile_idx, pos in enumerate(all_tiles):
+                local_image = self._process_and_blend_tile(
+                    tile_idx, pos, single_tensor, local_image,
+                    model, positive_sliced, negative_sliced, vae, image_seed, steps, cfg,
+                    sampler_name, scheduler, denoise, tile_width, tile_height,
+                    padding, mask_blur, width, height, force_uniform_tiles,
+                    tiled_decode, batch_idx=image_idx
+                )
+                run_async_in_server_loop(
+                    self._send_heartbeat_to_master(multi_job_id, master_url, worker_id),
+                    timeout=5.0
+                )
 
-                # Send processed image back to master
-                try:
-                    # Use the estimated remaining to determine if this is the last image
-                    is_last = is_last_for_worker
-                    run_async_in_server_loop(
-                        self._send_full_image_to_master(local_image, image_idx, multi_job_id,
-                                                        master_url, worker_id, is_last),
-                        timeout=TILE_SEND_TIMEOUT
-                    )
-                    # Send heartbeat after processing
-                    run_async_in_server_loop(
-                        _send_heartbeat_to_master(multi_job_id, master_url, worker_id),
-                        timeout=5.0
-                    )
-                    if is_last:
-                        break
-                except Exception as e:
-                    log(f"USDU Dist Worker[{worker_id[:8]}] - Error sending image {image_idx}: {e}")
-                    # Continue processing other images
+            # Send processed image back to master
+            try:
+                # Use the estimated remaining to determine if this is the last image
+                is_last = is_last_for_worker
+                run_async_in_server_loop(
+                    self._send_full_image_to_master(local_image, image_idx, multi_job_id,
+                                                    master_url, worker_id, is_last),
+                    timeout=TILE_SEND_TIMEOUT
+                )
+                # Send heartbeat after processing
+                run_async_in_server_loop(
+                    self._send_heartbeat_to_master(multi_job_id, master_url, worker_id),
+                    timeout=5.0
+                )
+                if is_last:
+                    break
+            except Exception as e:
+                log(f"USDU Dist Worker[{worker_id[:8]}] - Error sending image {image_idx}: {e}")
+                # Continue processing other images
 
         # Send final is_last signal
         debug_log(f"Worker[{worker_id[:8]}] processed {processed_count} images, sending completion signal")

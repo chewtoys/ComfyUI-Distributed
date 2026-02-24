@@ -1,6 +1,7 @@
-import { TIMEOUTS, STATUS_COLORS, ENDPOINTS } from './constants.js';
+import { TIMEOUTS, STATUS_COLORS } from './constants.js';
 import { buildWorkerUrl, normalizeWorkerUrl } from './urlUtils.js';
 import { isRemoteWorker } from './workerSettings.js';
+import { applyProbeResultToWorkerDot } from './workerUtils.js';
 
 export { normalizeWorkerUrl };
 
@@ -74,40 +75,45 @@ export async function checkAllWorkerStatuses(extension) {
 
 export async function checkMasterStatus(extension) {
     try {
-        const response = await fetch(`${window.location.origin}${ENDPOINTS.PROMPT}`, {
-            method: "GET",
-            signal: AbortSignal.timeout(TIMEOUTS.STATUS_CHECK),
-        });
+        const signal = extension.statusCheckAbortController?.signal || null;
+        const probeResult = await extension.api.probeWorker(
+            window.location.origin,
+            TIMEOUTS.STATUS_CHECK,
+            signal,
+        );
+        if (!probeResult.ok) {
+            throw new Error(`HTTP ${probeResult.status}`);
+        }
 
-        if (response.ok) {
-            const data = await response.json();
-            const queueRemaining = data.exec_info?.queue_remaining || 0;
-            const isProcessing = queueRemaining > 0;
+        const queueRemaining = probeResult.queueRemaining || 0;
+        const isProcessing = queueRemaining > 0;
 
-            // Update master status in state
-            extension.state.setMasterStatus(isProcessing ? "processing" : "online");
+        // Update master status in state
+        extension.state.setMasterStatus(isProcessing ? "processing" : "online");
 
-            // Update master status dot
-            const statusDot = document.getElementById("master-status");
-            if (statusDot) {
-                if (!extension.isMasterParticipating()) {
-                    if (isProcessing) {
-                        setStatusDotClass(statusDot, "worker-status--processing");
-                        statusDot.title = `Orchestrating (${queueRemaining} in queue)`;
-                    } else {
-                        setStatusDotClass(statusDot, "worker-status--unknown");
-                        statusDot.title = "Master orchestrator only";
-                    }
-                } else if (isProcessing) {
+        // Update master status dot
+        const statusDot = document.getElementById("master-status");
+        if (statusDot) {
+            if (!extension.isMasterParticipating()) {
+                if (isProcessing) {
                     setStatusDotClass(statusDot, "worker-status--processing");
-                    statusDot.title = `Processing (${queueRemaining} in queue)`;
+                    statusDot.title = `Orchestrating (${queueRemaining} in queue)`;
                 } else {
-                    setStatusDotClass(statusDot, "worker-status--online");
-                    statusDot.title = "Online";
+                    setStatusDotClass(statusDot, "worker-status--unknown");
+                    statusDot.title = "Master orchestrator only";
                 }
+            } else if (isProcessing) {
+                setStatusDotClass(statusDot, "worker-status--processing");
+                statusDot.title = `Processing (${queueRemaining} in queue)`;
+            } else {
+                setStatusDotClass(statusDot, "worker-status--online");
+                statusDot.title = "Online";
             }
         }
     } catch (error) {
+        if (error?.name === "AbortError") {
+            return;
+        }
         // Master is always online (we're running on it), so keep it green
         const statusDot = document.getElementById("master-status");
         if (statusDot) {
@@ -127,47 +133,36 @@ export function getWorkerUrl(extension, worker, endpoint = "") {
 
 export async function checkWorkerStatus(extension, worker) {
     // Assume caller ensured enabled; proceed with check
-    const url = getWorkerUrl(extension, worker, ENDPOINTS.PROMPT);
+    const workerUrl = getWorkerUrl(extension, worker);
 
     try {
-        // Combine timeout with abort controller signal
-        const timeoutSignal = AbortSignal.timeout(TIMEOUTS.STATUS_CHECK);
-        const signal = extension.statusCheckAbortController
-            ? AbortSignal.any([timeoutSignal, extension.statusCheckAbortController.signal])
-            : timeoutSignal;
-
-        const response = await fetch(url, {
-            method: "GET",
-            mode: "cors",
+        const signal = extension.statusCheckAbortController?.signal || null;
+        const probeResult = await extension.api.probeWorker(
+            workerUrl,
+            TIMEOUTS.STATUS_CHECK,
             signal,
+        );
+        if (!probeResult.ok) {
+            throw new Error(`HTTP ${probeResult.status}`);
+        }
+
+        const queueRemaining = probeResult.queueRemaining || 0;
+        const isProcessing = queueRemaining > 0;
+
+        // Update status
+        extension.state.setWorkerStatus(worker.id, {
+            online: true,
+            processing: isProcessing,
+            queueCount: queueRemaining,
         });
 
-        if (response.ok) {
-            const data = await response.json();
-            const queueRemaining = data.exec_info?.queue_remaining || 0;
-            const isProcessing = queueRemaining > 0;
+        // Update status dot based on probe result
+        applyProbeResultToWorkerDot(worker.id, probeResult);
 
-            // Update status
-            extension.state.setWorkerStatus(worker.id, {
-                online: true,
-                processing: isProcessing,
-                queueCount: queueRemaining,
-            });
-
-            // Update status dot based on processing state
-            if (isProcessing) {
-                extension.ui.updateStatusDot(worker.id, STATUS_COLORS.PROCESSING_YELLOW, `Online - Processing (${queueRemaining} in queue)`, false);
-            } else {
-                extension.ui.updateStatusDot(worker.id, STATUS_COLORS.ONLINE_GREEN, "Online - Idle", false);
-            }
-
-            // Clear launching state since worker is now online
-            if (extension.state.isWorkerLaunching(worker.id)) {
-                extension.state.setWorkerLaunching(worker.id, false);
-                clearLaunchingFlag(extension, worker.id);
-            }
-        } else {
-            throw new Error(`HTTP ${response.status}`);
+        // Clear launching state since worker is now online
+        if (extension.state.isWorkerLaunching(worker.id)) {
+            extension.state.setWorkerLaunching(worker.id, false);
+            clearLaunchingFlag(extension, worker.id);
         }
     } catch (error) {
         // Don't process aborted requests
@@ -186,8 +181,8 @@ export async function checkWorkerStatus(extension, worker) {
         if (extension.state.isWorkerLaunching(worker.id)) {
             extension.ui.updateStatusDot(worker.id, STATUS_COLORS.PROCESSING_YELLOW, "Launching...", true);
         } else if (worker.enabled) {
-            // Only update to red if not currently launching AND still enabled
-            extension.ui.updateStatusDot(worker.id, STATUS_COLORS.OFFLINE_RED, "Offline - Cannot connect", false);
+            // Only update to red if not currently launching AND still enabled.
+            applyProbeResultToWorkerDot(worker.id, { ok: false });
         }
         // If disabled, don't update the dot (leave it gray)
 
@@ -394,34 +389,34 @@ export function updateWorkerControls(extension, workerId) {
 
     // Show log button immediately if we have log file info (even if worker is still starting)
     if (managedInfo?.log_file && logBtn) {
-        logBtn.style.display = "";
+        logBtn.classList.remove("is-hidden");
         setButtonClass(logBtn, "btn--log");
     } else if (logBtn && !managedInfo) {
-        logBtn.style.display = "none";
+        logBtn.classList.add("is-hidden");
     }
 
     if (status?.online || managedInfo) {
         // Worker is running or we just launched it
-        launchBtn.style.display = "none"; // Hide launch button when running
+        launchBtn.classList.add("is-hidden");
 
         if (managedInfo) {
             // Only show stop button if we manage this worker
-            stopBtn.style.display = "";
+            stopBtn.classList.remove("is-hidden");
             stopBtn.disabled = false;
             stopBtn.textContent = "Stop";
             setButtonClass(stopBtn, "btn--stop");
         } else {
             // Hide stop button for workers launched outside UI
-            stopBtn.style.display = "none";
+            stopBtn.classList.add("is-hidden");
         }
     } else {
         // Worker is not running
-        launchBtn.style.display = ""; // Show launch button
+        launchBtn.classList.remove("is-hidden");
         launchBtn.disabled = false;
         launchBtn.textContent = "Launch";
         setButtonClass(launchBtn, "btn--launch");
 
-        stopBtn.style.display = "none"; // Hide stop button when not running
+        stopBtn.classList.add("is-hidden");
     }
 }
 
@@ -545,21 +540,13 @@ export function toggleWorkerExpanded(extension, workerId) {
         extension.state.setWorkerExpanded(workerId, false);
         settingsDiv.classList.remove("expanded");
         if (settingsArrow) {
-            settingsArrow.style.transform = "rotate(0deg)";
+            settingsArrow.classList.remove("settings-arrow--expanded");
         }
-        // Animate padding to 0
-        settingsDiv.style.padding = "0 12px";
-        settingsDiv.style.marginTop = "0";
-        settingsDiv.style.marginBottom = "0";
     } else {
         extension.state.setWorkerExpanded(workerId, true);
         settingsDiv.classList.add("expanded");
         if (settingsArrow) {
-            settingsArrow.style.transform = "rotate(90deg)";
+            settingsArrow.classList.add("settings-arrow--expanded");
         }
-        // Animate padding to full
-        settingsDiv.style.padding = "12px";
-        settingsDiv.style.marginTop = "8px";
-        settingsDiv.style.marginBottom = "8px";
     }
 }

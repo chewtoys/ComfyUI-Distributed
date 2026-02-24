@@ -6,7 +6,7 @@ import comfy.samplers
 
 from ..utils.logging import debug_log, log
 from ..utils.async_helpers import run_async_in_server_loop
-from ..utils.usdu_managment import ensure_tile_jobs_initialized
+from ..upscale.job_store import ensure_tile_jobs_initialized
 
 from ..upscale.tile_ops import TileOpsMixin
 from ..upscale.result_collector import ResultCollectorMixin

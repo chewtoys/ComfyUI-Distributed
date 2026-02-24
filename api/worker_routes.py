@@ -18,12 +18,9 @@ from ..utils.constants import CHUNK_SIZE
 from ..workers import get_worker_manager
 from .schemas import require_fields, validate_worker_id
 from ..workers.detection import (
-    is_local_worker,
-    is_same_physical_host,
     get_machine_id,
     is_docker_environment,
     is_runpod_environment,
-    get_comms_channel,
 )
 from ..utils.async_helpers import queue_prompt_payload
 
@@ -317,13 +314,7 @@ async def get_network_info_endpoint(request):
             "message": "Auto-detected network configuration"
         })
     except Exception as e:
-        return web.json_response({
-            "status": "error",
-            "message": str(e),
-            "hostname": "unknown",
-            "all_ips": [],
-            "recommended_ip": None
-        })
+        return await handle_api_error(request, e, 500)
 
 @server.PromptServer.instance.routes.get("/distributed/system_info")
 async def get_system_info_endpoint(request):
@@ -347,10 +338,7 @@ async def get_system_info_endpoint(request):
             "runpod_pod_id": os.environ.get('RUNPOD_POD_ID')
         })
     except Exception as e:
-        return web.json_response({
-            "status": "error",
-            "message": str(e)
-        }, status=500)
+        return await handle_api_error(request, e, 500)
 
 @server.PromptServer.instance.routes.post("/distributed/launch_worker")
 async def launch_worker_endpoint(request):
@@ -389,12 +377,7 @@ async def launch_worker_endpoint(request):
                 is_running = wm._is_process_running(proc_info['pid'])
             
             if is_running:
-                return web.json_response({
-                    "status": "error",
-                    "message": "Worker already running (managed by UI)",
-                    "pid": proc_info['pid'],
-                    "log_file": proc_info.get('log_file')
-                }, status=409)
+                return await handle_api_error(request, "Worker already running (managed by UI)", 409)
             else:
                 # Process is dead, remove it
                 del wm.processes[worker_id_str]
@@ -438,8 +421,11 @@ async def stop_worker_endpoint(request):
         if success:
             return web.json_response({"status": "success", "message": message})
         else:
-            return web.json_response({"status": "error", "message": message}, 
-                                   status=404 if "not managed" in message else 409)
+            return await handle_api_error(
+                request,
+                message,
+                404 if "not managed" in message else 409,
+            )
             
     except Exception as e:
         return await handle_api_error(request, e, 400)
