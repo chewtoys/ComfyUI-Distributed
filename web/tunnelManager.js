@@ -4,37 +4,39 @@ export function updateTunnelUIElements(extension, isRunning, isStarting) {
 
     const elements = extension.tunnelElements || {};
     const status = (extension.tunnelStatus?.status || "stopped").toLowerCase();
-    const enableColor = "#665533"; // requested yellow/brown tone
-    const disableColor = "#7c4a4a"; // match worker delete button
-    const colors = {
-        running: disableColor,
-        starting: enableColor,
-        stopped: enableColor,
-        error: disableColor,
-        unknown: enableColor,
-        stopping: disableColor,
-    };
+    const tunnelButtonColorClasses = ["tunnel-button--enable", "tunnel-button--disable"];
+    const tunnelStatusColorClasses = ["tunnel-status--enable", "tunnel-status--disable"];
 
     if (elements.button) {
         elements.button.disabled = status === "starting" || status === "stopping";
+        elements.button.classList.remove(...tunnelButtonColorClasses);
+
         if (status === "starting") {
             elements.button.innerHTML = `<span class="tunnel-spinner"></span> Starting...`;
-            elements.button.style.backgroundColor = enableColor;
+            elements.button.classList.add("tunnel-button--enable");
+        } else if (status === "stopping") {
+            elements.button.innerHTML = `<span class="tunnel-spinner"></span> Stopping...`;
+            elements.button.classList.add("tunnel-button--disable");
         } else if (status === "running") {
             elements.button.textContent = "Disable Cloudflare Tunnel";
-            elements.button.style.backgroundColor = disableColor;
+            elements.button.classList.add("tunnel-button--disable");
         } else if (status === "error") {
             elements.button.textContent = "Retry Cloudflare Tunnel";
-            elements.button.style.backgroundColor = disableColor;
+            elements.button.classList.add("tunnel-button--disable");
         } else {
             elements.button.textContent = "Enable Cloudflare Tunnel";
-            elements.button.style.backgroundColor = enableColor;
+            elements.button.classList.add("tunnel-button--enable");
         }
     }
 
     if (elements.status) {
         elements.status.textContent = status.toUpperCase();
-        elements.status.style.backgroundColor = colors[status] || colors.stopped;
+        elements.status.classList.remove(...tunnelStatusColorClasses);
+        if (status === "running" || status === "error" || status === "stopping") {
+            elements.status.classList.add("tunnel-status--disable");
+        } else {
+            elements.status.classList.add("tunnel-status--enable");
+        }
     }
 
     if (elements.url) {

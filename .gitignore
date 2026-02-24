@@ -3,5 +3,3 @@ logs/
 gpu_config.json
 __pycache__/
 AGENTS.md
-docs/REFACTOR_PLAN.md
-docs/refactor-validation-checklist.md

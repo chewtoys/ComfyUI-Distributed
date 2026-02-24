@@ -23,6 +23,7 @@ export function renderEntityCard(ui, cardConfigs, entityType, data, extension) {
     card.appendChild(leftColumn);
 
     const rightColumn = ui.createCardColumn('content');
+    rightColumn.classList.add("entity-card-content");
 
     const infoRow = ui.createInfoRow();
     if (config.infoRowPadding) {
@@ -87,14 +88,15 @@ export function renderEntityCard(ui, cardConfigs, entityType, data, extension) {
     rightColumn.appendChild(infoRow);
 
     if (config.hover === true) {
+        rightColumn.classList.add("entity-card-content--hoverable");
         rightColumn.onmouseover = () => {
-            rightColumn.style.backgroundColor = "#333";
+            rightColumn.classList.add("entity-card-content--hovered");
             if (settingsArrow) {
                 settingsArrow.style.color = "#fff";
             }
         };
         rightColumn.onmouseout = () => {
-            rightColumn.style.backgroundColor = "transparent";
+            rightColumn.classList.remove("entity-card-content--hovered");
             if (settingsArrow) {
                 settingsArrow.style.color = "#888";
             }
