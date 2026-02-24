@@ -6,8 +6,24 @@ import aiohttp
 
 from ...utils.logging import debug_log, log
 from ...utils.network import build_worker_url, get_client_session, probe_worker
-from ...utils.trace_logger import trace_debug, trace_info
-from ..schemas import parse_positive_int
+try:
+    from ...utils.trace_logger import trace_debug, trace_info
+except ImportError:
+    def trace_debug(*_args, **_kwargs):
+        return None
+
+    def trace_info(*_args, **_kwargs):
+        return None
+
+try:
+    from ..schemas import parse_positive_int
+except ImportError:
+    def parse_positive_int(value, default):
+        try:
+            parsed = int(value)
+            return parsed if parsed > 0 else default
+        except (TypeError, ValueError):
+            return default
 
 
 async def worker_is_active(worker):

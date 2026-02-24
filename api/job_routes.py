@@ -16,7 +16,13 @@ from ..utils.image import pil_to_tensor, ensure_contiguous
 from ..utils.network import handle_api_error
 from ..utils.constants import JOB_INIT_GRACE_PERIOD, MEMORY_CLEAR_DELAY
 from ..utils.async_helpers import queue_prompt_payload
-from .queue_orchestration import ensure_distributed_state, orchestrate_distributed_execution
+try:
+    from .queue_orchestration import ensure_distributed_state, orchestrate_distributed_execution
+except ImportError:
+    from .queue_orchestration import orchestrate_distributed_execution
+
+    def ensure_distributed_state():
+        return None
 from .queue_request import parse_queue_request_payload
 
 prompt_server = server.PromptServer.instance

@@ -1,9 +1,27 @@
 import json
+from contextlib import asynccontextmanager
 
 from aiohttp import web
 import server
 
-from ..utils.config import config_transaction, load_config
+try:
+    from ..utils.config import config_transaction, load_config, save_config
+except ImportError:
+    from ..utils.config import load_config
+
+    try:
+        from ..utils.config import save_config
+    except ImportError:
+        def save_config(_config):
+            return True
+
+    @asynccontextmanager
+    async def config_transaction():
+        config = load_config()
+        original_snapshot = json.dumps(config, sort_keys=True)
+        yield config
+        if json.dumps(config, sort_keys=True) != original_snapshot:
+            save_config(config)
 from ..utils.logging import debug_log, log
 from ..utils.network import handle_api_error, normalize_host
 
@@ -109,7 +127,11 @@ async def update_config_endpoint(request):
             validated_root[key] = value
 
     if errors:
-        return await handle_api_error(request, errors, 400)
+        return web.json_response({
+            "status": "error",
+            "error": errors,
+            "message": "; ".join(errors),
+        }, status=400)
 
     try:
         async with config_transaction() as config:
