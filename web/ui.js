@@ -201,6 +201,7 @@ export class DistributedUI {
         input.id = id;
         input.value = value;
         input.placeholder = placeholder;
+        input.classList.add('dist-form-input');
         input.style.cssText = this.styles.formInput;
         
         group.appendChild(labelEl);
@@ -211,6 +212,7 @@ export class DistributedUI {
 
     createInfoBox(text) {
         const box = document.createElement("div");
+        box.classList.add('dist-info-box');
         box.style.cssText = this.styles.infoBox;
         box.textContent = text;
         return box;
@@ -223,18 +225,21 @@ export class DistributedUI {
 
     createCard(type = 'worker', options = {}) {
         const card = document.createElement("div");
-        
+        card.classList.add('dist-card');
+
         switch(type) {
             case 'master':
             case 'worker':
                 card.style.cssText = this.styles.workerCard;
                 break;
             case 'blueprint':
+                card.classList.add('dist-card--blueprint');
                 card.style.cssText = this.styles.cardBase + this.styles.cardBlueprint;
                 if (options.onClick) card.onclick = options.onClick;
                 if (options.title) card.title = options.title;
                 break;
             case 'add':
+                card.classList.add('dist-card--add');
                 card.style.cssText = this.styles.cardBase + this.styles.cardAdd;
                 if (options.onClick) card.onclick = options.onClick;
                 if (options.title) card.title = options.title;
@@ -253,9 +258,10 @@ export class DistributedUI {
 
     createCardColumn(type = 'checkbox', options = {}) {
         const column = document.createElement("div");
-        
+
         switch(type) {
             case 'checkbox':
+                column.classList.add('dist-card__left-col');
                 column.style.cssText = this.styles.checkboxColumn;
                 if (options.title) column.title = options.title;
                 break;
@@ -562,8 +568,8 @@ export class DistributedUI {
             const fallbackActive = extension.isMasterFallbackActive();
             let message;
             const badge = document.createElement("div");
+            badge.classList.add("dist-info-box", "master-info-badge");
             badge.style.cssText = this.styles.infoBox;
-            badge.classList.add("master-info-badge");
             if (fallbackActive) {
                 message = "No workers selected. Master fallback execution active.";
                 badge.textContent = message;

@@ -49,6 +49,8 @@ class DistributedExtension {
             loadManagedWorkers(this);
             // Detect master IP after everything is set up
             this.detectMasterIP();
+            // Listen for Nodes 2.0 setting changes (once, for the lifetime of the extension)
+            this._setupNodes2Listener();
         });
     }
 
@@ -260,7 +262,8 @@ class DistributedExtension {
             render: (el) => {
                 this.panelElement = el;
                 this.onPanelOpen();
-                return renderSidebarContent(this, el);
+                renderSidebarContent(this, el);
+                this._applyNodes2Style();
             },
             destroy: () => {
                 this.onPanelClose();
@@ -274,23 +277,38 @@ class DistributedExtension {
             checkAllWorkerStatuses(this);
         }
     }
-    
+
     onPanelClose() {
         this.log("Panel closed - stopping status polling", "debug");
-        
+
         // Cancel any pending status checks
         if (this.statusCheckAbortController) {
             this.statusCheckAbortController.abort();
             this.statusCheckAbortController = null;
         }
-        
+
         // Clear the timeout
         if (this.statusCheckTimeout) {
             clearTimeout(this.statusCheckTimeout);
             this.statusCheckTimeout = null;
         }
-        
+
         this.panelElement = null;
+    }
+
+    _applyNodes2Style() {
+        if (!this.panelElement) return;
+        const enabled = app.ui.settings.getSettingValue("Comfy.VueNodes.Enabled") ?? false;
+        this.panelElement.classList.toggle('distributed-panel--nodes2', Boolean(enabled));
+    }
+
+    _setupNodes2Listener() {
+        app.ui.settings.addEventListener("Comfy.VueNodes.Enabled.change", (e) => {
+            const enabled = e.detail?.value ?? false;
+            if (this.panelElement) {
+                this.panelElement.classList.toggle('distributed-panel--nodes2', Boolean(enabled));
+            }
+        });
     }
 
     // --- Core Logic & Execution ---
@@ -311,12 +329,12 @@ class DistributedExtension {
             clearInterval(this.logAutoRefreshInterval);
             this.logAutoRefreshInterval = null;
         }
-        
+
         if (this.statusCheckTimeout) {
             clearTimeout(this.statusCheckTimeout);
             this.statusCheckTimeout = null;
         }
-        
+
         this.log("Cleaned up intervals", "debug");
     }
 

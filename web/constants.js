@@ -134,17 +134,17 @@ export const UI_STYLES = {
     controlsDiv: "padding: 0 12px 12px 12px; display: flex; gap: 6px;",
     formGroup: "display: flex; flex-direction: column; gap: 5px;",
     formLabel: "font-size: 12px; color: #ccc; font-weight: 500;",
-    formInput: "padding: 6px 10px; background: #2a2a2a; border: 1px solid #444; color: white; font-size: 12px; border-radius: 4px; transition: border-color 0.2s;",
+    formInput: "padding: 6px 10px; color: white; font-size: 12px; transition: border-color 0.2s;",
     
     // Card styles
-    cardBase: "margin-bottom: 12px; border-radius: 6px; overflow: hidden; display: flex;",
-    workerCard: "margin-bottom: 12px; border-radius: 6px; overflow: hidden; display: flex; background: #2a2a2a;",
-    cardBlueprint: "border: 2px dashed #555; cursor: pointer; transition: all 0.2s ease; background: rgba(255, 255, 255, 0.02);",
-    cardAdd: "border: 1px dashed #444; cursor: pointer; transition: all 0.2s ease; background: transparent;",
-    
+    cardBase: "margin-bottom: 12px; overflow: hidden; display: flex;",
+    workerCard: "margin-bottom: 12px; overflow: hidden; display: flex;",
+    cardBlueprint: "cursor: pointer; transition: all 0.2s ease;",
+    cardAdd: "cursor: pointer; transition: all 0.2s ease;",
+
     // Column styles
     columnBase: "display: flex; align-items: center; justify-content: center;",
-    checkboxColumn: "flex: 0 0 44px; display: flex; align-items: center; justify-content: center; border-right: 1px solid #3a3a3a; cursor: default; background: rgba(0,0,0,0.1);",
+    checkboxColumn: "flex: 0 0 44px; display: flex; align-items: center; justify-content: center; cursor: default;",
     contentColumn: "flex: 1; display: flex; flex-direction: column; transition: background-color 0.2s ease;",
     iconColumn: "width: 44px; flex-shrink: 0; font-size: 20px; color: #666;",
     
@@ -162,8 +162,8 @@ export const UI_STYLES = {
     
     // Existing styles
     settingsArrow: "font-size: 12px; color: #888; transition: all 0.2s ease; margin-left: auto; padding: 4px;",
-    infoBox: "background-color: #333; color: #999; padding: 5px 14px; border-radius: 4px; font-size: 11px; text-align: center; flex: 1; font-weight: 500;",
-    workerSettings: "margin: 0 12px; padding: 0 12px; background: #1e1e1e; border-radius: 4px; border: 1px solid #2a2a2a;"
+    infoBox: "color: #999; padding: 5px 14px; font-size: 11px; text-align: center; flex: 1; font-weight: 500;",
+    workerSettings: "margin: 0 12px; padding: 0 12px;"
 };
 
 export const TIMEOUTS = {
