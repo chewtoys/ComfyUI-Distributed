@@ -12,6 +12,7 @@ from .utils.logging import debug_log
 from .utils.network import cleanup_client_session
 from .workers import get_worker_manager
 from .workers.startup import delayed_auto_launch, register_async_signals, sync_cleanup
+from .upscale.job_store import ensure_tile_jobs_initialized
 from .nodes import (
     NODE_CLASS_MAPPINGS,
     NODE_DISPLAY_NAME_MAPPINGS,
@@ -41,10 +42,7 @@ atexit.register(lambda: None)  # placeholder; real cleanup in sync_cleanup
 # Initialize distributed job state on prompt_server
 prompt_server = server.PromptServer.instance
 ensure_distributed_state(prompt_server)
-
-if not hasattr(prompt_server, 'distributed_pending_tile_jobs'):
-    prompt_server.distributed_pending_tile_jobs = {}
-    prompt_server.distributed_tile_jobs_lock = asyncio.Lock()
+ensure_tile_jobs_initialized()
 
 # Worker startup
 if not os.environ.get('COMFYUI_IS_WORKER'):
