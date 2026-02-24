@@ -33,6 +33,14 @@ function setButtonClass(button, className) {
     }
 }
 
+function setButtonVisibility(button, visible) {
+    if (!button) {
+        return;
+    }
+    button.classList.toggle("is-hidden", !visible);
+    button.style.display = visible ? "" : "none";
+}
+
 export async function checkAllWorkerStatuses(extension) {
     if (_statusCheckRunning || !extension.panelElement) {
         return;
@@ -388,35 +396,36 @@ export function updateWorkerControls(extension, workerId) {
     const logBtn = document.getElementById(`log-${workerId}`);
 
     // Show log button immediately if we have log file info (even if worker is still starting)
-    if (managedInfo?.log_file && logBtn) {
-        logBtn.classList.remove("is-hidden");
-        setButtonClass(logBtn, "btn--log");
-    } else if (logBtn && !managedInfo) {
-        logBtn.classList.add("is-hidden");
+    if (logBtn) {
+        const showLog = Boolean(managedInfo?.log_file);
+        setButtonVisibility(logBtn, showLog);
+        if (showLog) {
+            setButtonClass(logBtn, "btn--log");
+        }
     }
 
     if (status?.online || managedInfo) {
         // Worker is running or we just launched it
-        launchBtn.classList.add("is-hidden");
+        setButtonVisibility(launchBtn, false);
 
         if (managedInfo) {
             // Only show stop button if we manage this worker
-            stopBtn.classList.remove("is-hidden");
+            setButtonVisibility(stopBtn, true);
             stopBtn.disabled = false;
             stopBtn.textContent = "Stop";
             setButtonClass(stopBtn, "btn--stop");
         } else {
             // Hide stop button for workers launched outside UI
-            stopBtn.classList.add("is-hidden");
+            setButtonVisibility(stopBtn, false);
         }
     } else {
         // Worker is not running
-        launchBtn.classList.remove("is-hidden");
+        setButtonVisibility(launchBtn, true);
         launchBtn.disabled = false;
         launchBtn.textContent = "Launch";
         setButtonClass(launchBtn, "btn--launch");
 
-        stopBtn.classList.add("is-hidden");
+        setButtonVisibility(stopBtn, false);
     }
 }
 
@@ -539,12 +548,18 @@ export function toggleWorkerExpanded(extension, workerId) {
     if (extension.state.isWorkerExpanded(workerId)) {
         extension.state.setWorkerExpanded(workerId, false);
         settingsDiv.classList.remove("expanded");
+        settingsDiv.style.padding = "0 12px";
+        settingsDiv.style.marginTop = "0";
+        settingsDiv.style.marginBottom = "0";
         if (settingsArrow) {
             settingsArrow.classList.remove("settings-arrow--expanded");
         }
     } else {
         extension.state.setWorkerExpanded(workerId, true);
         settingsDiv.classList.add("expanded");
+        settingsDiv.style.padding = "12px";
+        settingsDiv.style.marginTop = "8px";
+        settingsDiv.style.marginBottom = "8px";
         if (settingsArrow) {
             settingsArrow.classList.add("settings-arrow--expanded");
         }

@@ -15,7 +15,12 @@ export function updateWorkerCard(extension, workerId, newStatus = {}) {
         return false;
     }
 
-    if (newStatus.online && newStatus.processing) {
+    const workerState = extension.state.getWorker(workerId);
+    const isLaunching = Boolean(workerState?.launching);
+
+    if (isLaunching && !newStatus.online) {
+        extension.ui.updateStatusDot(workerId, STATUS_COLORS.PROCESSING_YELLOW, "Launching...", true);
+    } else if (newStatus.online && newStatus.processing) {
         const queue = newStatus.queueCount || 0;
         extension.ui.updateStatusDot(workerId, STATUS_COLORS.PROCESSING_YELLOW, `Online - Processing (${queue} in queue)`, false);
     } else if (newStatus.online) {

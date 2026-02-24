@@ -149,6 +149,9 @@ export async function saveWorkerSettings(extension, workerId) {
             life: 3000,
         });
 
+        // Keep post-save card height consistent with the default collapsed layout.
+        extension.state.setWorkerExpanded(workerId, false);
+
         // Refresh the UI
         if (extension.panelElement) {
             renderSidebarContent(extension, extension.panelElement);

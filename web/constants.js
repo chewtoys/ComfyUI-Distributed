@@ -106,7 +106,9 @@ export const PULSE_ANIMATION_CSS = `
     .worker-settings.expanded {
         max-height: 500px;
         opacity: 1;
-        padding: 12px 0;
+        padding: 12px;
+        margin-top: 8px;
+        margin-bottom: 8px;
     }
 
     /* Cloudflare tunnel spinner */
