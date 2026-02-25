@@ -2,4 +2,8 @@ bin/
 logs/
 gpu_config.json
 __pycache__/
+**/__pycache__/
+*.py[cod]
+node_modules/
+npm-debug.log*
 AGENTS.md
