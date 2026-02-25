@@ -1,0 +1,12 @@
+{
+  "name": "comfyui-distributed-web-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:web": "bash ./scripts/test-web.sh",
+    "test:web:watch": "bash ./scripts/test-web.sh --watch"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.9"
+  }
+}

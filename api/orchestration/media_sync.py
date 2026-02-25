@@ -34,6 +34,10 @@ def convert_paths_for_platform(obj, target_separator):
                 is_absolute = trimmed.startswith("/") or trimmed.startswith("\\\\")
                 has_protocol = bool(re.match(r"^\w+://", trimmed))
 
+                # URLs are not local paths and should never be separator-normalized.
+                if has_protocol:
+                    return trimmed
+
                 # Keep relative media-style paths in forward-slash form (Comfy-style annotated paths).
                 if not has_drive and not is_absolute and not has_protocol and IMAGE_OR_VIDEO_RE.search(trimmed):
                     return re.sub(r"[\\]+", "/", trimmed)

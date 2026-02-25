@@ -13,3 +13,7 @@ Repository = "https://github.com/robertvoy/ComfyUI-Distributed"
 PublisherId = "robertvoy"
 DisplayName = "ComfyUI-Distributed"
 Icon = "https://raw.githubusercontent.com/robertvoy/ComfyUI-Distributed/refs/heads/main/web/distributed-logo-icon.png"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

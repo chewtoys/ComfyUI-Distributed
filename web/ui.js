@@ -55,7 +55,6 @@ const cardConfigs = {
             dynamic: true,
             initialColor: (data) => data.enabled ? STATUS_COLORS.OFFLINE_RED : STATUS_COLORS.DISABLED_GRAY,
             initialTitle: (data) => data.enabled ? "Checking status..." : "Disabled",
-            pulsing: (data) => data.enabled,
             id: (data) => `status-${data.id}`
         },
         infoText: (data, extension) => {

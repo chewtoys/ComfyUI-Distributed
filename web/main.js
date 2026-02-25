@@ -192,7 +192,7 @@ class DistributedExtension {
             if (statusDot) {
                 if (enabled) {
                     // Enabled: Start with checking state and trigger check
-                    this.ui.updateStatusDot(workerId, STATUS_COLORS.OFFLINE_RED, "Checking status...", true);
+                    this.ui.updateStatusDot(workerId, STATUS_COLORS.OFFLINE_RED, "Checking status...", false);
                     setTimeout(() => checkWorkerStatus(this, worker), TIMEOUTS.STATUS_CHECK_DELAY);
                 } else {
                     // Disabled: Set to gray

@@ -140,7 +140,8 @@ def prune_prompt_for_worker(prompt_obj):
         if node is not None:
             pruned_prompt[node_id] = json.loads(json.dumps(node))
 
-    next_id = _create_numeric_id_generator(pruned_prompt)
+    # Generate IDs from the original prompt so we never reuse IDs from pruned downstream nodes.
+    next_id = _create_numeric_id_generator(prompt_obj)
     for dist_id in distributed_ids:
         if dist_id not in pruned_prompt:
             continue
@@ -187,7 +188,8 @@ def prepare_delegate_master_prompt(prompt_obj, collector_ids):
                         f"Removed upstream reference '{input_name}' from node {node_id} for delegate-only master prompt."
                     )
 
-    next_id = _create_numeric_id_generator(pruned_prompt)
+    # Generate IDs from the original prompt to avoid ID collisions with pruned nodes.
+    next_id = _create_numeric_id_generator(prompt_obj)
     for collector_id in collector_ids:
         collector_entry = pruned_prompt.get(collector_id)
         if not collector_entry:

@@ -143,7 +143,9 @@ def _load_worker_routes_module():
     server_module.PromptServer = types.SimpleNamespace(instance=types.SimpleNamespace(routes=_Routes()))
     sys.modules["server"] = server_module
 
+    created_torch_stub = False
     if "torch" not in sys.modules:
+        created_torch_stub = True
         torch_module = types.ModuleType("torch")
         torch_module.cuda = types.SimpleNamespace(
             is_available=lambda: False,
@@ -219,6 +221,8 @@ def _load_worker_routes_module():
 
     if created_aiohttp_stub:
         sys.modules.pop("aiohttp", None)
+    if created_torch_stub:
+        sys.modules.pop("torch", None)
 
     return module
 

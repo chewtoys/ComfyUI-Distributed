@@ -74,7 +74,9 @@ def _load_job_routes_module():
     sys.modules["server"] = server_module
 
     # torch stub (only needed to satisfy import)
+    created_torch_stub = False
     if "torch" not in sys.modules:
+        created_torch_stub = True
         torch_module = types.ModuleType("torch")
         torch_module.cuda = types.SimpleNamespace(
             is_available=lambda: False,
@@ -84,7 +86,9 @@ def _load_job_routes_module():
         sys.modules["torch"] = torch_module
 
     # PIL stub (only needed to satisfy import)
+    created_pil_stub = False
     if "PIL" not in sys.modules:
+        created_pil_stub = True
         pil_module = types.ModuleType("PIL")
         image_module = types.ModuleType("PIL.Image")
         pil_module.Image = image_module
@@ -165,6 +169,11 @@ def _load_job_routes_module():
 
     if created_aiohttp_stub:
         sys.modules.pop("aiohttp", None)
+    if created_torch_stub:
+        sys.modules.pop("torch", None)
+    if created_pil_stub:
+        sys.modules.pop("PIL.Image", None)
+        sys.modules.pop("PIL", None)
 
     return module
 
