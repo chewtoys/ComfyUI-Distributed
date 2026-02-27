@@ -9,13 +9,13 @@ import time
 from aiohttp import web
 import server
 import torch
+import numpy as np
 from PIL import Image
 
 from ..utils.logging import debug_log
 from ..utils.image import pil_to_tensor, ensure_contiguous
 from ..utils.network import handle_api_error
 from ..utils.constants import JOB_INIT_GRACE_PERIOD, MEMORY_CLEAR_DELAY
-from ..utils.async_helpers import queue_prompt_payload
 try:
     from .queue_orchestration import ensure_distributed_state, orchestrate_distributed_execution
 except ImportError:
@@ -131,6 +131,55 @@ def _decode_canonical_png_tensor(image_payload):
         return ensure_contiguous(tensor)
     except Exception as exc:
         raise ValueError(f"Failed to decode PNG image payload: {exc}") from exc
+
+
+def _decode_audio_payload(audio_payload):
+    """Decode canonical audio payload into an AUDIO dict."""
+    if audio_payload is None:
+        return None
+    if not isinstance(audio_payload, dict):
+        raise ValueError("Field 'audio' must be an object when provided.")
+
+    encoded = audio_payload.get("data")
+    shape = audio_payload.get("shape")
+    sample_rate = audio_payload.get("sample_rate", 44100)
+
+    if not isinstance(encoded, str) or not encoded.strip():
+        raise ValueError("Field 'audio.data' must be a non-empty base64 string.")
+    if not isinstance(shape, list) or len(shape) != 3:
+        raise ValueError("Field 'audio.shape' must be a 3-item list [batch, channels, samples].")
+
+    try:
+        shape_tuple = tuple(int(dim) for dim in shape)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Field 'audio.shape' must contain integers.") from exc
+    if any(dim < 0 for dim in shape_tuple):
+        raise ValueError("Field 'audio.shape' dimensions must be non-negative.")
+
+    try:
+        sample_rate = int(sample_rate)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Field 'audio.sample_rate' must be an integer.") from exc
+    if sample_rate <= 0:
+        raise ValueError("Field 'audio.sample_rate' must be positive.")
+
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("Field 'audio.data' is not valid base64.") from exc
+
+    expected_bytes = int(np.prod(shape_tuple, dtype=np.int64)) * 4
+    if len(raw) != expected_bytes:
+        raise ValueError(
+            f"Field 'audio.data' byte size mismatch: expected {expected_bytes}, got {len(raw)}."
+        )
+
+    array = np.frombuffer(raw, dtype=np.float32).reshape(shape_tuple)
+    waveform = torch.from_numpy(array.copy())
+    return {
+        "waveform": ensure_contiguous(waveform),
+        "sample_rate": sample_rate,
+    }
 
 
 @server.PromptServer.instance.routes.post("/distributed/prepare_job")
@@ -277,6 +326,7 @@ async def job_complete_endpoint(request):
         worker_id = data.get("worker_id")
         batch_idx = data.get("batch_idx")
         image_payload = data.get("image")
+        audio_payload = data.get("audio")
         is_last = data.get("is_last")
 
         errors = []
@@ -288,12 +338,15 @@ async def job_complete_endpoint(request):
             errors.append("batch_idx: expected non-negative integer")
         if not isinstance(image_payload, str) or not image_payload.strip():
             errors.append("image: expected non-empty base64 PNG string")
+        if audio_payload is not None and not isinstance(audio_payload, dict):
+            errors.append("audio: expected object when provided")
         if not isinstance(is_last, bool):
             errors.append("is_last: expected boolean")
         if errors:
             return await handle_api_error(request, errors, 400)
 
         tensor = _decode_canonical_png_tensor(image_payload)
+        decoded_audio = _decode_audio_payload(audio_payload) if audio_payload is not None else None
         multi_job_id = job_id.strip()
         worker_id = worker_id.strip()
 
@@ -310,7 +363,7 @@ async def job_complete_endpoint(request):
                             "worker_id": worker_id,
                             "image_index": int(batch_idx),
                             "is_last": is_last,
-                            "audio": None,
+                            "audio": decoded_audio,
                         }
                     )
                     queue_size = pending.qsize()

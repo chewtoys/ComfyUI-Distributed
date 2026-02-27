@@ -132,7 +132,8 @@ async def _prepare_worker_payload(
     async with worker_prep_semaphore:
         worker_prompt = prompt_index.copy_prompt()
 
-        is_remote_like = bool(worker.get("host"))
+        worker_type = str(worker.get("type") or "local").strip().lower()
+        is_remote_like = bool(worker.get("host")) and worker_type != "local"
         if is_remote_like:
             path_separator = await fetch_worker_path_separator(worker, trace_execution_id=trace_execution_id)
             if path_separator:

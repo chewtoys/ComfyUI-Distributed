@@ -22,7 +22,7 @@ from ..workers.detection import (
     is_docker_environment,
     is_runpod_environment,
 )
-from ..utils.async_helpers import queue_prompt_payload
+from ..utils.async_helpers import PromptValidationError, queue_prompt_payload
 
 
 @server.PromptServer.instance.routes.get("/distributed/worker_ws")
@@ -74,6 +74,15 @@ async def worker_ws_endpoint(request):
                     "request_id": data.get("request_id"),
                     "ok": True,
                     "prompt_id": prompt_id,
+                })
+            except PromptValidationError as exc:
+                await ws.send_json({
+                    "type": "dispatch_ack",
+                    "request_id": data.get("request_id"),
+                    "ok": False,
+                    "error": str(exc),
+                    "validation_error": exc.validation_error,
+                    "node_errors": exc.node_errors,
                 })
             except Exception as exc:
                 await ws.send_json({

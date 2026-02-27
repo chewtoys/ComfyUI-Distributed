@@ -79,7 +79,14 @@ async def _dispatch_via_websocket(worker_url, payload, client_id, timeout=60.0):
                 if data.get("type") == "dispatch_ack" and data.get("request_id") == request_id:
                     if data.get("ok"):
                         return
-                    raise RuntimeError(data.get("error") or "Worker rejected websocket dispatch.")
+                    error_text = data.get("error") or "Worker rejected websocket dispatch."
+                    validation_error = data.get("validation_error")
+                    node_errors = data.get("node_errors")
+                    if validation_error:
+                        error_text = f"{error_text} | validation_error={validation_error}"
+                    if node_errors:
+                        error_text = f"{error_text} | node_errors={node_errors}"
+                    raise RuntimeError(error_text)
             elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
                 raise RuntimeError(f"Worker websocket closed unexpectedly: {msg.type}")
 

@@ -56,6 +56,54 @@ def run_async_in_server_loop(coro: Coroutine, timeout: Optional[float] = None) -
 prompt_server = server.PromptServer.instance
 
 
+def _summarize_node_errors(node_errors: dict) -> str:
+    if not isinstance(node_errors, dict) or not node_errors:
+        return ""
+
+    parts = []
+    for node_id, entry in node_errors.items():
+        if not isinstance(entry, dict):
+            continue
+        class_type = str(entry.get("class_type") or "UnknownNode")
+        for err in entry.get("errors", []):
+            if not isinstance(err, dict):
+                continue
+            message = str(err.get("message") or "validation error")
+            details = str(err.get("details") or "").strip()
+            parts.append(
+                f"{class_type}#{node_id}: {message}{f' ({details})' if details else ''}"
+            )
+            if len(parts) >= 5:
+                return " | ".join(parts)
+    return " | ".join(parts)
+
+
+class PromptValidationError(RuntimeError):
+    """Raised when a prompt fails ComfyUI validation with structured context."""
+
+    def __init__(self, error_payload, node_errors=None):
+        payload = error_payload if isinstance(error_payload, dict) else {
+            "type": "prompt_validation_failed",
+            "message": str(error_payload),
+            "details": "",
+            "extra_info": {},
+        }
+        self.validation_error = dict(payload)
+        self.node_errors = node_errors if isinstance(node_errors, dict) else {}
+
+        if self.node_errors:
+            details = str(self.validation_error.get("details") or "").strip()
+            if not details:
+                summary = _summarize_node_errors(self.node_errors)
+                if summary:
+                    self.validation_error["details"] = summary
+
+        merged = dict(self.validation_error)
+        if self.node_errors:
+            merged["node_errors"] = self.node_errors
+        super().__init__(f"Invalid prompt: {merged}")
+
+
 async def queue_prompt_payload(prompt_obj, workflow_meta=None, client_id=None):
     """Validate and queue a prompt via ComfyUI's prompt queue."""
     payload = {"prompt": prompt_obj}
@@ -65,7 +113,9 @@ async def queue_prompt_payload(prompt_obj, workflow_meta=None, client_id=None):
     prompt_id = str(uuid.uuid4())
     valid = await execution.validate_prompt(prompt_id, prompt, None)
     if not valid[0]:
-        raise RuntimeError(f"Invalid prompt: {valid[1]}")
+        error_payload = valid[1] if len(valid) > 1 else "Prompt outputs failed validation"
+        node_errors = valid[3] if len(valid) > 3 else {}
+        raise PromptValidationError(error_payload, node_errors)
 
     extra_data = {}
     if workflow_meta:

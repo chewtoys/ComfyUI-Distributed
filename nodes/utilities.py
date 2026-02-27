@@ -4,20 +4,20 @@ import json
 from ..utils.logging import debug_log, log
 
 
-def _divide_and_pad(items: list, n_workers: int) -> list[list]:
-    """Split items across n_workers buckets, padding each to length 10 with the last item."""
-    if not items:
-        return [[] for _ in range(max(1, n_workers))]
+def _chunk_bounds(total_items: int, n_splits: int) -> list[tuple[int, int]]:
+    """Return contiguous [start, end) bounds for n_splits chunks."""
+    split_count = max(1, int(n_splits))
+    total = max(0, int(total_items))
+    base, remainder = divmod(total, split_count)
 
-    buckets = [[] for _ in range(max(1, n_workers))]
-    for i, item in enumerate(items):
-        buckets[i % len(buckets)].append(item)
-
-    for bucket in buckets:
-        while len(bucket) < 10:
-            bucket.append(bucket[-1] if bucket else items[-1])
-
-    return buckets
+    bounds: list[tuple[int, int]] = []
+    start = 0
+    for idx in range(split_count):
+        size = base + (1 if idx < remainder else 0)
+        end = start + size
+        bounds.append((start, end))
+        start = end
+    return bounds
 
 
 class DistributedSeed:
@@ -176,23 +176,11 @@ class ImageBatchDivider:
     CATEGORY = "image"
     
     def divide_batch(self, images, divide_by):
-        import torch
-
         total_splits = max(1, min(int(divide_by), 10))
         total_frames = images.shape[0]
-
-        if total_frames > 0:
-            frame_indices = list(range(total_frames))
-            buckets = _divide_and_pad(frame_indices, total_splits)
-            outputs = [images[bucket] for bucket in buckets]
-            empty_tensor = torch.zeros(
-                (1, images.shape[1], images.shape[2], images.shape[3]),
-                dtype=images.dtype,
-                device=images.device,
-            )
-        else:
-            outputs = []
-            empty_tensor = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
+        empty_tensor = images[:0]
+        bounds = _chunk_bounds(total_frames, total_splits)
+        outputs = [images[start:end] if end > start else empty_tensor for start, end in bounds]
 
         while len(outputs) < 10:
             outputs.append(empty_tensor)
@@ -237,23 +225,21 @@ class AudioBatchDivider:
             return tuple([empty_audio] * 10)
 
         total_splits = max(1, min(int(divide_by), 10))
-
-        # Waveform shape: [batch, channels, samples]
-        total_samples = waveform.shape[-1]
-        sample_indices = list(range(total_samples))
-        buckets = _divide_and_pad(sample_indices, total_splits)
+        total_samples = int(waveform.shape[-1])
+        bounds = _chunk_bounds(total_samples, total_splits)
 
         outputs = []
-        for bucket in buckets:
+        empty_waveform = waveform[..., :0]
+        for start, end in bounds:
+            split_waveform = waveform[..., start:end] if end > start else empty_waveform
             outputs.append({
-                "waveform": waveform[..., bucket],
+                "waveform": split_waveform,
                 "sample_rate": sample_rate
             })
 
         # Pad with empty audio up to max (10) to match RETURN_TYPES length
         empty_audio = {
-            "waveform": torch.zeros(waveform.shape[0], waveform.shape[1], 1,
-                                    dtype=waveform.dtype, device=waveform.device),
+            "waveform": empty_waveform,
             "sample_rate": sample_rate
         }
 

@@ -2,9 +2,14 @@ import importlib.util
 import sys
 import types
 import unittest
+import asyncio
+import base64
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+
+import numpy as np
+import torch
 
 
 class _FakeResponse:
@@ -223,6 +228,53 @@ class DistributedQueueEndpointTests(unittest.IsolatedAsyncioTestCase):
         response = await job_routes.distributed_queue_endpoint(request)
         self.assertEqual(response.status, 400)
         self.assertIn("enabled_worker_ids", response.payload.get("message", "").lower())
+
+
+class JobCompleteAudioPayloadTests(unittest.IsolatedAsyncioTestCase):
+    def _encoded_audio_payload(self):
+        waveform = np.arange(8, dtype=np.float32).reshape(1, 2, 4)
+        return {
+            "sample_rate": 44100,
+            "shape": [1, 2, 4],
+            "dtype": "float32",
+            "data": base64.b64encode(waveform.tobytes()).decode("ascii"),
+        }
+
+    async def test_job_complete_accepts_audio_payload(self):
+        queue = asyncio.Queue()
+        job_routes.prompt_server.distributed_jobs_lock = asyncio.Lock()
+        job_routes.prompt_server.distributed_pending_jobs = {"job-1": queue}
+        request = _FakeRequest(
+            {
+                "job_id": "job-1",
+                "worker_id": "worker-1",
+                "batch_idx": 0,
+                "image": "data:image/png;base64,AAAA",
+                "audio": self._encoded_audio_payload(),
+                "is_last": True,
+            }
+        )
+
+        with patch.object(job_routes, "_decode_canonical_png_tensor", return_value="tensor-data"):
+            response = await job_routes.job_complete_endpoint(request)
+
+        self.assertEqual(response.status, 200)
+        queued = await queue.get()
+        self.assertEqual(queued["worker_id"], "worker-1")
+        self.assertTrue(queued["is_last"])
+        self.assertIsNotNone(queued["audio"])
+        self.assertEqual(queued["audio"]["sample_rate"], 44100)
+        self.assertEqual(tuple(queued["audio"]["waveform"].shape), (1, 2, 4))
+
+    def test_decode_audio_payload_rejects_bad_shape(self):
+        bad = {
+            "sample_rate": 44100,
+            "shape": [1, 2],
+            "dtype": "float32",
+            "data": base64.b64encode(b"\x00\x00\x00\x00").decode("ascii"),
+        }
+        with self.assertRaises(ValueError):
+            job_routes._decode_audio_payload(bad)
 
 
 if __name__ == "__main__":

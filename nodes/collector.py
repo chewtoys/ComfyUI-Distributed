@@ -1,5 +1,4 @@
 import torch
-import numpy as np
 import io
 import json
 import asyncio
@@ -67,9 +66,7 @@ class DistributedCollectorNode:
         if batch_size == 0:
             return
 
-        if audio is not None:
-            # Canonical /distributed/job_complete transport currently only carries image payloads.
-            debug_log("Worker - Audio payload is not submitted via /distributed/job_complete canonical envelope")
+        encoded_audio = self._encode_audio_payload(audio)
 
         session = await get_client_session()
         url = f"{master_url}/distributed/job_complete"
@@ -85,6 +82,8 @@ class DistributedCollectorNode:
                 "image": f"data:image/png;base64,{encoded_image}",
                 "is_last": bool(batch_idx == batch_size - 1),
             }
+            if payload["is_last"] and encoded_audio is not None:
+                payload["audio"] = encoded_audio
 
             try:
                 async with session.post(
@@ -97,6 +96,30 @@ class DistributedCollectorNode:
                 log(f"Worker - Failed to send canonical image envelope to master: {e}")
                 debug_log(f"Worker - Full error details: URL={url}")
                 raise  # Re-raise to handle at caller level
+
+    def _encode_audio_payload(self, audio):
+        """Serialize AUDIO dict into a JSON-safe payload for canonical job_complete envelopes."""
+        if not isinstance(audio, dict):
+            return None
+
+        waveform = audio.get("waveform")
+        if waveform is None or not isinstance(waveform, torch.Tensor) or waveform.numel() == 0:
+            return None
+
+        sample_rate = audio.get("sample_rate", 44100)
+        try:
+            sample_rate = int(sample_rate)
+        except (TypeError, ValueError):
+            sample_rate = 44100
+
+        waveform_cpu = waveform.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        data_bytes = waveform_cpu.numpy().tobytes()
+        return {
+            "sample_rate": sample_rate,
+            "shape": [int(dim) for dim in waveform_cpu.shape],
+            "dtype": "float32",
+            "data": base64.b64encode(data_bytes).decode("ascii"),
+        }
 
     def _combine_audio(self, master_audio, worker_audio, empty_audio):
         """Combine audio from master and workers into a single audio output."""
