@@ -135,6 +135,10 @@ export function createApiClient(baseUrl) {
         async getWorkerLog(workerId, lines = 1000) {
             return request(`/distributed/worker_log/${workerId}?lines=${lines}`);
         },
+
+        async getRemoteWorkerLog(workerId, lines = 300) {
+            return request(`/distributed/remote_worker_log/${workerId}?lines=${lines}`);
+        },
         
         async clearLaunchingFlag(workerId) {
             return request('/distributed/worker/clear_launching', {

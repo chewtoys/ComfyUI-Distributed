@@ -205,6 +205,8 @@ export const ENDPOINTS = {
     STOP_WORKER: '/distributed/stop_worker',
     MANAGED_WORKERS: '/distributed/managed_workers',
     WORKER_LOG: '/distributed/worker_log',
+    REMOTE_WORKER_LOG: '/distributed/remote_worker_log',
+    LOCAL_LOG: '/distributed/local_log',
     CLEAR_LAUNCHING: '/distributed/worker/clear_launching',
     PREPARE_JOB: '/distributed/prepare_job',
     LOAD_IMAGE: '/distributed/load_image',

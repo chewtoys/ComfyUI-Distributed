@@ -390,7 +390,7 @@ export class DistributedUI {
         statusDot.classList.toggle('status-pulsing', pulsing);
     }
 
-    showLogModal(extension, workerId, logData) {
+    showLogModal(extension, workerId, logData, fetchLog = null) {
         if (this._logModal) {
             this._logModal.unmount();
             this._logModal = null;
@@ -404,7 +404,7 @@ export class DistributedUI {
         modal.mount(document.body, {
             workerName,
             logData,
-            fetchLog: async () => extension.api.getWorkerLog(workerId, 1000),
+            fetchLog: fetchLog || (async () => extension.api.getWorkerLog(workerId, 1000)),
             onClose: () => {
                 if (this._logModal === modal) {
                     this._logModal = null;
@@ -584,12 +584,12 @@ export class DistributedUI {
             controlsWrapper.appendChild(badge);
         } else if (config.dynamic && data) {
             if (isRemote) {
-                const isCloud = data.type === 'cloud';
-                const workerTypeText = isCloud ? "Cloud worker" : "Remote worker";
-                const remoteInfo = this.createButton(workerTypeText, null, BUTTON_STYLES.info);
-                remoteInfo.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.workerControl + BUTTON_STYLES.info + " color: #999; cursor: default;";
-                remoteInfo.disabled = true;
-                controlsWrapper.appendChild(remoteInfo);
+                const logBtn = this.createButton('View Log', () => viewWorkerLog(extension, data.id, true));
+                logBtn.id = `log-${data.id}`;
+                logBtn.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.workerControl;
+                logBtn.classList.add("btn--log");
+                logBtn.title = "View remote worker log";
+                controlsWrapper.appendChild(logBtn);
             } else {
                 const controls = this.createWorkerControls(data.id, {
                     launch: () => launchWorker(extension, data.id),

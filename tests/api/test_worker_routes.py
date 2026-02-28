@@ -4,6 +4,7 @@ import sys
 import tempfile
 import types
 import unittest
+from collections import deque
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +23,35 @@ class _FakeRequest:
 
     async def json(self):
         return self._payload
+
+
+class _FakeHTTPClientResponse:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status = status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, _exc_type, _exc, _tb):
+        return False
+
+    async def json(self):
+        return self._payload
+
+    async def text(self):
+        return str(self._payload)
+
+
+class _FakeHTTPClientSession:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self._status = status
+        self.calls = []
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append({"url": url, "params": params, "timeout": timeout})
+        return _FakeHTTPClientResponse(self._payload, status=self._status)
 
 
 class _DummyWorkerManager:
@@ -294,6 +324,78 @@ class WorkerRoutesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.payload.get("status"), "success")
         self.assertIn("content", response.payload)
         self.assertIn("line-3", response.payload["content"])
+
+    async def test_local_log_reads_memory_buffer(self):
+        request = _FakeRequest(query={"lines": "2"})
+        fake_logs = deque(
+            [
+                {"m": "line-1\n"},
+                {"m": "line-2\n"},
+                {"m": "line-3\n"},
+            ],
+            maxlen=300,
+        )
+        app_module = types.ModuleType("app")
+        app_module.__path__ = []
+        logger_module = types.ModuleType("app.logger")
+        logger_module.get_logs = lambda: fake_logs
+        app_module.logger = logger_module
+
+        with patch.dict(sys.modules, {"app": app_module, "app.logger": logger_module}):
+            response = await worker_routes.get_local_log_endpoint(request)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.payload.get("status"), "success")
+        self.assertEqual(response.payload.get("source"), "memory")
+        self.assertEqual(response.payload.get("entries"), 2)
+        self.assertIn("line-3", response.payload.get("content", ""))
+
+    async def test_remote_worker_log_proxies_to_worker_local_log_endpoint(self):
+        config = {
+            "workers": [
+                {
+                    "id": "worker-remote",
+                    "name": "Remote Worker",
+                    "host": "worker.example.com",
+                    "port": 8188,
+                    "type": "remote",
+                }
+            ]
+        }
+        request = _FakeRequest(match_info={"worker_id": "worker-remote"}, query={"lines": "120"})
+        proxied_payload = {
+            "status": "success",
+            "content": "remote-log-content\n",
+            "entries": 1,
+            "source": "memory",
+            "truncated": False,
+            "lines_shown": 1,
+        }
+        fake_session = _FakeHTTPClientSession(proxied_payload)
+
+        async def _fake_get_client_session():
+            return fake_session
+
+        with patch.object(worker_routes, "load_config", return_value=config), patch.object(
+            worker_routes, "get_client_session", side_effect=_fake_get_client_session
+        ):
+            response = await worker_routes.get_remote_worker_log_endpoint(request)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.payload.get("content"), "remote-log-content\n")
+        self.assertEqual(len(fake_session.calls), 1)
+        self.assertEqual(fake_session.calls[0]["params"], {"lines": "120"})
+        self.assertTrue(fake_session.calls[0]["url"].endswith("/distributed/local_log"))
+
+    async def test_remote_worker_log_rejects_local_workers(self):
+        config = {"workers": [{"id": "worker-local", "name": "Local Worker", "port": 8188}]}
+        request = _FakeRequest(match_info={"worker_id": "worker-local"})
+
+        with patch.object(worker_routes, "load_config", return_value=config):
+            response = await worker_routes.get_remote_worker_log_endpoint(request)
+
+        self.assertEqual(response.status, 400)
+        self.assertIn("local", response.payload.get("message", "").lower())
 
 
 if __name__ == "__main__":

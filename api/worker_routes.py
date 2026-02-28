@@ -13,7 +13,13 @@ import server
 
 from ..utils.config import load_config
 from ..utils.logging import debug_log, log
-from ..utils.network import build_worker_url, handle_api_error, normalize_host, probe_worker
+from ..utils.network import (
+    build_worker_url,
+    get_client_session,
+    handle_api_error,
+    normalize_host,
+    probe_worker,
+)
 from ..utils.constants import CHUNK_SIZE
 from ..workers import get_worker_manager
 from .schemas import require_fields, validate_worker_id
@@ -319,6 +325,71 @@ def _read_worker_log_sync(log_file, lines_to_read):
     }
 
 
+def _parse_positive_int_query(value, default, minimum=1, maximum=10000):
+    """Parse bounded positive integer query params with sane fallback."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
+def _find_worker_by_id(config, worker_id):
+    worker_id_str = str(worker_id).strip()
+    for worker in config.get("workers", []):
+        if str(worker.get("id")).strip() == worker_id_str:
+            return worker
+    return None
+
+
+@server.PromptServer.instance.routes.get("/distributed/local_log")
+async def get_local_log_endpoint(request):
+    """Return this instance's in-memory ComfyUI log buffer."""
+    try:
+        from app.logger import get_logs
+    except Exception as e:
+        return await handle_api_error(request, f"Failed to import app.logger: {e}", 500)
+
+    try:
+        lines_to_read = _parse_positive_int_query(request.query.get("lines"), default=300, maximum=3000)
+        logs = get_logs()
+        if logs is None:
+            return web.json_response(
+                {
+                    "status": "success",
+                    "content": "",
+                    "entries": 0,
+                    "source": "memory",
+                    "truncated": False,
+                    "lines_shown": 0,
+                }
+            )
+
+        entries = list(logs)
+        selected_entries = entries[-lines_to_read:]
+        content = "".join(
+            entry.get("m", "") if isinstance(entry, dict) else str(entry)
+            for entry in selected_entries
+        )
+        lines_shown = content.count("\n") + (1 if content else 0)
+
+        return web.json_response(
+            {
+                "status": "success",
+                "content": content,
+                "entries": len(selected_entries),
+                "source": "memory",
+                "truncated": len(entries) > len(selected_entries),
+                "lines_shown": lines_shown,
+            }
+        )
+    except Exception as e:
+        return await handle_api_error(request, e, 500)
+
+
 @server.PromptServer.instance.routes.get("/distributed/network_info")
 async def get_network_info_endpoint(request):
     """Get network interfaces and recommend best IP for master."""
@@ -553,7 +624,7 @@ async def get_worker_log_endpoint(request):
             return await handle_api_error(request, "Log file not found", 404)
         
         # Read last N lines (or full file if small)
-        lines_to_read = int(request.query.get('lines', 1000))
+        lines_to_read = _parse_positive_int_query(request.query.get('lines'), default=1000)
         
         try:
             loop = asyncio.get_running_loop()
@@ -571,5 +642,54 @@ async def get_worker_log_endpoint(request):
         except Exception as e:
             return await handle_api_error(request, f"Error reading log file: {str(e)}", 500)
             
+    except Exception as e:
+        return await handle_api_error(request, e, 500)
+
+
+@server.PromptServer.instance.routes.get("/distributed/remote_worker_log/{worker_id}")
+async def get_remote_worker_log_endpoint(request):
+    """Proxy a remote worker log request to the worker's local in-memory log endpoint."""
+    try:
+        worker_id = str(request.match_info["worker_id"]).strip()
+        config = load_config()
+        worker = _find_worker_by_id(config, worker_id)
+        if not worker:
+            return await handle_api_error(request, f"Worker {worker_id} not found", 404)
+
+        # Remote log proxy is only meaningful for remote/cloud workers.
+        host = normalize_host(worker.get("host")) or ""
+        if not host:
+            return await handle_api_error(
+                request,
+                f"Worker {worker_id} is local; use /distributed/worker_log/{worker_id} instead.",
+                400,
+            )
+
+        lines_to_read = _parse_positive_int_query(request.query.get("lines"), default=300, maximum=3000)
+        worker_url = build_worker_url(worker, "/distributed/local_log")
+        session = await get_client_session()
+        async with session.get(
+            worker_url,
+            params={"lines": str(lines_to_read)},
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            if resp.status >= 400:
+                body = await resp.text()
+                return await handle_api_error(
+                    request,
+                    f"Remote worker {worker_id} returned HTTP {resp.status}: {body[:400]}",
+                    resp.status,
+                )
+
+            try:
+                data = await resp.json()
+            except Exception as e:
+                return await handle_api_error(
+                    request,
+                    f"Remote worker {worker_id} returned invalid JSON: {e}",
+                    502,
+                )
+
+        return web.json_response(data)
     except Exception as e:
         return await handle_api_error(request, e, 500)

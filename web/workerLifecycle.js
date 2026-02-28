@@ -381,19 +381,26 @@ export function updateWorkerControls(extension, workerId) {
         return;
     }
 
-    // Skip button updates for remote workers
+    // Update button states - buttons are now inside a wrapper div
+    const launchBtn = document.getElementById(`launch-${workerId}`);
+    const stopBtn = document.getElementById(`stop-${workerId}`);
+    const logBtn = document.getElementById(`log-${workerId}`);
+
     if (isRemoteWorker(extension, worker)) {
+        setButtonVisibility(launchBtn, false);
+        setButtonVisibility(stopBtn, false);
+        if (logBtn) {
+            setButtonVisibility(logBtn, true);
+            logBtn.disabled = false;
+            logBtn.textContent = "View Log";
+            setButtonClass(logBtn, "btn--log");
+        }
         return;
     }
 
     // Ensure we check for string ID
     const managedInfo = extension.state.getWorker(workerId).managed;
     const status = extension.state.getWorkerStatus(workerId);
-
-    // Update button states - buttons are now inside a wrapper div
-    const launchBtn = document.getElementById(`launch-${workerId}`);
-    const stopBtn = document.getElementById(`stop-${workerId}`);
-    const logBtn = document.getElementById(`log-${workerId}`);
 
     // Show log button immediately if we have log file info (even if worker is still starting)
     if (logBtn) {
@@ -429,9 +436,11 @@ export function updateWorkerControls(extension, workerId) {
     }
 }
 
-export async function viewWorkerLog(extension, workerId) {
+export async function viewWorkerLog(extension, workerId, isRemote = false) {
+    const worker = extension.config.workers.find((w) => w.id === workerId);
+    const isRemoteLog = isRemote || (worker ? isRemoteWorker(extension, worker) : false);
     const managedInfo = extension.state.getWorker(workerId).managed;
-    if (!managedInfo?.log_file) {
+    if (!isRemoteLog && !managedInfo?.log_file) {
         return;
     }
 
@@ -445,11 +454,13 @@ export async function viewWorkerLog(extension, workerId) {
     }
 
     try {
-        // Fetch log content
-        const data = await extension.api.getWorkerLog(workerId, 1000);
+        const fetchLog = isRemoteLog
+            ? async () => extension.api.getRemoteWorkerLog(workerId, 300)
+            : async () => extension.api.getWorkerLog(workerId, 1000);
+        const data = await fetchLog();
 
         // Create modal dialog
-        extension.ui.showLogModal(extension, workerId, data);
+        extension.ui.showLogModal(extension, workerId, data, fetchLog);
 
         // Restore button
         if (logBtn) {
@@ -486,7 +497,11 @@ export async function refreshLog(extension, workerId, silent = false) {
     }
 
     try {
-        const data = await extension.api.getWorkerLog(workerId, 1000);
+        const worker = extension.config.workers.find((w) => w.id === workerId);
+        const isRemoteLog = worker ? isRemoteWorker(extension, worker) : false;
+        const data = isRemoteLog
+            ? await extension.api.getRemoteWorkerLog(workerId, 300)
+            : await extension.api.getWorkerLog(workerId, 1000);
 
         // Update content
         const shouldAutoScroll = logContent.scrollTop + logContent.clientHeight >= logContent.scrollHeight - 50;

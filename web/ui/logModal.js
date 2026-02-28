@@ -29,9 +29,17 @@ export function createLogModal() {
             _logContentEl.scrollTop = _logContentEl.scrollHeight;
         }
 
-        let statusText = `Log file: ${logData.log_file || 'unknown'}`;
-        if (logData.truncated) {
-            statusText += ` (showing last ${logData.lines_shown} lines of ${formatFileSize(logData.file_size || 0)})`;
+        let statusText;
+        if (logData.source === "memory") {
+            statusText = "Remote worker log (in-memory buffer)";
+            if (logData.truncated) {
+                statusText += ` (showing last ${logData.lines_shown || 0} lines)`;
+            }
+        } else {
+            statusText = `Log file: ${logData.log_file || 'unknown'}`;
+            if (logData.truncated) {
+                statusText += ` (showing last ${logData.lines_shown} lines of ${formatFileSize(logData.file_size || 0)})`;
+            }
         }
         _statusBarEl.textContent = statusText;
     };
