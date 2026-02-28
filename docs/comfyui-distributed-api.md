@@ -22,6 +22,7 @@ This document describes the **public HTTP API** added to ComfyUI-Distributed to 
   - Pings workers (`GET /prompt`) to include only reachable ones.
   - Dispatches the workflow to workers (`POST /prompt`).
   - Queues the master workflow in ComfyUI’s prompt queue.
+  - If any `DistributedCollector` has `load_balance=true`, selects one least-busy participant for this run.
 
 ### What it does *not* add
 
@@ -169,6 +170,32 @@ Legacy multipart/tensor payload formats are no longer accepted on this endpoint.
 ### CORS note
 
 If you call the API from a browser (not from a backend), ensure the master ComfyUI is started with `--enable-cors-header`.
+
+---
+
+## Log Endpoints
+
+### `GET /distributed/worker_log/{worker_id}`
+
+Read log files for workers launched locally by the master UI process manager.
+
+- Intended for managed local workers.
+- Query param: `lines` (optional, default `1000`).
+
+### `GET /distributed/local_log`
+
+Read this ComfyUI instance's in-memory runtime log buffer.
+
+- Available on any ComfyUI-Distributed instance (master or worker).
+- Query param: `lines` (optional, default `300`, max `3000`).
+
+### `GET /distributed/remote_worker_log/{worker_id}`
+
+Proxy endpoint on master that fetches logs from a configured remote/cloud worker's
+`/distributed/local_log`.
+
+- Intended for remote/cloud workers in master config.
+- Query param: `lines` (optional, default `300`, max `3000`).
 
 ---
 

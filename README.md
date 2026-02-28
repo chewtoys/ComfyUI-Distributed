@@ -34,6 +34,16 @@
 
 ---
 
+## Current Architecture
+
+- Workflow-level load balancing is controlled by **Distributed Collector** via the `load_balance` toggle.
+- There is **no Distributed Queue node** anymore.
+- With `load_balance=true`, orchestration selects one least-busy execution participant:
+  - If master participation is enabled, master is included as a candidate.
+  - If master is in orchestrator-only mode, only workers are considered.
+
+---
+
 ## Worker Types
 
 <img width="200" align="right" alt="ComfyUI_temp_khvcc_00034_@0 25x" src="https://github.com/user-attachments/assets/651e4912-7c23-4e32-bd88-250f5175e129" />
@@ -92,8 +102,9 @@ Generate multiple images in the time it takes to generate one. Each worker uses 
 1. Open your ComfyUI workflow
 2. Add **Distributed Seed** → connect to sampler's seed
 3. Add **Distributed Collector** → after VAE Decode
-4. Enable workers in the UI
-5. Run the workflow!
+4. Optional: enable `load_balance` on Distributed Collector to run on one least-busy participant
+5. Enable workers in the UI
+6. Run the workflow!
 
 ### Parallel WAN Generation
 Generate multiple videos in the time it takes to generate one. Each worker uses a different seed.
@@ -116,7 +127,7 @@ Accelerate Ultimate SD Upscaler by distributing tiles across multiple workers, w
 
 ![Clipboard Image (3)](https://github.com/user-attachments/assets/ffb57a0d-7b75-4497-96d2-875d60865a1a)
 
-> [Download workflow](/workflows/distributed-txt2img.json)
+> [Download workflow](/workflows/distributed-upscale.json)
 
 1. Load your image
 2. Upscale with ESRGAN or similar
@@ -154,13 +165,25 @@ Control your distributed cluster programmatically without opening the browser.
 
 ---
 
+## Distributed Value
+
+Use **Distributed Value** when you want per-worker overrides (for example, different prompts/models/settings per worker).
+
+- Output type adapts to the connected input where possible (`STRING`, `INT`, `FLOAT`, `COMBO`).
+- The node shows only currently enabled workers.
+- If worker enablement changes, worker fields update automatically.
+- When disconnected, it resets to default string mode and clears per-worker overrides.
+- On execution, master uses `default_value`; workers use their mapped override with typed coercion fallback to default.
+
+---
+
 ## Nodes
 
 | Node | Description |
 |------|-------------|
 | **Distributed Seed** | Generates unique seeds for each worker |
-| **Distributed Collector** | Collects results (image/video frames and optionally audio) from all workers back to the master |
-| **Distributed Queue** | Routes the entire workflow to the least-busy worker for load balancing (don't use Distributed Collector with this) |
+| **Distributed Collector** | Collects results (image/video frames and optionally audio) from workers back to the master; `load_balance` can route the run to one least-busy participant |
+| **Distributed Value** | Outputs per-worker override values with fallback to default |
 | **Ultimate SD Upscale Distributed** | Distributes upscale tiles across workers |
 | **Image Batch Divider** | Splits image batches for multi-GPU output |
 | **Audio Batch Divider** | Splits audio batches for multi-GPU output |
