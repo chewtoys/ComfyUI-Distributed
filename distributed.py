@@ -20,6 +20,7 @@ from .nodes import (
     DistributedCollectorNode,
     DistributedSeed,
     DistributedModelName,
+    DistributedValue,
     AudioBatchDivider,
     DistributedEmptyImage,
     AnyType,

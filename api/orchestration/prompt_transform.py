@@ -299,6 +299,20 @@ def _override_upscale_nodes(
             inputs["worker_id"] = participant_id
 
 
+def _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id, worker_index_map):
+    """Configure DistributedValue nodes for master or worker role."""
+    for node_id in prompt_index.nodes_for_class("DistributedValue"):
+        node = prompt_copy.get(node_id)
+        if not isinstance(node, dict):
+            continue
+        inputs = node.setdefault("inputs", {})
+        inputs["is_worker"] = not is_master
+        if is_master:
+            inputs["worker_id"] = ""
+        else:
+            inputs["worker_id"] = f"worker_{worker_index_map.get(participant_id, 0)}"
+
+
 def apply_participant_overrides(
     prompt_copy,
     participant_id,
@@ -314,6 +328,7 @@ def apply_participant_overrides(
     enabled_json = json.dumps(enabled_worker_ids)
 
     _override_seed_nodes(prompt_copy, prompt_index, is_master, participant_id, worker_index_map)
+    _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id, worker_index_map)
     _override_collector_nodes(
         prompt_copy,
         prompt_index,

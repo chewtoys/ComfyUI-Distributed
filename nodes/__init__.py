@@ -1,6 +1,7 @@
 from .utilities import (
     DistributedSeed,
     DistributedModelName,
+    DistributedValue,
     ImageBatchDivider,
     AudioBatchDivider,
     DistributedEmptyImage,
@@ -14,6 +15,7 @@ NODE_CLASS_MAPPINGS = {
     "DistributedCollector": DistributedCollectorNode,
     "DistributedSeed": DistributedSeed,
     "DistributedModelName": DistributedModelName,
+    "DistributedValue": DistributedValue,
     "ImageBatchDivider": ImageBatchDivider,
     "AudioBatchDivider": AudioBatchDivider,
     "DistributedEmptyImage": DistributedEmptyImage,
@@ -22,6 +24,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DistributedCollector": "Distributed Collector",
     "DistributedSeed": "Distributed Seed",
     "DistributedModelName": "Distributed Model Name",
+    "DistributedValue": "Distributed Value",
     "ImageBatchDivider": "Image Batch Divider",
     "AudioBatchDivider": "Audio Batch Divider",
     "DistributedEmptyImage": "Distributed Empty Image",

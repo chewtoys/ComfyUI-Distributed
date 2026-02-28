@@ -464,5 +464,30 @@ class ApplyOverridesUpscaleTests(unittest.TestCase):
         self.assertTrue(result["2"]["inputs"].get("pass_through"))
 
 
+# ---------------------------------------------------------------------------
+# apply_participant_overrides – DistributedValue
+# ---------------------------------------------------------------------------
+
+class ApplyOverridesValueTests(unittest.TestCase):
+    def _value_prompt(self):
+        return {"1": {"class_type": "DistributedValue", "inputs": {}}}
+
+    def test_worker_sets_is_worker_true(self):
+        result = _apply(self._value_prompt(), "worker-a")
+        self.assertTrue(result["1"]["inputs"]["is_worker"])
+
+    def test_worker_id_reflects_index_in_enabled_list(self):
+        result = _apply(self._value_prompt(), "worker-b", enabled_worker_ids=["worker-a", "worker-b"])
+        self.assertEqual(result["1"]["inputs"]["worker_id"], "worker_1")
+
+    def test_master_sets_is_worker_false(self):
+        result = _apply(self._value_prompt(), "master")
+        self.assertFalse(result["1"]["inputs"]["is_worker"])
+
+    def test_master_sets_empty_worker_id(self):
+        result = _apply(self._value_prompt(), "master")
+        self.assertEqual(result["1"]["inputs"]["worker_id"], "")
+
+
 if __name__ == "__main__":
     unittest.main()

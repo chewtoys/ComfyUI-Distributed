@@ -74,12 +74,92 @@ class DistributedSeed:
                 # Fallback: return original seed
                 return (seed,)
 
+
 # Define ByPassTypeTuple for flexible return types
 class AnyType(str):
     def __ne__(self, __value: object) -> bool:
         return False
 
 any_type = AnyType("*")
+
+
+class DistributedValue:
+    """
+    Outputs a different value per worker.
+    On master: returns default_value.
+    On workers: looks up the worker-specific value from a JSON map,
+    falling back to default_value if not set.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "default_value": ("STRING", {"default": ""}),
+                "worker_values": ("STRING", {"default": "{}"}),
+            },
+            "hidden": {
+                "is_worker": ("BOOLEAN", {"default": False}),
+                "worker_id": ("STRING", {"default": ""}),
+            },
+        }
+
+    RETURN_TYPES = (any_type,)
+    RETURN_NAMES = ("value",)
+    FUNCTION = "distribute"
+    CATEGORY = "utils"
+
+    @staticmethod
+    def _coerce(value, value_type):
+        """Convert a string value to the requested type."""
+        if value_type == "INT":
+            return int(float(value))
+        if value_type == "FLOAT":
+            return float(value)
+        return value  # STRING and COMBO stay as strings
+
+    @staticmethod
+    def _coerce_safe(value, value_type):
+        """Best-effort coercion with graceful fallback to original value."""
+        try:
+            return DistributedValue._coerce(value, value_type)
+        except (TypeError, ValueError):
+            return value
+
+    def distribute(self, default_value, worker_values="{}", is_worker=False, worker_id=""):
+        values = {}
+        value_type = "STRING"
+
+        try:
+            values = json.loads(worker_values) if isinstance(worker_values, str) else worker_values
+            if not isinstance(values, dict):
+                values = {}
+        except json.JSONDecodeError as e:
+            debug_log(f"DistributedValue - Error parsing worker_values: {e}")
+            values = {}
+
+        value_type = values.get("_type", "STRING")
+        coerced_default = self._coerce_safe(default_value, value_type)
+
+        if not is_worker:
+            debug_log(f"DistributedValue - Master: returning default '{coerced_default}'")
+            return (coerced_default,)
+
+        try:
+            if worker_id.startswith("worker_"):
+                idx = int(worker_id.split("_")[1])
+            else:
+                idx = int(worker_id)
+            key = str(idx + 1)  # worker_0 → key "1" (1-indexed)
+            raw = values.get(key, "")
+            if raw:
+                coerced = self._coerce(raw, value_type)
+                debug_log(f"DistributedValue - Worker {idx}: returning '{coerced}'")
+                return (coerced,)
+        except (ValueError, IndexError) as e:
+            debug_log(f"DistributedValue - Error: {e}")
+        debug_log(f"DistributedValue - Worker fallback: returning default '{coerced_default}'")
+        return (coerced_default,)
 
 class DistributedModelName:
     @classmethod
