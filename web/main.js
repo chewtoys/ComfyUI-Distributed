@@ -13,6 +13,8 @@ import { checkAllWorkerStatuses, checkWorkerStatus, loadManagedWorkers } from '.
 import { detectMasterIP } from './masterDetection.js';
 import { parseHostInput, getMasterUrl as buildMasterUrl } from './urlUtils.js';
 
+const WORKERS_CHANGED_EVENT = "distributed:workers-changed";
+
 class DistributedExtension {
     constructor() {
         this.config = null;
@@ -150,10 +152,20 @@ class DistributedExtension {
                     this.state.updateWorker(w.id, { enabled: w.enabled });
                 });
             }
+            this._emitWorkersChanged();
         } catch (error) {
             this.log("Failed to load config: " + error.message, "error");
             this.config = { workers: [], settings: { has_auto_populated_workers: false } };
         }
+    }
+
+    _emitWorkersChanged() {
+        if (typeof window === "undefined" || typeof window.dispatchEvent !== "function") {
+            return;
+        }
+        window.dispatchEvent(new CustomEvent(WORKERS_CHANGED_EVENT, {
+            detail: { workers: this.config?.workers || [] },
+        }));
     }
 
     _applyMasterHost(host) {
@@ -187,6 +199,7 @@ class DistributedExtension {
         if (worker) {
             worker.enabled = enabled;
             this.state.updateWorker(workerId, { enabled });
+            this._emitWorkersChanged();
 
             // Immediately update status dot based on enabled state
             const statusDot = document.getElementById(`status-${workerId}`);

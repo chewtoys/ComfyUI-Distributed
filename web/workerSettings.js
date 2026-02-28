@@ -3,6 +3,17 @@ import { generateUUID } from './constants.js';
 import { parseHostInput } from './urlUtils.js';
 import { toggleWorkerExpanded } from './workerLifecycle.js';
 
+const WORKERS_CHANGED_EVENT = "distributed:workers-changed";
+
+function emitWorkersChanged(extension) {
+    if (typeof window === "undefined" || typeof window.dispatchEvent !== "function") {
+        return;
+    }
+    window.dispatchEvent(new CustomEvent(WORKERS_CHANGED_EVENT, {
+        detail: { workers: extension.config?.workers || [] },
+    }));
+}
+
 export function isRemoteWorker(extension, worker) {
     const workerType = String(worker?.type || "").toLowerCase();
 
@@ -158,6 +169,7 @@ export async function saveWorkerSettings(extension, workerId) {
 
         // Sync to state
         extension.state.updateWorker(workerId, { enabled: nextEnabled });
+        emitWorkersChanged(extension);
 
         extension.app.extensionManager.toast.add({
             severity: "success",
@@ -225,6 +237,7 @@ export async function deleteWorker(extension, workerId) {
         if (index !== -1) {
             extension.config.workers.splice(index, 1);
         }
+        emitWorkersChanged(extension);
 
         extension.app.extensionManager.toast.add({
             severity: "success",
@@ -325,6 +338,7 @@ export async function addNewWorker(extension) {
 
         // Sync to state
         extension.state.updateWorker(newId, { enabled: newWorker.enabled });
+        emitWorkersChanged(extension);
 
         extension.app.extensionManager.toast.add({
             severity: fallbackToRemote ? "warn" : "success",

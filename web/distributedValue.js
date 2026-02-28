@@ -5,13 +5,22 @@ const NODE_CLASS = "DistributedValue";
 const CONVERTED_WIDGET = "converted-widget";
 const DYNAMIC_DEFAULT_WIDGET = "_dv_default";
 const DYNAMIC_WORKER_WIDGET_PREFIX = "_dv_worker_";
+const WORKERS_CHANGED_EVENT = "distributed:workers-changed";
+
+const trackedNodes = new Set();
+let workersChangedListenerAttached = false;
+
+function filterEnabledWorkers(workers) {
+    if (!Array.isArray(workers)) return [];
+    return workers.filter((worker) => Boolean(worker?.enabled));
+}
 
 async function fetchWorkers() {
     try {
         const resp = await fetch(ENDPOINTS.CONFIG);
         if (!resp.ok) return [];
         const config = await resp.json();
-        return config.workers || [];
+        return filterEnabledWorkers(config.workers);
     } catch {
         return [];
     }
@@ -201,12 +210,20 @@ function serializeWorkerStoreFromWidgets(node, inputType, comboOptions) {
     if (inputType === "COMBO" && Array.isArray(comboOptions)) {
         nextStore._options = comboOptions;
     }
+    const valuesByWorkerId = {};
 
     for (const widget of getDynamicWorkerWidgets(node)) {
         const key = widget.name.slice(DYNAMIC_WORKER_WIDGET_PREFIX.length);
         if (widget.value !== "" && widget.value !== null && widget.value !== undefined) {
-            nextStore[key] = String(widget.value);
+            const value = String(widget.value);
+            nextStore[key] = value;
+            if (widget._dvWorkerId) {
+                valuesByWorkerId[widget._dvWorkerId] = value;
+            }
         }
+    }
+    if (Object.keys(valuesByWorkerId).length) {
+        nextStore._by_worker_id = valuesByWorkerId;
     }
 
     writeWorkerStore(node, nextStore);
@@ -277,8 +294,11 @@ function createDynamicDefaultWidget(node, inputType, comboOptions) {
     widget.label = "default_value";
 }
 
-function getWorkerInitialValue(store, key, inputType, comboOptions) {
-    const saved = store[key];
+function getWorkerInitialValue(store, key, workerId, inputType, comboOptions) {
+    const byWorkerId = store?._by_worker_id;
+    const saved = (byWorkerId && workerId && byWorkerId[workerId] != null)
+        ? byWorkerId[workerId]
+        : store[key];
     if (saved == null) {
         if (inputType === "INT" || inputType === "FLOAT") return 0;
         if (inputType === "COMBO" && Array.isArray(comboOptions) && comboOptions.length) {
@@ -305,7 +325,7 @@ function createWorkerWidgets(node, workers, inputType, comboOptions) {
         const worker = workers[i];
         const label = worker.name || worker.id || `Worker ${key}`;
         const widgetName = `${DYNAMIC_WORKER_WIDGET_PREFIX}${key}`;
-        const initial = getWorkerInitialValue(store, key, inputType, comboOptions);
+        const initial = getWorkerInitialValue(store, key, worker.id, inputType, comboOptions);
         let widget;
 
         if (inputType === "COMBO" && Array.isArray(comboOptions) && comboOptions.length) {
@@ -355,6 +375,7 @@ function createWorkerWidgets(node, workers, inputType, comboOptions) {
         }
 
         widget.label = label;
+        widget._dvWorkerId = worker.id;
     }
 
     serializeWorkerStoreFromWidgets(node, inputType, comboOptions);
@@ -382,12 +403,43 @@ function rebuildWidgets(node) {
     if (node.setDirtyCanvas) node.setDirtyCanvas(true, true);
 }
 
+function refreshNodeWorkers(node, workers) {
+    if (!node || !node.graph) return;
+    node._dvWorkers = workers;
+    rebuildWidgets(node);
+}
+
+async function refreshTrackedNodes(workers = null) {
+    const nextWorkers = workers || (await fetchWorkers());
+    for (const node of trackedNodes) {
+        refreshNodeWorkers(node, nextWorkers);
+    }
+}
+
+function attachWorkersChangedListener() {
+    if (workersChangedListenerAttached) return;
+    if (typeof window === "undefined" || typeof window.addEventListener !== "function") return;
+
+    window.addEventListener(WORKERS_CHANGED_EVENT, (event) => {
+        const changedWorkers = filterEnabledWorkers(event?.detail?.workers);
+        if (changedWorkers.length > 0 || Array.isArray(event?.detail?.workers)) {
+            void refreshTrackedNodes(changedWorkers);
+            return;
+        }
+        void refreshTrackedNodes();
+    });
+
+    workersChangedListenerAttached = true;
+}
+
 app.registerExtension({
     name: "Distributed.DistributedValue",
     async nodeCreated(node) {
         if (node.comfyClass !== NODE_CLASS) return;
 
         try {
+            attachWorkersChangedListener();
+            trackedNodes.add(node);
             node._dvWorkers = await fetchWorkers();
             rebuildWidgets(node);
 
@@ -406,6 +458,14 @@ app.registerExtension({
                 const result = originalConfigure ? originalConfigure.call(this, data) : undefined;
                 setTimeout(() => rebuildWidgets(this), 20);
                 return result;
+            };
+
+            const originalOnRemoved = node.onRemoved;
+            node.onRemoved = function () {
+                trackedNodes.delete(this);
+                if (originalOnRemoved) {
+                    return originalOnRemoved.call(this);
+                }
             };
         } catch (error) {
             console.error("Error in DistributedValue extension:", error);
