@@ -29,7 +29,13 @@ class DistributedCollectorNode:
         return {
             "required": {
                 "images": ("IMAGE",),
-                "load_balance": ("BOOLEAN", {"default": False}),
+                "load_balance": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Run this workflow on one least-busy participant (master included when participating).",
+                    },
+                ),
             },
             "optional": { "audio": ("AUDIO",) },
             "hidden": {
