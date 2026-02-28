@@ -242,5 +242,21 @@ class FindMediaReferencesTests(unittest.TestCase):
         self.assertIn("track.wav", refs)
 
 
+class RewritePromptMediaInputsTests(unittest.TestCase):
+    def test_rewrites_video_file_input_to_worker_path(self):
+        prompt = {
+            "79": {"class_type": "LoadVideo", "inputs": {"file": "1 - Copy.mp4"}},
+        }
+        ms._rewrite_prompt_media_inputs(prompt, {"1 - Copy.mp4": "videos/1 - Copy.mp4"})
+        self.assertEqual(prompt["79"]["inputs"]["file"], "videos/1 - Copy.mp4")
+
+    def test_rewrites_audio_input_and_strips_annotation_when_matching(self):
+        prompt = {
+            "1": {"class_type": "LoadAudio", "inputs": {"audio": "song.wav [input]"}},
+        }
+        ms._rewrite_prompt_media_inputs(prompt, {"song.wav": "song.wav"})
+        self.assertEqual(prompt["1"]["inputs"]["audio"], "song.wav")
+
+
 if __name__ == "__main__":
     unittest.main()

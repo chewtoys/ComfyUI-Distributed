@@ -22,6 +22,17 @@ MEDIA_FILE_RE = re.compile(
     re.IGNORECASE,
 )
 
+
+def _normalize_media_reference(value):
+    """Normalize one media string value to a path-like reference or None."""
+    if not isinstance(value, str):
+        return None
+    cleaned = re.sub(r"\s*\[\w+\]$", "", value).strip().replace("\\", "/")
+    if MEDIA_FILE_RE.search(cleaned):
+        return cleaned
+    return None
+
+
 def convert_paths_for_platform(obj, target_separator):
     """Recursively normalize likely file paths for the worker platform separator."""
     if target_separator not in ("/", "\\"):
@@ -64,12 +75,31 @@ def _find_media_references(prompt_obj):
             continue
         inputs = node.get("inputs", {})
         for key in ("image", "video", "audio", "file"):
-            value = inputs.get(key)
-            if isinstance(value, str):
-                cleaned = re.sub(r"\s*\[\w+\]$", "", value).strip().replace("\\", "/")
-                if MEDIA_FILE_RE.search(cleaned):
-                    media_refs.add(cleaned)
+            cleaned = _normalize_media_reference(inputs.get(key))
+            if cleaned:
+                media_refs.add(cleaned)
     return sorted(media_refs)
+
+
+def _rewrite_prompt_media_inputs(prompt_obj, worker_media_paths):
+    """Rewrite media string inputs to worker-local uploaded paths."""
+    if not isinstance(worker_media_paths, dict) or not worker_media_paths:
+        return
+
+    for node in prompt_obj.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+        for key in ("image", "video", "audio", "file"):
+            value = inputs.get(key)
+            cleaned = _normalize_media_reference(value)
+            if not cleaned:
+                continue
+            worker_path = worker_media_paths.get(cleaned)
+            if worker_path:
+                inputs[key] = worker_path
 
 
 def _load_media_file_sync(filename):
@@ -128,7 +158,7 @@ async def _upload_media_to_worker(worker, filename, file_bytes, file_hash, mime_
             if resp.status == 200:
                 payload = await resp.json()
                 if payload.get("exists") and payload.get("hash_matches"):
-                    return False
+                    return False, normalized
     except Exception as exc:
         if trace_execution_id:
             trace_debug(trace_execution_id, f"Media check failed for '{normalized}' on worker {worker.get('id')}: {exc}")
@@ -152,7 +182,15 @@ async def _upload_media_to_worker(worker, filename, file_bytes, file_hash, mime_
         timeout=aiohttp.ClientTimeout(total=30),
     ) as resp:
         resp.raise_for_status()
-    return True
+        try:
+            payload = await resp.json()
+        except Exception:
+            payload = {}
+
+    name = str((payload or {}).get("name") or clean_name).strip()
+    subfolder = str((payload or {}).get("subfolder") or "").strip().replace("\\", "/").strip("/")
+    worker_path = f"{subfolder}/{name}" if subfolder else name
+    return True, worker_path
 
 
 async def sync_worker_media(worker, prompt_obj, trace_execution_id=None):
@@ -165,6 +203,7 @@ async def sync_worker_media(worker, prompt_obj, trace_execution_id=None):
     uploaded = 0
     skipped = 0
     missing = 0
+    worker_media_paths = {}
     for filename in media_refs:
         try:
             file_bytes, file_hash, mime_type = await loop.run_in_executor(
@@ -185,7 +224,7 @@ async def sync_worker_media(worker, prompt_obj, trace_execution_id=None):
             continue
 
         try:
-            changed = await _upload_media_to_worker(
+            changed, worker_path = await _upload_media_to_worker(
                 worker,
                 filename,
                 file_bytes,
@@ -193,6 +232,8 @@ async def sync_worker_media(worker, prompt_obj, trace_execution_id=None):
                 mime_type,
                 trace_execution_id=trace_execution_id,
             )
+            if worker_path:
+                worker_media_paths[filename] = worker_path
             if changed:
                 uploaded += 1
             else:
@@ -202,6 +243,8 @@ async def sync_worker_media(worker, prompt_obj, trace_execution_id=None):
                 trace_info(trace_execution_id, f"Failed to upload media '{filename}' to worker {worker.get('id')}: {exc}")
             else:
                 log(f"[Distributed] Failed to upload media '{filename}' to worker {worker.get('id')}: {exc}")
+
+    _rewrite_prompt_media_inputs(prompt_obj, worker_media_paths)
 
     summary = (
         f"Media sync for worker {worker.get('id')}: "
