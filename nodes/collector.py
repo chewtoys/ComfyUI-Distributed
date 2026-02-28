@@ -212,7 +212,8 @@ class DistributedCollectorNode:
             delegate_mode = delegate_only or is_master_delegate_only()
             # Master mode: collect images and audio from workers
             enabled_workers = json.loads(enabled_worker_ids)
-            num_workers = len(enabled_workers)
+            expected_workers = {str(worker_id) for worker_id in enabled_workers}
+            num_workers = len(expected_workers)
             if num_workers == 0:
                 return (images, audio if audio is not None else self.EMPTY_AUDIO)
 
@@ -262,6 +263,21 @@ class DistributedCollectorNode:
             # NEW: Initialize progress bar for workers (total = num_workers)
             p = ProgressBar(num_workers)
 
+            def mark_worker_done(done_worker_id):
+                done_worker_id = str(done_worker_id)
+                if done_worker_id not in expected_workers:
+                    debug_log(
+                        f"Master - Ignoring completion from unexpected worker {done_worker_id} for job {multi_job_id}"
+                    )
+                    return
+                if done_worker_id in workers_done:
+                    debug_log(
+                        f"Master - Ignoring duplicate completion from worker {done_worker_id} for job {multi_job_id}"
+                    )
+                    return
+                workers_done.add(done_worker_id)
+                p.update(1)  # +1 per completed expected worker
+
             try:
                 while len(workers_done) < num_workers:
                     # Check for user interruption to abort collection promptly
@@ -293,8 +309,7 @@ class DistributedCollectorNode:
                         base_timeout = float(get_worker_timeout_seconds())
 
                         if is_last:
-                            workers_done.add(worker_id)
-                            p.update(1)  # +1 per completed worker
+                            mark_worker_done(worker_id)
                         
                     except asyncio.TimeoutError:
                         # If we still have time, continue polling; otherwise handle timeout
@@ -378,8 +393,7 @@ class DistributedCollectorNode:
                                         collected_count += self._store_worker_result(worker_images, item)
                                         
                                         if is_last:
-                                            workers_done.add(worker_id)
-                                            p.update(1)  # +1 here too
+                                            mark_worker_done(worker_id)
                             else:
                                 log(f"Master - Queue {multi_job_id} no longer exists!")
                         break

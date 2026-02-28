@@ -386,8 +386,15 @@ function rebuildWidgets(node) {
     const workers = node._dvWorkers || [];
     const store = readWorkerStore(node);
     const detected = detectTargetType(node);
-    const inputType = detected.connected ? detected.type : (store._type || "STRING");
-    const comboOptions = detected.connected ? detected.options : normalizeComboOptions(store._options);
+    const disconnected = !detected.connected;
+    const inputType = disconnected ? "STRING" : detected.type;
+    const comboOptions = disconnected ? null : detected.options;
+
+    if (disconnected) {
+        // Reset disconnected node back to the neutral default state.
+        setRawDefaultValue(node, "");
+        writeWorkerStore(node, { _type: "STRING" });
+    }
 
     createDynamicDefaultWidget(node, inputType, comboOptions);
     if (workers.length > 0) {
