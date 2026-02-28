@@ -9,10 +9,8 @@ from .utilities import (
     any_type,
 )
 from .collector import DistributedCollectorNode
-from .queue_node import DistributedQueueNode
 
 NODE_CLASS_MAPPINGS = {
-    "DistributedQueue": DistributedQueueNode,
     "DistributedCollector": DistributedCollectorNode,
     "DistributedSeed": DistributedSeed,
     "DistributedModelName": DistributedModelName,
@@ -21,7 +19,6 @@ NODE_CLASS_MAPPINGS = {
     "DistributedEmptyImage": DistributedEmptyImage,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "DistributedQueue": "Distributed Queue",
     "DistributedCollector": "Distributed Collector",
     "DistributedSeed": "Distributed Seed",
     "DistributedModelName": "Distributed Model Name",

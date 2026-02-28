@@ -16,7 +16,11 @@ from ..utils.logging import debug_log, log
 from ..utils.network import build_master_url
 from ..utils.trace_logger import trace_debug
 from .schemas import parse_positive_float, parse_positive_int
-from .orchestration.dispatch import dispatch_worker_prompt, select_active_workers
+from .orchestration.dispatch import (
+    dispatch_worker_prompt,
+    select_active_workers,
+    select_least_busy_worker,
+)
 from .orchestration.media_sync import convert_paths_for_platform, fetch_worker_path_separator, sync_worker_media
 from .orchestration.prompt_transform import (
     PromptIndex,
@@ -116,6 +120,24 @@ def _resolve_orchestration_limits(config):
     )
 
 
+def _is_load_balance_enabled(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _prompt_requests_load_balance(prompt_index):
+    for node_id in prompt_index.nodes_for_class("DistributedCollector"):
+        inputs = prompt_index.inputs_by_node.get(node_id, {})
+        if _is_load_balance_enabled(inputs.get("load_balance", False)):
+            return True
+    return False
+
+
 async def _prepare_worker_payload(
     worker,
     prompt_index,
@@ -187,6 +209,7 @@ async def orchestrate_distributed_execution(
 
     config = load_config()
     use_websocket = bool(config.get("settings", {}).get("websocket_orchestration", False))
+    master_url = build_master_url(config=config, prompt_server_instance=prompt_server)
     (
         worker_probe_concurrency,
         worker_prep_concurrency,
@@ -196,6 +219,7 @@ async def orchestrate_distributed_execution(
     requested_ids = enabled_worker_ids if enabled_worker_ids is not None else None
     workers = _resolve_enabled_workers(config, requested_ids)
     prompt_index = PromptIndex(prompt_obj)
+    load_balance_requested = _prompt_requests_load_balance(prompt_index)
     trace_debug(
         execution_trace_id,
         (
@@ -205,7 +229,8 @@ async def orchestrate_distributed_execution(
             f"probe_concurrency={worker_probe_concurrency}, "
             f"prep_concurrency={worker_prep_concurrency}, "
             f"media_sync_concurrency={media_sync_concurrency}, "
-            f"media_sync_timeout={media_sync_timeout_seconds:.1f}s"
+            f"media_sync_timeout={media_sync_timeout_seconds:.1f}s, "
+            f"load_balance={load_balance_requested}"
         ),
     )
 
@@ -228,6 +253,57 @@ async def orchestrate_distributed_execution(
         probe_concurrency=worker_probe_concurrency,
     )
 
+    if load_balance_requested:
+        candidate_workers = list(active_workers)
+        if not delegate_master:
+            # Include master in load balancing only when master participation is enabled.
+            candidate_workers.append(
+                {
+                    "id": "master",
+                    "name": "Master",
+                    "host": master_url,
+                    "type": "local",
+                }
+            )
+
+        selected_worker = None
+        if candidate_workers:
+            selected_worker = await select_least_busy_worker(
+                candidate_workers,
+                trace_execution_id=execution_trace_id,
+                probe_concurrency=worker_probe_concurrency,
+            )
+        if selected_worker is None and candidate_workers:
+            trace_debug(
+                execution_trace_id,
+                "Load-balance selection probe failed; using first available candidate.",
+            )
+            selected_worker = candidate_workers[0]
+
+        if selected_worker is not None and str(selected_worker.get("id")) == "master":
+            # Master selected as least busy; run master workload only.
+            active_workers = []
+            delegate_master = False
+            trace_debug(
+                execution_trace_id,
+                "Load-balance selected master for execution (workers skipped).",
+            )
+        elif selected_worker is not None:
+            active_workers = [selected_worker]
+            # Worker selected as least busy; keep master orchestrator-only for this run.
+            delegate_master = True
+            trace_debug(
+                execution_trace_id,
+                f"Load-balance selected worker {selected_worker.get('id')} (master set to delegate-only).",
+            )
+        else:
+            trace_debug(
+                execution_trace_id,
+                "Load-balance requested but no execution candidates were available.",
+            )
+            active_workers = []
+            delegate_master = False
+
     enabled_ids = [worker["id"] for worker in active_workers]
 
     discovery_prefix = f"exec_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
@@ -241,7 +317,6 @@ async def orchestrate_distributed_execution(
     for job_id in job_id_map.values():
         await _ensure_distributed_queue(job_id)
 
-    master_url = build_master_url(config=config, prompt_server_instance=prompt_server)
     master_prompt = prompt_index.copy_prompt()
     master_prompt = apply_participant_overrides(
         master_prompt,

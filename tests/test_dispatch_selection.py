@@ -187,6 +187,68 @@ class DispatchSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(state["max_in_flight"], 2)
         self.assertGreaterEqual(state["max_in_flight"], 2)
 
+    async def test_select_least_busy_worker_round_robins_idle_workers(self):
+        workers = [
+            {"id": "w1", "name": "Worker 1"},
+            {"id": "w2", "name": "Worker 2"},
+            {"id": "w3", "name": "Worker 3"},
+        ]
+        queue_map = {"w1": 0, "w2": 0, "w3": 2}
+
+        async def fake_probe(worker_url, timeout=3.0):
+            worker_id = worker_url.rsplit("/", 1)[-1]
+            return {"exec_info": {"queue_remaining": queue_map[worker_id]}}
+
+        with patch.object(dispatch, "build_worker_url", side_effect=lambda worker: f"http://host/{worker['id']}"), patch.object(
+            dispatch,
+            "probe_worker",
+            side_effect=fake_probe,
+        ):
+            dispatch._least_busy_rr_index = 0
+            selected1 = await dispatch.select_least_busy_worker(workers, probe_concurrency=3)
+            selected2 = await dispatch.select_least_busy_worker(workers, probe_concurrency=3)
+            selected3 = await dispatch.select_least_busy_worker(workers, probe_concurrency=3)
+
+        self.assertEqual(selected1["id"], "w1")
+        self.assertEqual(selected2["id"], "w2")
+        self.assertEqual(selected3["id"], "w1")
+
+    async def test_select_least_busy_worker_chooses_smallest_queue_when_all_busy(self):
+        workers = [
+            {"id": "w1", "name": "Worker 1"},
+            {"id": "w2", "name": "Worker 2"},
+            {"id": "w3", "name": "Worker 3"},
+        ]
+        queue_map = {"w1": 5, "w2": 2, "w3": 4}
+
+        async def fake_probe(worker_url, timeout=3.0):
+            worker_id = worker_url.rsplit("/", 1)[-1]
+            return {"exec_info": {"queue_remaining": queue_map[worker_id]}}
+
+        with patch.object(dispatch, "build_worker_url", side_effect=lambda worker: f"http://host/{worker['id']}"), patch.object(
+            dispatch,
+            "probe_worker",
+            side_effect=fake_probe,
+        ):
+            selected = await dispatch.select_least_busy_worker(workers, probe_concurrency=2)
+
+        self.assertEqual(selected["id"], "w2")
+
+    async def test_select_least_busy_worker_returns_none_when_all_probes_fail(self):
+        workers = [{"id": "w1", "name": "Worker 1"}]
+
+        async def fake_probe(_worker_url, timeout=3.0):
+            return None
+
+        with patch.object(dispatch, "build_worker_url", side_effect=lambda worker: f"http://host/{worker['id']}"), patch.object(
+            dispatch,
+            "probe_worker",
+            side_effect=fake_probe,
+        ):
+            selected = await dispatch.select_least_busy_worker(workers, probe_concurrency=1)
+
+        self.assertIsNone(selected)
+
 
 if __name__ == "__main__":
     unittest.main()

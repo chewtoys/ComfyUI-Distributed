@@ -1,31 +1,19 @@
 import { api } from "../../scripts/api.js";
 import { applyProbeResultToWorkerDot, findNodesByClass } from './workerUtils.js';
 import { TIMEOUTS, NODE_CLASSES, generateUUID } from './constants.js';
-import { markSkipDispatch, selectLeastBusyWorker } from './executionDecisionUtils.js';
 import { checkAllWorkerStatuses, getWorkerUrl } from './workerLifecycle.js';
-
-export { markSkipDispatch, selectLeastBusyWorker };
 
 export function setupInterceptor(extension) {
     api.queuePrompt = async (number, prompt) => {
         if (extension.isEnabled) {
             const hasCollector = findNodesByClass(prompt.output, NODE_CLASSES.DISTRIBUTED_COLLECTOR).length > 0;
             const hasDistUpscale = findNodesByClass(prompt.output, NODE_CLASSES.UPSCALE_DISTRIBUTED).length > 0;
-            const hasDistQueue = findNodesByClass(prompt.output, NODE_CLASSES.DISTRIBUTED_QUEUE).length > 0;
 
             if (hasCollector || hasDistUpscale) {
                 const result = await executeParallelDistributed(extension, prompt);
                 // Immediate status check for instant feedback
                 checkAllWorkerStatuses(extension);
                 // Another check after a short delay to catch state changes
-                setTimeout(() => checkAllWorkerStatuses(extension), TIMEOUTS.POST_ACTION_DELAY);
-                return result;
-            }
-
-            // DistributedQueue: route entire workflow to least-busy worker
-            if (hasDistQueue) {
-                const result = await executeQueueDistributed(extension, prompt);
-                checkAllWorkerStatuses(extension);
                 setTimeout(() => checkAllWorkerStatuses(extension), TIMEOUTS.POST_ACTION_DELAY);
                 return result;
             }
@@ -115,82 +103,6 @@ export async function executeParallelDistributed(extension, promptWrapper) {
         }
         return null;
     }
-}
-
-/**
- * Execute a workflow via DistributedQueue - routes to the least-busy worker.
- * The workflow runs ONLY on the selected worker, not on the master.
- */
-export async function executeQueueDistributed(extension, promptWrapper) {
-    try {
-        const enabledWorkers = extension.enabledWorkers;
-
-        if (enabledWorkers.length === 0) {
-            extension.log("DistributedQueue: No enabled workers. Falling back to local execution.", "warn");
-            return extension.originalQueuePrompt(0, promptWrapper);
-        }
-
-        // Fetch queue status from all enabled workers
-        const workerStatuses = await fetchWorkerQueueStatuses(extension, enabledWorkers);
-
-        if (workerStatuses.length === 0) {
-            extension.log("DistributedQueue: No reachable workers. Falling back to local execution.", "warn");
-            return extension.originalQueuePrompt(0, promptWrapper);
-        }
-
-        // Select the least-busy worker
-        const selectedWorker = selectLeastBusyWorker(extension, workerStatuses);
-        const worker = selectedWorker.worker;
-        const queueRemaining = selectedWorker.queueRemaining;
-
-        extension.log(`DistributedQueue: Routing to ${worker.name} (queue_remaining=${queueRemaining})`, "info");
-
-        // Prepare the prompt with skip_dispatch=True for DistributedQueue nodes
-        const promptToSend = JSON.parse(JSON.stringify(promptWrapper.output));
-        markSkipDispatch(promptToSend);
-
-        // Dispatch to the selected worker
-        const workerUrl = getWorkerUrl(extension, worker);
-        try {
-            const result = await extension.api.dispatchToWorker(workerUrl, {
-                prompt: promptToSend,
-                extra_data: { extra_pnginfo: { workflow: promptWrapper.workflow } },
-                client_id: api.clientId
-            });
-            extension.log(`DistributedQueue: Dispatched to ${worker.name}, prompt_id=${result.prompt_id}`, "info");
-
-            return { prompt_id: result.prompt_id, worker_id: worker.id };
-        } catch (error) {
-            extension.log(`DistributedQueue: Failed to dispatch to ${worker.name}: ${error.message}`, "error");
-            // Fall back to local execution
-            return extension.originalQueuePrompt(0, promptWrapper);
-        }
-    } catch (error) {
-        extension.log("DistributedQueue execution failed: " + error.message, "error");
-        throw error;
-    }
-}
-
-async function fetchWorkerQueueStatuses(extension, workers) {
-    const statuses = [];
-
-    const checkPromises = workers.map(async (worker) => {
-        const workerUrl = getWorkerUrl(extension, worker);
-        try {
-            const probeResult = await extension.api.probeWorker(workerUrl, TIMEOUTS.STATUS_CHECK);
-
-            if (probeResult.ok) {
-                return { worker, queueRemaining: probeResult.queueRemaining || 0, online: true };
-            }
-            extension.log(`DistributedQueue: Worker ${worker.name} returned ${probeResult.status}`, "debug");
-        } catch (error) {
-            extension.log(`DistributedQueue: Worker ${worker.name} unreachable: ${error.message}`, "debug");
-        }
-        return null;
-    });
-
-    const results = await Promise.all(checkPromises);
-    return results.filter(r => r !== null);
 }
 
 export async function performPreflightCheck(extension, workers) {

@@ -27,7 +27,10 @@ class DistributedCollectorNode:
     @classmethod
     def INPUT_TYPES(s):
         return {
-            "required": { "images": ("IMAGE",) },
+            "required": {
+                "images": ("IMAGE",),
+                "load_balance": ("BOOLEAN", {"default": False}),
+            },
             "optional": { "audio": ("AUDIO",) },
             "hidden": {
                 "multi_job_id": ("STRING", {"default": ""}),
@@ -46,7 +49,7 @@ class DistributedCollectorNode:
     FUNCTION = "run"
     CATEGORY = "image"
     
-    def run(self, images, audio=None, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", pass_through=False, delegate_only=False):
+    def run(self, images, load_balance=False, audio=None, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", pass_through=False, delegate_only=False):
         # Create empty audio if not provided
         empty_audio = {"waveform": torch.zeros(1, 2, 1), "sample_rate": 44100}
 
@@ -57,7 +60,18 @@ class DistributedCollectorNode:
 
         # Use async helper to run in server loop
         result = run_async_in_server_loop(
-            self.execute(images, audio, multi_job_id, is_worker, master_url, enabled_worker_ids, worker_batch_size, worker_id, delegate_only)
+            self.execute(
+                images,
+                audio,
+                load_balance,
+                multi_job_id,
+                is_worker,
+                master_url,
+                enabled_worker_ids,
+                worker_batch_size,
+                worker_id,
+                delegate_only,
+            )
         )
         return result
 
@@ -182,7 +196,7 @@ class DistributedCollectorNode:
         else:
             raise ValueError("No image data collected from master or workers")
 
-    async def execute(self, images, audio, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False):
+    async def execute(self, images, audio, load_balance=False, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False):
         if is_worker:
             # Worker mode: send images and audio to master in a single batch
             debug_log(f"Worker - Job {multi_job_id} complete. Sending {images.shape[0]} image(s) to master")

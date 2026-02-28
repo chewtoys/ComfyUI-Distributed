@@ -25,6 +25,8 @@ except ImportError:
         except (TypeError, ValueError):
             return default
 
+_least_busy_rr_index = 0
+
 
 async def worker_is_active(worker):
     """Ping worker's /prompt endpoint to confirm it's reachable."""
@@ -187,3 +189,80 @@ async def select_active_workers(
         delegate_master = False
 
     return active_workers, delegate_master
+
+
+def _extract_queue_remaining(payload):
+    if not isinstance(payload, dict):
+        return 0
+    try:
+        queue_remaining = int(payload.get("exec_info", {}).get("queue_remaining", 0))
+    except (TypeError, ValueError):
+        queue_remaining = 0
+    return max(queue_remaining, 0)
+
+
+async def _probe_worker_queue(worker, semaphore, probe_timeout):
+    async with semaphore:
+        worker_url = build_worker_url(worker)
+        payload = await probe_worker(worker_url, timeout=probe_timeout)
+        if payload is None:
+            return None
+        return {
+            "worker": worker,
+            "queue_remaining": _extract_queue_remaining(payload),
+        }
+
+
+def _select_idle_round_robin(statuses):
+    global _least_busy_rr_index
+    if not statuses:
+        return None
+    index = _least_busy_rr_index % len(statuses)
+    _least_busy_rr_index += 1
+    return statuses[index]
+
+
+async def select_least_busy_worker(
+    workers,
+    trace_execution_id=None,
+    probe_concurrency=8,
+    probe_timeout=3.0,
+):
+    """Select one worker by queue depth, round-robin among idle workers."""
+    if not workers:
+        return None
+
+    probe_limit = parse_positive_int(probe_concurrency, 8)
+    probe_semaphore = asyncio.Semaphore(probe_limit)
+    statuses = await asyncio.gather(
+        *[
+            _probe_worker_queue(worker, probe_semaphore, probe_timeout)
+            for worker in workers
+        ]
+    )
+    statuses = [status for status in statuses if status is not None]
+    if not statuses:
+        if trace_execution_id:
+            trace_info(trace_execution_id, "Least-busy selection failed: no worker queue probes succeeded.")
+        else:
+            log("[Distributed] Least-busy selection failed: no worker queue probes succeeded.")
+        return None
+
+    idle_statuses = [status for status in statuses if status["queue_remaining"] == 0]
+    if idle_statuses:
+        selected = _select_idle_round_robin(idle_statuses)
+    else:
+        selected = min(statuses, key=lambda status: status["queue_remaining"])
+
+    worker = selected["worker"]
+    queue_remaining = selected["queue_remaining"]
+    if trace_execution_id:
+        trace_debug(
+            trace_execution_id,
+            f"Least-busy worker selected: {worker.get('name')} ({worker.get('id')}), queue_remaining={queue_remaining}",
+        )
+    else:
+        debug_log(
+            f"Least-busy worker selected: {worker.get('name')} ({worker.get('id')}), queue_remaining={queue_remaining}"
+        )
+    return worker

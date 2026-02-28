@@ -219,7 +219,6 @@ export const ENDPOINTS = {
 
 export const NODE_CLASSES = {
     DISTRIBUTED_COLLECTOR: 'DistributedCollector',
-    DISTRIBUTED_QUEUE: 'DistributedQueue',
     DISTRIBUTED_SEED: 'DistributedSeed',
     DISTRIBUTED_EMPTY_IMAGE: 'DistributedEmptyImage',
     UPSCALE_DISTRIBUTED: 'UltimateSDUpscaleDistributed',
