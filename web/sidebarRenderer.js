@@ -52,8 +52,9 @@ export async function renderSidebarContent(extension, el) {
         // Show loading indicator
         el.innerHTML = '';
         const loadingDiv = document.createElement("div");
-        loadingDiv.style.cssText = "display: flex; align-items: center; justify-content: center; height: calc(100vh - 100px); color: #888;";
-        loadingDiv.innerHTML = `<svg width="24" height="24" viewBox="0 0 24 24" style="color: #888;">
+        loadingDiv.style.cssText =
+            "display: flex; align-items: center; justify-content: center; height: calc(100vh - 100px); color: var(--dist-muted-text, #888);";
+        loadingDiv.innerHTML = `<svg width="24" height="24" viewBox="0 0 24 24" style="color: var(--dist-muted-text, #888);">
             <circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-dasharray="40 40"/>
         </svg>`;
         el.appendChild(loadingDiv);
@@ -74,7 +75,8 @@ export async function renderSidebarContent(extension, el) {
         // Create toolbar header to match ComfyUI style
         const toolbar = document.createElement("div");
         toolbar.className = "p-toolbar p-component border-x-0 border-t-0 rounded-none px-2 py-1 min-h-8";
-        toolbar.style.cssText = "border-bottom: 1px solid #444; background: transparent; display: flex; align-items: center;";
+        toolbar.style.cssText =
+            "border-bottom: 1px solid var(--dist-divider, #444); background: transparent; display: flex; align-items: center;";
         const toolbarStart = document.createElement("div");
         toolbarStart.className = "p-toolbar-start";
         toolbarStart.style.cssText = "display: flex; align-items: center;";
@@ -107,6 +109,7 @@ export async function renderSidebarContent(extension, el) {
         container.appendChild(renderActionsSection(extension));
         container.appendChild(renderSettingsSection(extension));
         el.appendChild(container);
+        extension._applyThemeToneClass?.();
         // Start checking worker statuses immediately in parallel
         setTimeout(() => checkAllWorkerStatuses(extension), 0);
     } finally {

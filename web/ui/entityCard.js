@@ -70,6 +70,7 @@ export function renderEntityCard(ui, cardConfigs, entityType, data, extension) {
     workerContent.appendChild(statusDot);
 
     const infoSpan = document.createElement("span");
+    infoSpan.classList.add("dist-worker-info");
     infoSpan.innerHTML = config.infoText(data, extension);
     workerContent.appendChild(infoSpan);
 
@@ -92,13 +93,13 @@ export function renderEntityCard(ui, cardConfigs, entityType, data, extension) {
         rightColumn.onmouseover = () => {
             rightColumn.classList.add("entity-card-content--hovered");
             if (settingsArrow) {
-                settingsArrow.style.color = "#fff";
+                settingsArrow.style.color = "var(--dist-settings-arrow-hover, #fff)";
             }
         };
         rightColumn.onmouseout = () => {
             rightColumn.classList.remove("entity-card-content--hovered");
             if (settingsArrow) {
-                settingsArrow.style.color = "#888";
+                settingsArrow.style.color = "var(--dist-settings-arrow, #888)";
             }
         };
     }

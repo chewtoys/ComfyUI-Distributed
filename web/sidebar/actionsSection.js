@@ -2,7 +2,8 @@ import { BUTTON_STYLES } from "../constants.js";
 
 export function renderActionsSection(extension) {
     const actionsSection = document.createElement("div");
-    actionsSection.style.cssText = "padding-top: 10px; margin-bottom: 15px; border-top: 1px solid #444;";
+    actionsSection.style.cssText =
+        "padding-top: 10px; margin-bottom: 15px; border-top: 1px solid var(--dist-divider, #444);";
 
     const buttonRow = document.createElement("div");
     buttonRow.style.cssText = "display: flex; gap: 8px;";

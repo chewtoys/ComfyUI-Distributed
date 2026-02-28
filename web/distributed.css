@@ -12,6 +12,90 @@
     --master-badge-fallback-border: #335533;
     --master-badge-delegate-bg: #3a3a3a;
     --master-badge-delegate-text: #ffcc66;
+    --dist-divider: #444;
+    --dist-muted-text: #888;
+    --dist-label-text: #ccc;
+    --dist-settings-arrow: #888;
+    --dist-settings-arrow-hover: #fff;
+    --dist-card-bg: #2a2a2a;
+    --dist-card-title: #f4f5f7;
+    --dist-card-subtext: #a9afb9;
+    --dist-card-placeholder-title: #aaa;
+    --dist-left-col-border: #3a3a3a;
+    --dist-left-col-bg: rgba(0, 0, 0, 0.1);
+    --dist-info-box-bg: #333;
+    --dist-info-box-text: #999;
+    --dist-input-bg: #2a2a2a;
+    --dist-input-border: #444;
+    --dist-input-text: #fff;
+    --dist-settings-bg: #1e1e1e;
+    --dist-settings-border: #2a2a2a;
+    --dist-hover-bg: #333;
+    --dist-placeholder-blueprint-border: #555;
+    --dist-placeholder-blueprint-hover-border: #777;
+    --dist-placeholder-add-border: #444;
+    --dist-placeholder-add-hover-border: #666;
+    --dist-placeholder-blueprint-bg: rgba(255, 255, 255, 0.02);
+    --dist-placeholder-blueprint-hover-bg: rgba(255, 255, 255, 0.05);
+    --dist-placeholder-add-hover-bg: rgba(255, 255, 255, 0.02);
+    --dist-placeholder-blueprint-color: #777;
+    --dist-placeholder-blueprint-hover-color: #999;
+    --dist-placeholder-add-color: #555;
+    --dist-placeholder-add-hover-color: #888;
+    --dist-log-modal-bg: #1e1e1e;
+    --dist-log-modal-border: #444;
+    --dist-log-modal-header-border: #444;
+    --dist-log-modal-title: #fff;
+    --dist-log-modal-label: #ccc;
+    --dist-log-modal-body-bg: #0d0d0d;
+    --dist-log-modal-body-text: #ddd;
+    --dist-log-modal-status: #888;
+}
+
+.distributed-panel--light {
+    --dist-divider: #c7ced9;
+    --dist-muted-text: #5b6472;
+    --dist-label-text: #2f3a4a;
+    --dist-settings-arrow: #6b7483;
+    --dist-settings-arrow-hover: #253040;
+    --dist-card-bg: #f6f8fb;
+    --dist-card-title: #1e293b;
+    --dist-card-subtext: #4b5565;
+    --dist-card-placeholder-title: #3f4a5a;
+    --dist-left-col-border: #d8deea;
+    --dist-left-col-bg: #eef2f8;
+    --dist-info-box-bg: #e8edf5;
+    --dist-info-box-text: #4f5b6c;
+    --dist-input-bg: #ffffff;
+    --dist-input-border: #b8c2d3;
+    --dist-input-text: #1f2937;
+    --dist-settings-bg: #eef2f8;
+    --dist-settings-border: #d5dcea;
+    --dist-hover-bg: #e6ebf3;
+    --dist-placeholder-blueprint-border: #aeb8c9;
+    --dist-placeholder-blueprint-hover-border: #8e9ab0;
+    --dist-placeholder-add-border: #b7c1d3;
+    --dist-placeholder-add-hover-border: #919eb4;
+    --dist-placeholder-blueprint-bg: rgba(80, 100, 140, 0.05);
+    --dist-placeholder-blueprint-hover-bg: rgba(80, 100, 140, 0.08);
+    --dist-placeholder-add-hover-bg: rgba(80, 100, 140, 0.05);
+    --dist-placeholder-blueprint-color: #5f6c82;
+    --dist-placeholder-blueprint-hover-color: #47556e;
+    --dist-placeholder-add-color: #6a7588;
+    --dist-placeholder-add-hover-color: #4c586f;
+    --master-badge-delegate-bg: #efe7ce;
+    --master-badge-delegate-text: #6a4f00;
+    --master-badge-fallback-bg: #dff1df;
+    --master-badge-fallback-text: #1f5f1f;
+    --master-badge-fallback-border: #9fc79f;
+    --dist-log-modal-bg: #f9fbff;
+    --dist-log-modal-border: #bcc7db;
+    --dist-log-modal-header-border: #c7d1e3;
+    --dist-log-modal-title: #1f2937;
+    --dist-log-modal-label: #4a5568;
+    --dist-log-modal-body-bg: #f2f5fb;
+    --dist-log-modal-body-text: #1f2937;
+    --dist-log-modal-status: #5c6779;
 }
 
 .btn--stop {
@@ -50,45 +134,47 @@
 }
 
 .entity-card-content--hovered {
-    background-color: #333 !important;
+    background-color: var(--dist-hover-bg) !important;
 }
 
 .placeholder-card--blueprint {
-    border-color: #555 !important;
-    background-color: rgba(255, 255, 255, 0.02) !important;
+    border-color: var(--dist-placeholder-blueprint-border) !important;
+    background-color: var(--dist-placeholder-blueprint-bg) !important;
 }
 
 .placeholder-card--blueprint.is-hovered {
-    border-color: #777 !important;
-    background-color: rgba(255, 255, 255, 0.05) !important;
+    border-color: var(--dist-placeholder-blueprint-hover-border) !important;
+    background-color: var(--dist-placeholder-blueprint-hover-bg) !important;
 }
 
 .placeholder-card--add {
-    border-color: #444 !important;
+    border-color: var(--dist-placeholder-add-border) !important;
     background-color: transparent !important;
 }
 
 .placeholder-card--add.is-hovered {
-    border-color: #666 !important;
-    background-color: rgba(255, 255, 255, 0.02) !important;
+    border-color: var(--dist-placeholder-add-hover-border) !important;
+    background-color: var(--dist-placeholder-add-hover-bg) !important;
 }
 
 .placeholder-column--blueprint {
-    color: #777 !important;
+    color: var(--dist-placeholder-blueprint-color) !important;
+    border-right-color: var(--dist-placeholder-blueprint-border) !important;
 }
 
 .placeholder-column--blueprint.is-hovered {
-    color: #999 !important;
+    color: var(--dist-placeholder-blueprint-hover-color) !important;
 }
 
 .placeholder-column--add {
-    color: #555 !important;
-    border-color: #444 !important;
+    color: var(--dist-placeholder-add-color) !important;
+    border-color: var(--dist-placeholder-add-border) !important;
+    border-right-color: var(--dist-placeholder-add-border) !important;
 }
 
 .placeholder-column--add.is-hovered {
-    color: #888 !important;
-    border-color: #666 !important;
+    color: var(--dist-placeholder-add-hover-color) !important;
+    border-color: var(--dist-placeholder-add-hover-border) !important;
 }
 
 .tunnel-button--enable {
@@ -110,40 +196,60 @@
 /* ---- Themeable card/column/input defaults (Classic) ---- */
 
 .dist-card {
-    background: #2a2a2a;
+    background: var(--dist-card-bg);
+    color: var(--dist-card-title);
     border-radius: 6px;
 }
 
 .dist-card--blueprint {
-    border: 2px dashed #555;
-    background: rgba(255, 255, 255, 0.02);
+    border: 2px dashed var(--dist-placeholder-blueprint-border);
+    background: var(--dist-placeholder-blueprint-bg);
 }
 
 .dist-card--add {
-    border: 1px dashed #444;
+    border: 1px dashed var(--dist-placeholder-add-border);
     background: transparent;
 }
 
 .dist-card__left-col {
-    border-right: 1px solid #3a3a3a;
-    background: rgba(0, 0, 0, 0.1);
+    border-right: 1px solid var(--dist-left-col-border);
+    background: var(--dist-left-col-bg);
 }
 
 .dist-info-box {
-    background-color: #333;
+    background-color: var(--dist-info-box-bg);
+    color: var(--dist-info-box-text);
     border-radius: 4px;
 }
 
 .dist-form-input {
-    background: #2a2a2a;
-    border: 1px solid #444;
+    background: var(--dist-input-bg);
+    border: 1px solid var(--dist-input-border);
+    color: var(--dist-input-text);
     border-radius: 4px;
 }
 
 .worker-settings {
-    background: #1e1e1e;
-    border: 1px solid #2a2a2a;
+    background: var(--dist-settings-bg);
+    border: 1px solid var(--dist-settings-border);
     border-radius: 4px;
+}
+
+.dist-worker-info__title {
+    color: var(--dist-card-title) !important;
+    font-size: 1.03em;
+    font-weight: 700;
+}
+
+.dist-worker-info__meta {
+    color: var(--dist-card-subtext) !important;
+    font-size: 0.88em;
+}
+
+.dist-worker-info__fallback {
+    color: var(--master-badge-fallback-text) !important;
+    font-size: 0.86em;
+    font-weight: 600;
 }
 
 /* ---- Nodes 2.0 Theme ---- */
@@ -235,19 +341,19 @@
 }
 
 .log-modal__content {
-    background: #1e1e1e;
+    background: var(--dist-log-modal-bg);
     border-radius: 8px;
     width: 90%;
     max-width: 1200px;
     height: 80%;
     display: flex;
     flex-direction: column;
-    border: 1px solid #444;
+    border: 1px solid var(--dist-log-modal-border);
 }
 
 .log-modal__header {
     padding: 15px 20px;
-    border-bottom: 1px solid #444;
+    border-bottom: 1px solid var(--dist-log-modal-header-border);
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -255,7 +361,7 @@
 
 .log-modal__title {
     margin: 0;
-    color: #fff;
+    color: var(--dist-log-modal-title);
 }
 
 .log-modal__header-buttons {
@@ -276,7 +382,7 @@
 
 .log-modal__refresh-label {
     font-size: 12px;
-    color: #ccc;
+    color: var(--dist-log-modal-label);
     cursor: pointer;
     white-space: nowrap;
 }
@@ -296,15 +402,15 @@
     font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
     font-size: 12px;
     line-height: 1.4;
-    color: #ddd;
-    background: #0d0d0d;
+    color: var(--dist-log-modal-body-text);
+    background: var(--dist-log-modal-body-bg);
     white-space: pre-wrap;
     word-wrap: break-word;
 }
 
 .log-modal__status {
     padding: 10px 20px;
-    border-top: 1px solid #444;
+    border-top: 1px solid var(--dist-log-modal-header-border);
     font-size: 11px;
-    color: #888;
+    color: var(--dist-log-modal-status);
 }

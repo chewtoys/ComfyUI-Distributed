@@ -27,12 +27,10 @@ const cardConfigs = {
             const participationEnabled = extension.isMasterParticipationEnabled();
             const fallbackActive = extension.isMasterFallbackActive();
             let delegateBadge = '';
-            if (!participationEnabled) {
-                delegateBadge = fallbackActive
-                    ? `<br><small style="color: #6bd06b;">Fallback active • Master executing</small>`
-                    : `<br><small style="color: ${UI_COLORS.SECONDARY_TEXT};">Orchestrator-only mode</small>`;
+            if (!participationEnabled && fallbackActive) {
+                delegateBadge = `<br><span class="dist-worker-info__fallback">Fallback active • Master executing</span>`;
             }
-            return `<strong id="master-name-display">${data?.name || extension.config?.master?.name || "Master"}</strong><br><small style="color: ${UI_COLORS.MUTED_TEXT};"><span id="master-cuda-info">${cudaInfo}Port ${port}</span></small>${delegateBadge}`;
+            return `<span class="dist-worker-info__title" id="master-name-display">${data?.name || extension.config?.master?.name || "Master"}</span><br><span class="dist-worker-info__meta"><span id="master-cuda-info">${cudaInfo}Port ${port}</span></span>${delegateBadge}`;
         },
         controls: { 
             type: 'master'
@@ -63,12 +61,15 @@ const cardConfigs = {
             
             if (isCloud) {
                 // For cloud workers, don't show port (it's always 443)
-                return `<strong>${data.name}</strong><br><small style="color: ${UI_COLORS.MUTED_TEXT};">${data.host}</small>`;
+                return `<span class="dist-worker-info__title">${data.name}</span><br><span class="dist-worker-info__meta">${data.host}</span>`;
             } else if (isRemote) {
-                return `<strong>${data.name}</strong><br><small style="color: ${UI_COLORS.MUTED_TEXT};">${data.host}:${data.port}</small>`;
+                const hostLabel = data.host
+                    ? `${data.host}:${data.port}`
+                    : `Unconfigured remote worker • Port ${data.port}`;
+                return `<span class="dist-worker-info__title">${data.name}</span><br><span class="dist-worker-info__meta">${hostLabel}</span>`;
             } else {
                 const cudaInfo = data.cuda_device !== undefined ? `CUDA ${data.cuda_device} • ` : '';
-                return `<strong>${data.name}</strong><br><small style="color: ${UI_COLORS.MUTED_TEXT};">${cudaInfo}Port ${data.port}</small>`;
+                return `<span class="dist-worker-info__title">${data.name}</span><br><span class="dist-worker-info__meta">${cudaInfo}Port ${data.port}</span>`;
             }
         },
         controls: { 
@@ -401,10 +402,15 @@ export class DistributedUI {
 
         const modal = createLogModal();
         this._logModal = modal;
+        const themeClass =
+            extension.panelElement?.classList.contains("distributed-panel--light")
+                ? "distributed-panel--light"
+                : "";
         modal.mount(document.body, {
             workerName,
             logData,
             fetchLog: fetchLog || (async () => extension.api.getWorkerLog(workerId, 1000)),
+            themeClass,
             onClose: () => {
                 if (this._logModal === modal) {
                     this._logModal = null;
@@ -427,7 +433,8 @@ export class DistributedUI {
         
         const settingsToggle = document.createElement("span");
         settingsToggle.textContent = "▶"; // Right arrow when collapsed
-        settingsToggle.style.cssText = "font-size: 12px; color: #888; transition: all 0.2s ease;";
+        settingsToggle.style.cssText =
+            "font-size: 12px; color: var(--dist-settings-arrow, #888); transition: all 0.2s ease;";
         
         settingsRow.appendChild(settingsToggle);
         settingsRow.appendChild(settingsTitle);
@@ -574,16 +581,22 @@ export class DistributedUI {
                 badge.textContent = message;
                 badge.classList.add("master-info-badge--fallback");
             } else if (!participationEnabled) {
-                message = "Master disabled: running as orchestrator only.";
+                message = "Master disabled: running as orchestrator only";
                 badge.textContent = message;
                 badge.classList.add("master-info-badge--delegate");
             } else {
-                message = "Master participating in workflows.";
+                message = "Master participating in workflows";
                 badge.textContent = message;
             }
             controlsWrapper.appendChild(badge);
         } else if (config.dynamic && data) {
             if (isRemote) {
+                const isCloud = data.type === 'cloud';
+                const workerTypeText = isCloud ? "Cloud worker" : "Remote worker";
+                const workerTypeBadge = this.createInfoBox(workerTypeText);
+                workerTypeBadge.title = "Worker is externally hosted";
+                controlsWrapper.appendChild(workerTypeBadge);
+
                 const logBtn = this.createButton('View Log', () => viewWorkerLog(extension, data.id, true));
                 logBtn.id = `log-${data.id}`;
                 logBtn.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.workerControl;

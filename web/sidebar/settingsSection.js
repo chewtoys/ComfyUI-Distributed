@@ -2,7 +2,7 @@ import { createCheckboxSetting, createNumberSetting } from "../ui/buttonHelpers.
 
 export function renderSettingsSection(extension) {
     const settingsSection = document.createElement("div");
-    settingsSection.style.cssText = "border-top: 1px solid #444; margin-bottom: 10px;";
+    settingsSection.style.cssText = "border-top: 1px solid var(--dist-divider, #444); margin-bottom: 10px;";
 
     const settingsToggleArea = document.createElement("div");
     settingsToggleArea.style.cssText = "padding: 16.5px 0; cursor: pointer; user-select: none;";
@@ -16,21 +16,22 @@ export function renderSettingsSection(extension) {
 
     const workerSettingsToggle = document.createElement("span");
     workerSettingsToggle.textContent = "▶";
-    workerSettingsToggle.style.cssText = "font-size: 12px; color: #888; transition: all 0.2s ease;";
+    workerSettingsToggle.style.cssText =
+        "font-size: 12px; color: var(--dist-settings-arrow, #888); transition: all 0.2s ease;";
 
     settingsHeader.appendChild(workerSettingsTitle);
     settingsHeader.appendChild(workerSettingsToggle);
     settingsToggleArea.appendChild(settingsHeader);
 
     settingsToggleArea.onmouseover = () => {
-        workerSettingsToggle.style.color = "#fff";
+        workerSettingsToggle.style.color = "var(--dist-settings-arrow-hover, #fff)";
     };
     settingsToggleArea.onmouseout = () => {
-        workerSettingsToggle.style.color = "#888";
+        workerSettingsToggle.style.color = "var(--dist-settings-arrow, #888)";
     };
 
     const settingsSeparator = document.createElement("div");
-    settingsSeparator.style.cssText = "border-bottom: 1px solid #444; margin: 0;";
+    settingsSeparator.style.cssText = "border-bottom: 1px solid var(--dist-divider, #444); margin: 0;";
 
     const settingsContent = document.createElement("div");
     settingsContent.style.cssText =
@@ -59,12 +60,12 @@ export function renderSettingsSection(extension) {
     const generalLabel = document.createElement("div");
     generalLabel.textContent = "GENERAL";
     generalLabel.style.cssText =
-        "grid-column: 1 / span 2; font-size: 11px; color: #888; letter-spacing: 0.06em; padding-top: 2px;";
+        "grid-column: 1 / span 2; font-size: 11px; color: var(--dist-muted-text, #888); letter-spacing: 0.06em; padding-top: 2px;";
 
     const timeoutsLabel = document.createElement("div");
     timeoutsLabel.textContent = "TIMEOUTS";
     timeoutsLabel.style.cssText =
-        "grid-column: 1 / span 2; font-size: 11px; color: #888; letter-spacing: 0.06em; padding-top: 4px;";
+        "grid-column: 1 / span 2; font-size: 11px; color: var(--dist-muted-text, #888); letter-spacing: 0.06em; padding-top: 4px;";
 
     settingsDiv.appendChild(generalLabel);
     settingsDiv.appendChild(

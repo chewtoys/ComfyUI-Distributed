@@ -95,13 +95,16 @@ export function createLogModal() {
         }
     };
 
-    const mount = (container, { workerName, logData, onClose, fetchLog }) => {
+    const mount = (container, { workerName, logData, onClose, fetchLog, themeClass = "" }) => {
         _onClose = onClose;
         _fetchLog = fetchLog;
 
         const modal = document.createElement('div');
         modal.id = 'distributed-log-modal';
         modal.className = 'log-modal';
+        if (themeClass) {
+            modal.classList.add(themeClass);
+        }
 
         const content = document.createElement('div');
         content.className = 'log-modal__content';

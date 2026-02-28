@@ -133,8 +133,9 @@ export const UI_STYLES = {
     statusDot: "display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 10px;",
     controlsDiv: "padding: 0 12px 12px 12px; display: flex; gap: 6px;",
     formGroup: "display: flex; flex-direction: column; gap: 5px;",
-    formLabel: "font-size: 12px; color: #ccc; font-weight: 500;",
-    formInput: "padding: 6px 10px; color: white; font-size: 12px; transition: border-color 0.2s;",
+    formLabel: "font-size: 12px; color: var(--dist-label-text, #ccc); font-weight: 500;",
+    formInput:
+        "padding: 6px 10px; color: var(--dist-input-text, white); background: var(--dist-input-bg, transparent); font-size: 12px; transition: border-color 0.2s;",
     
     // Card styles
     cardBase: "margin-bottom: 12px; overflow: hidden; display: flex;",
@@ -146,7 +147,7 @@ export const UI_STYLES = {
     columnBase: "display: flex; align-items: center; justify-content: center;",
     checkboxColumn: "flex: 0 0 44px; display: flex; align-items: center; justify-content: center; cursor: default;",
     contentColumn: "flex: 1; display: flex; flex-direction: column; transition: background-color 0.2s ease;",
-    iconColumn: "width: 44px; flex-shrink: 0; font-size: 20px; color: #666;",
+    iconColumn: "width: 44px; flex-shrink: 0; font-size: 20px; color: var(--dist-placeholder-add-color, #666);",
     
     // Row and content styles
     infoRow: "display: flex; align-items: center; padding: 12px; cursor: pointer; min-height: 64px;",
@@ -156,13 +157,15 @@ export const UI_STYLES = {
     buttonGroup: "display: flex; gap: 4px; margin-top: 10px;",
     settingsForm: "display: flex; flex-direction: column; gap: 10px;",
     checkboxGroup: "display: flex; align-items: center; gap: 8px; margin: 5px 0;",
-    formLabelClickable: "font-size: 12px; color: #ccc; cursor: pointer;",
+    formLabelClickable: "font-size: 12px; color: var(--dist-label-text, #ccc); cursor: pointer;",
     settingsToggle: "display: flex; align-items: center; gap: 6px; padding: 4px 0; cursor: pointer; user-select: none;",
     controlsWrapper: "display: flex; gap: 6px; align-items: stretch; width: 100%;",
     
     // Existing styles
-    settingsArrow: "font-size: 12px; color: #888; transition: all 0.2s ease; margin-left: auto; padding: 4px;",
-    infoBox: "color: #999; padding: 5px 14px; font-size: 11px; text-align: center; flex: 1; font-weight: 500;",
+    settingsArrow:
+        "font-size: 12px; color: var(--dist-settings-arrow, #888); transition: all 0.2s ease; margin-left: auto; padding: 4px;",
+    infoBox:
+        "color: var(--dist-info-box-text, #999); padding: 5px 14px; font-size: 11px; text-align: center; flex: 1; font-weight: 500;",
     workerSettings: "margin: 0 12px; padding: 0 12px;"
 };
 

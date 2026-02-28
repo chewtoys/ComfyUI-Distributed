@@ -15,7 +15,7 @@ export function createCheckboxSetting(id, label, tooltip, checked, onChange) {
     const lbl = document.createElement("label");
     lbl.htmlFor = id;
     lbl.textContent = label;
-    lbl.style.cssText = "font-size: 12px; color: #ccc; cursor: pointer;";
+    lbl.style.cssText = "font-size: 12px; color: var(--dist-label-text, #ccc); cursor: pointer;";
     if (tooltip) {
         lbl.title = tooltip;
     }
@@ -32,7 +32,7 @@ export function createNumberSetting(id, label, tooltip, value, min, step, onChan
     const lbl = document.createElement("label");
     lbl.htmlFor = id;
     lbl.textContent = label;
-    lbl.style.cssText = "font-size: 12px; color: #ccc;";
+    lbl.style.cssText = "font-size: 12px; color: var(--dist-label-text, #ccc);";
     if (tooltip) {
         lbl.title = tooltip;
     }
@@ -42,7 +42,8 @@ export function createNumberSetting(id, label, tooltip, value, min, step, onChan
     input.id = id;
     input.min = String(min);
     input.step = String(step);
-    input.style.cssText = "width: 80px; padding: 2px 6px; background: #222; color: #ddd; border: 1px solid #333; border-radius: 3px;";
+    input.style.cssText =
+        "width: 80px; padding: 2px 6px; background: var(--dist-input-bg, #222); color: var(--dist-input-text, #ddd); border: 1px solid var(--dist-input-border, #333); border-radius: 3px;";
     input.value = value;
     input.onchange = onChange;
 

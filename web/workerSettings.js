@@ -4,14 +4,22 @@ import { parseHostInput } from './urlUtils.js';
 import { toggleWorkerExpanded } from './workerLifecycle.js';
 
 export function isRemoteWorker(extension, worker) {
-    // Check if explicitly marked as cloud worker
-    if (worker.type === "cloud") {
+    const workerType = String(worker?.type || "").toLowerCase();
+
+    // Explicit type always wins over host heuristics.
+    if (workerType === "cloud" || workerType === "remote") {
         return true;
     }
+    if (workerType === "local") {
+        return false;
+    }
+
     // Otherwise check by host (backward compatibility)
-    const parsed = parseHostInput(worker.host || window.location.hostname);
-    const host = parsed.host || window.location.hostname;
-    return host !== "localhost" && host !== "127.0.0.1" && host !== window.location.hostname;
+    const parsed = parseHostInput(worker?.host || window.location.hostname);
+    const host = String(parsed.host || window.location.hostname || "").toLowerCase();
+    const currentHost = String(parseHostInput(window.location.hostname).host || window.location.hostname || "").toLowerCase();
+    const localHosts = new Set(["", "localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"]);
+    return !(localHosts.has(host) || host === currentHost);
 }
 
 export function isCloudWorker(extension, worker) {
@@ -32,6 +40,7 @@ export async function saveWorkerSettings(extension, workerId) {
     const rawHost = isRemote ? document.getElementById(`host-${workerId}`).value : window.location.hostname;
     const parsedHost = isRemote ? parseHostInput(rawHost) : { host: window.location.hostname, port: null };
     const host = isRemote ? parsedHost.host : window.location.hostname;
+    const hostTrimmed = (host || "").trim();
     let port = parseInt(document.getElementById(`port-${workerId}`).value);
     const cudaDevice = isRemote ? undefined : parseInt(document.getElementById(`cuda-${workerId}`).value);
     const extraArgs = isRemote ? undefined : document.getElementById(`args-${workerId}`).value;
@@ -51,7 +60,7 @@ export async function saveWorkerSettings(extension, workerId) {
         return;
     }
 
-    if ((workerType === "remote" || workerType === "cloud") && !host.trim()) {
+    if ((workerType === "remote" || workerType === "cloud") && !hostTrimmed) {
         extension.app.extensionManager.toast.add({
             severity: "error",
             summary: "Validation Error",
@@ -102,7 +111,7 @@ export async function saveWorkerSettings(extension, workerId) {
         }
     } else {
         // For remote workers, only check conflicts with other workers on the same host
-        const sameHostConflict = extension.config.workers.some((w) => w.id !== workerId && w.port === port && w.host === host.trim());
+        const sameHostConflict = extension.config.workers.some((w) => w.id !== workerId && w.port === port && w.host === hostTrimmed);
 
         if (sameHostConflict) {
             extension.app.extensionManager.toast.add({
@@ -115,21 +124,28 @@ export async function saveWorkerSettings(extension, workerId) {
         }
     }
 
+    const wasUnconfiguredRemote =
+        (worker.type === "remote" || worker.type === "cloud") &&
+        (!String(worker.host || "").trim()) &&
+        !worker.enabled;
+    const nextEnabled = isRemote && hostTrimmed && wasUnconfiguredRemote ? true : worker.enabled;
+
     try {
         await extension.api.updateWorker(workerId, {
             name: name.trim(),
             type: workerType,
-            host: isRemote ? host.trim() : null,
+            host: isRemote ? hostTrimmed : null,
             port,
             cuda_device: isRemote ? null : cudaDevice,
             extra_args: isRemote ? null : extraArgs ? extraArgs.trim() : "",
+            enabled: nextEnabled,
         });
 
         // Update local config
         worker.name = name.trim();
         worker.type = workerType;
         if (isRemote) {
-            worker.host = host.trim();
+            worker.host = hostTrimmed;
             delete worker.cuda_device;
             delete worker.extra_args;
         } else {
@@ -138,14 +154,17 @@ export async function saveWorkerSettings(extension, workerId) {
             worker.extra_args = extraArgs ? extraArgs.trim() : "";
         }
         worker.port = port;
+        worker.enabled = nextEnabled;
 
         // Sync to state
-        extension.state.updateWorker(workerId, { enabled: worker.enabled });
+        extension.state.updateWorker(workerId, { enabled: nextEnabled });
 
         extension.app.extensionManager.toast.add({
             severity: "success",
             summary: "Settings Saved",
-            detail: `Worker ${name} settings updated`,
+            detail: nextEnabled && wasUnconfiguredRemote
+                ? `Worker ${name} configured and enabled`
+                : `Worker ${name} settings updated`,
             life: 3000,
         });
 
@@ -229,6 +248,44 @@ export async function deleteWorker(extension, workerId) {
 }
 
 export async function addNewWorker(extension) {
+    const toInt = (value) => {
+        const parsed = Number.parseInt(value, 10);
+        return Number.isFinite(parsed) ? parsed : null;
+    };
+
+    const totalCudaDevices = toInt(extension.cudaDeviceCount);
+    const masterCudaDevice = toInt(extension.masterCudaDevice ?? extension.config?.master?.cuda_device);
+    const localWorkers = (extension.config?.workers || []).filter((w) => !isRemoteWorker(extension, w));
+
+    let selectedCudaDevice = extension.config.workers.length;
+    let fallbackToRemote = false;
+    if (totalCudaDevices !== null && totalCudaDevices > 0) {
+        const usedCudaDevices = new Set();
+        for (const worker of localWorkers) {
+            const cudaIdx = toInt(worker.cuda_device);
+            if (cudaIdx !== null) {
+                usedCudaDevices.add(cudaIdx);
+            }
+        }
+        if (masterCudaDevice !== null) {
+            usedCudaDevices.add(masterCudaDevice);
+        }
+
+        const availableCudaDevices = [];
+        for (let i = 0; i < totalCudaDevices; i++) {
+            if (!usedCudaDevices.has(i)) {
+                availableCudaDevices.push(i);
+            }
+        }
+
+        if (availableCudaDevices.length === 0) {
+            fallbackToRemote = true;
+            selectedCudaDevice = null;
+        } else {
+            selectedCudaDevice = availableCudaDevices[0];
+        }
+    }
+
     // Generate new worker ID using UUID (fallback for non-secure contexts)
     const newId = generateUUID();
 
@@ -244,8 +301,10 @@ export async function addNewWorker(extension) {
         id: newId,
         name: `Worker ${extension.config.workers.length + 1}`,
         port: nextPort,
-        cuda_device: extension.config.workers.length,
-        enabled: true, // Default to enabled for convenience
+        type: fallbackToRemote ? "remote" : "local",
+        host: fallbackToRemote ? "" : null,
+        cuda_device: selectedCudaDevice,
+        enabled: fallbackToRemote ? false : true, // Remote fallback starts disabled until configured
         extra_args: "",
     };
 
@@ -260,16 +319,20 @@ export async function addNewWorker(extension) {
             cuda_device: newWorker.cuda_device,
             extra_args: newWorker.extra_args,
             enabled: newWorker.enabled,
+            host: newWorker.host,
+            type: newWorker.type,
         });
 
         // Sync to state
-        extension.state.updateWorker(newId, { enabled: true });
+        extension.state.updateWorker(newId, { enabled: newWorker.enabled });
 
         extension.app.extensionManager.toast.add({
-            severity: "success",
-            summary: "Worker Added",
-            detail: `New worker created on port ${nextPort}`,
-            life: 3000,
+            severity: fallbackToRemote ? "warn" : "success",
+            summary: fallbackToRemote ? "Remote Worker Added" : "Worker Added",
+            detail: fallbackToRemote
+                ? `No local GPU available, so a disabled remote worker was added on port ${nextPort}. Configure host and enable it.`
+                : `New worker created on port ${nextPort}`,
+            life: fallbackToRemote ? 5000 : 3000,
         });
 
         // Refresh UI and expand the new worker

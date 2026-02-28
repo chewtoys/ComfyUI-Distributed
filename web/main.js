@@ -37,6 +37,7 @@ class DistributedExtension {
         
         // Initialize abort controller for status checks
         this.statusCheckAbortController = null;
+        this.themeMutationObserver = null;
 
         // Inject CSS for pulsing animation
         this.injectStyles();
@@ -264,6 +265,7 @@ class DistributedExtension {
                 this.onPanelOpen();
                 renderSidebarContent(this, el);
                 this._applyNodes2Style();
+                this._applyThemeToneClass();
             },
             destroy: () => {
                 this.onPanelClose();
@@ -276,6 +278,8 @@ class DistributedExtension {
         if (!this.statusCheckTimeout) {
             checkAllWorkerStatuses(this);
         }
+        this._startThemeObserver();
+        this._applyThemeToneClass();
     }
 
     onPanelClose() {
@@ -292,6 +296,7 @@ class DistributedExtension {
             clearTimeout(this.statusCheckTimeout);
             this.statusCheckTimeout = null;
         }
+        this._stopThemeObserver();
 
         this.panelElement = null;
     }
@@ -302,11 +307,108 @@ class DistributedExtension {
         this.panelElement.classList.toggle('distributed-panel--nodes2', Boolean(enabled));
     }
 
+    _parseColorToRgba(colorValue) {
+        if (!colorValue || typeof colorValue !== "string") {
+            return null;
+        }
+
+        const color = colorValue.trim().toLowerCase();
+        if (!color || color === "transparent") {
+            return null;
+        }
+
+        const rgbMatch = color.match(/^rgba?\(([^)]+)\)$/);
+        if (rgbMatch) {
+            const parts = rgbMatch[1].split(",").map((part) => Number(part.trim()));
+            if (parts.length < 3 || parts.slice(0, 3).some((part) => Number.isNaN(part))) {
+                return null;
+            }
+            const alpha = parts.length >= 4 && Number.isFinite(parts[3]) ? parts[3] : 1;
+            return {
+                r: Math.max(0, Math.min(255, parts[0])),
+                g: Math.max(0, Math.min(255, parts[1])),
+                b: Math.max(0, Math.min(255, parts[2])),
+                a: Math.max(0, Math.min(1, alpha)),
+            };
+        }
+
+        const hexMatch = color.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+        if (hexMatch) {
+            const value = hexMatch[1];
+            const expanded = value.length === 3
+                ? value.split("").map((c) => `${c}${c}`).join("")
+                : value;
+            const r = parseInt(expanded.slice(0, 2), 16);
+            const g = parseInt(expanded.slice(2, 4), 16);
+            const b = parseInt(expanded.slice(4, 6), 16);
+            return { r, g, b, a: 1 };
+        }
+
+        return null;
+    }
+
+    _isPanelLightTheme() {
+        const fallbackLight = window.matchMedia?.("(prefers-color-scheme: light)")?.matches || false;
+        if (!this.panelElement) {
+            return fallbackLight;
+        }
+
+        let current = this.panelElement;
+        while (current) {
+            const bg = getComputedStyle(current).backgroundColor;
+            const rgba = this._parseColorToRgba(bg);
+            if (rgba && rgba.a > 0.02) {
+                // Relative luminance approximation (0..1)
+                const luminance = (0.2126 * rgba.r + 0.7152 * rgba.g + 0.0722 * rgba.b) / 255;
+                return luminance > 0.58;
+            }
+            current = current.parentElement;
+        }
+
+        return fallbackLight;
+    }
+
+    _applyThemeToneClass() {
+        if (!this.panelElement) {
+            return;
+        }
+        this.panelElement.classList.toggle("distributed-panel--light", this._isPanelLightTheme());
+    }
+
+    _startThemeObserver() {
+        if (this.themeMutationObserver) {
+            return;
+        }
+
+        this.themeMutationObserver = new MutationObserver(() => {
+            this._applyThemeToneClass();
+        });
+        this.themeMutationObserver.observe(document.documentElement, {
+            attributes: true,
+            attributeFilter: ["class", "style"],
+        });
+        if (document.body) {
+            this.themeMutationObserver.observe(document.body, {
+                attributes: true,
+                attributeFilter: ["class", "style"],
+            });
+        }
+    }
+
+    _stopThemeObserver() {
+        if (!this.themeMutationObserver) {
+            return;
+        }
+        this.themeMutationObserver.disconnect();
+        this.themeMutationObserver = null;
+    }
+
     _setupNodes2Listener() {
         app.ui.settings.addEventListener("Comfy.VueNodes.Enabled.change", (e) => {
             const enabled = e.detail?.value ?? false;
             if (this.panelElement) {
                 this.panelElement.classList.toggle('distributed-panel--nodes2', Boolean(enabled));
+                this._applyThemeToneClass();
             }
         });
     }

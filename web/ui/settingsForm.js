@@ -14,11 +14,12 @@ export function createWorkerSettingsForm(ui, extension, worker) {
     const typeLabel = document.createElement("label");
     typeLabel.htmlFor = `worker-type-${worker.id}`;
     typeLabel.textContent = "Worker Type:";
-    typeLabel.style.cssText = "font-size: 12px; color: #ccc;";
+    typeLabel.style.cssText = "font-size: 12px; color: var(--dist-label-text, #ccc);";
 
     const typeSelect = document.createElement("select");
     typeSelect.id = `worker-type-${worker.id}`;
-    typeSelect.style.cssText = "padding: 4px 8px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px; font-size: 12px;";
+    typeSelect.style.cssText =
+        "padding: 4px 8px; background: var(--dist-input-bg, #333); color: var(--dist-input-text, #fff); border: 1px solid var(--dist-input-border, #555); border-radius: 4px; font-size: 12px;";
 
     const localOption = document.createElement("option");
     localOption.value = "local";
