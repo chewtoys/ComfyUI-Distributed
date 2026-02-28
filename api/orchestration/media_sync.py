@@ -57,13 +57,13 @@ def convert_paths_for_platform(obj, target_separator):
 
 
 def _find_media_references(prompt_obj):
-    """Find media file references in image/video/audio inputs used by worker prompts."""
+    """Find media file references in image/video/audio/file inputs used by worker prompts."""
     media_refs = set()
     for node in prompt_obj.values():
         if not isinstance(node, dict):
             continue
         inputs = node.get("inputs", {})
-        for key in ("image", "video", "audio"):
+        for key in ("image", "video", "audio", "file"):
             value = inputs.get(key)
             if isinstance(value, str):
                 cleaned = re.sub(r"\s*\[\w+\]$", "", value).strip().replace("\\", "/")
