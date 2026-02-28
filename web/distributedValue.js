@@ -2,11 +2,9 @@ import { app } from "/scripts/app.js";
 import { ENDPOINTS } from "./constants.js";
 
 const NODE_CLASS = "DistributedValue";
-const WORKER_WIDGET_PREFIX = "_dv_worker_";
-
-// ---------------------------------------------------------------------------
-// Config helpers
-// ---------------------------------------------------------------------------
+const CONVERTED_WIDGET = "converted-widget";
+const DYNAMIC_DEFAULT_WIDGET = "_dv_default";
+const DYNAMIC_WORKER_WIDGET_PREFIX = "_dv_worker_";
 
 async function fetchWorkers() {
     try {
@@ -19,176 +17,305 @@ async function fetchWorkers() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Hidden widget accessors (worker_values JSON storage)
-// ---------------------------------------------------------------------------
+function getRawDefaultWidget(node) {
+    return node.widgets?.find((w) => w.name === "default_value");
+}
 
-function getWorkerValuesWidget(node) {
+function getRawWorkerValuesWidget(node) {
     return node.widgets?.find((w) => w.name === "worker_values");
 }
 
-function getHiddenWidget(node) {
-    return node._dvHiddenWidget || getWorkerValuesWidget(node);
+function getDynamicDefaultWidget(node) {
+    return node.widgets?.find((w) => w.name === DYNAMIC_DEFAULT_WIDGET);
 }
 
-function getWorkerWidgets(node) {
-    return (node.widgets || []).filter((w) => w.name.startsWith(WORKER_WIDGET_PREFIX));
+function getDynamicWorkerWidgets(node) {
+    return (node.widgets || []).filter((w) => w.name.startsWith(DYNAMIC_WORKER_WIDGET_PREFIX));
 }
 
-function readStore(node) {
-    const w = getHiddenWidget(node);
-    if (!w) return {};
+function hideWidgetForGood(node, widget, suffix = "") {
+    if (!widget) return;
+    if (typeof widget.type === "string" && widget.type.startsWith(CONVERTED_WIDGET)) return;
+
+    widget.origType = widget.type;
+    widget.origComputeSize = widget.computeSize;
+    widget.origSerializeValue = widget.serializeValue;
+    widget.computeSize = () => [0, -4];
+    widget.type = `${CONVERTED_WIDGET}${suffix}`;
+
+    // Hide any attached DOM element (multiline widgets).
+    if (widget.element) widget.element.style.display = "none";
+    if (widget.inputEl) widget.inputEl.style.display = "none";
+
+    if (widget.linkedWidgets) {
+        for (const linked of widget.linkedWidgets) {
+            hideWidgetForGood(node, linked, `:${widget.name}`);
+        }
+    }
+}
+
+function hideRawWidgets(node) {
+    hideWidgetForGood(node, getRawDefaultWidget(node), ":default_value");
+    hideWidgetForGood(node, getRawWorkerValuesWidget(node), ":worker_values");
+}
+
+function removeDynamicDefaultWidget(node) {
+    const idx = node.widgets?.findIndex((w) => w.name === DYNAMIC_DEFAULT_WIDGET);
+    if (idx != null && idx >= 0) {
+        node.widgets.splice(idx, 1);
+    }
+}
+
+function removeDynamicWorkerWidgets(node) {
+    if (!node.widgets) return;
+    for (let i = node.widgets.length - 1; i >= 0; i--) {
+        if (node.widgets[i].name.startsWith(DYNAMIC_WORKER_WIDGET_PREFIX)) {
+            node.widgets.splice(i, 1);
+        }
+    }
+}
+
+function readWorkerStore(node) {
+    const raw = getRawWorkerValuesWidget(node);
+    if (!raw) return {};
     try {
-        const parsed = JSON.parse(w.value || "{}");
+        const parsed = JSON.parse(raw.value || "{}");
         return typeof parsed === "object" && parsed !== null ? parsed : {};
     } catch {
         return {};
     }
 }
 
-function writeStore(node, patch) {
-    const w = getHiddenWidget(node);
-    if (!w) return;
-    const store = readStore(node);
-    Object.assign(store, patch);
-    w.value = JSON.stringify(store);
+function writeWorkerStore(node, store) {
+    const raw = getRawWorkerValuesWidget(node);
+    if (!raw) return;
+    raw.value = JSON.stringify(store);
 }
 
-function serializeWorkerValues(node) {
-    const store = readStore(node);
-    // Keep metadata keys (_type, _options) but overwrite worker values
-    const newStore = { _type: store._type || "STRING" };
-    if (store._options) newStore._options = store._options;
-    for (const w of getWorkerWidgets(node)) {
-        const key = w.name.slice(WORKER_WIDGET_PREFIX.length);
-        const val = w.value;
-        if (val !== undefined && val !== null && val !== "") {
-            newStore[key] = String(val);
-        }
+function normalizeComboOptions(options) {
+    if (!options) return null;
+    if (Array.isArray(options)) return options;
+    if (Array.isArray(options.values)) return options.values;
+    return null;
+}
+
+function resolveGraphLink(graph, linkId) {
+    const links = graph.links || graph._links;
+    if (!links) return null;
+    const link = links[linkId] ?? (typeof links.get === "function" ? links.get(linkId) : null);
+    if (!link) return null;
+    if (Array.isArray(link)) {
+        return {
+            target_id: link[2],
+            target_slot: link[3],
+        };
     }
-    const hidden = getHiddenWidget(node);
-    if (hidden) hidden.value = JSON.stringify(newStore);
+    return link;
 }
-
-// ---------------------------------------------------------------------------
-// Hide the raw worker_values widget
-// ---------------------------------------------------------------------------
-
-function hideRawWidget(node) {
-    const w = getWorkerValuesWidget(node);
-    if (!w) return;
-
-    // Hide any DOM elements (multiline creates a textarea)
-    if (w.element) w.element.style.display = "none";
-    if (w.inputEl) w.inputEl.style.display = "none";
-
-    // Remove from visible widgets array
-    const idx = node.widgets.indexOf(w);
-    if (idx !== -1) node.widgets.splice(idx, 1);
-
-    // Keep reference
-    node._dvHiddenWidget = w;
-}
-
-// ---------------------------------------------------------------------------
-// Connection type detection
-// ---------------------------------------------------------------------------
 
 function detectTargetType(node) {
-    // Find what our output (slot 0) is connected to
-    if (!node.outputs || !node.outputs[0] || !node.outputs[0].links) {
-        return { type: "STRING", options: null };
-    }
-    const linkIds = node.outputs[0].links;
-    if (!linkIds || linkIds.length === 0) {
-        return { type: "STRING", options: null };
+    const out = node.outputs?.[0];
+    const linkIds = out?.links || [];
+    if (!linkIds.length) {
+        return { connected: false, type: "STRING", options: null };
     }
 
     const graph = node.graph || app.graph;
-    if (!graph) return { type: "STRING", options: null };
+    if (!graph) {
+        return { connected: false, type: "STRING", options: null };
+    }
 
-    // Use the first connection to determine type
-    const linkId = linkIds[0];
-    const link = graph.links?.[linkId] || graph._links?.get?.(linkId);
-    if (!link) return { type: "STRING", options: null };
+    const link = resolveGraphLink(graph, linkIds[0]);
+    if (!link) {
+        return { connected: false, type: "STRING", options: null };
+    }
 
     const targetNode = graph.getNodeById(link.target_id);
-    if (!targetNode) return { type: "STRING", options: null };
+    if (!targetNode) {
+        return { connected: false, type: "STRING", options: null };
+    }
 
     const targetInputName = targetNode.inputs?.[link.target_slot]?.name;
-    if (!targetInputName) return { type: "STRING", options: null };
+    if (!targetInputName) {
+        return { connected: false, type: "STRING", options: null };
+    }
 
-    // Find the corresponding widget on the target node to get type info
     const targetWidget = targetNode.widgets?.find((w) => w.name === targetInputName);
-    if (!targetWidget) {
-        // Check node definition for input type
-        const nodeDef = targetNode.constructor?.nodeData;
-        if (nodeDef) {
-            const inputDef =
-                nodeDef.input?.required?.[targetInputName] ||
-                nodeDef.input?.optional?.[targetInputName];
-            if (inputDef) {
-                if (Array.isArray(inputDef[0])) {
-                    return { type: "COMBO", options: inputDef[0] };
-                }
-                const typeName = inputDef[0];
-                if (typeName === "INT") return { type: "INT", options: null };
-                if (typeName === "FLOAT") return { type: "FLOAT", options: null };
-            }
+    if (targetWidget) {
+        if (targetWidget.type === "combo") {
+            const comboOptions = normalizeComboOptions(targetWidget.options);
+            return { connected: true, type: "COMBO", options: comboOptions };
         }
-        return { type: "STRING", options: null };
+        if (targetWidget.type === "number") {
+            const step = targetWidget.options?.step;
+            const precision = targetWidget.options?.precision;
+            const isInt = Number.isInteger(step) && (precision === 0 || precision == null);
+            return { connected: true, type: isInt ? "INT" : "FLOAT", options: null };
+        }
     }
 
-    // Detect type from widget
-    if (targetWidget.type === "combo") {
-        const options = targetWidget.options?.values || [];
-        return { type: "COMBO", options };
-    }
-    if (targetWidget.type === "number") {
-        // Distinguish INT vs FLOAT from the widget options
-        const step = targetWidget.options?.step;
-        if (step !== undefined && step % 1 === 0 && (!targetWidget.options?.precision || targetWidget.options.precision === 0)) {
-            return { type: "INT", options: null };
+    const nodeDef = targetNode.constructor?.nodeData;
+    const inputDef = nodeDef?.input?.required?.[targetInputName] || nodeDef?.input?.optional?.[targetInputName];
+    if (inputDef) {
+        const defType = inputDef[0];
+        if (Array.isArray(defType)) {
+            return { connected: true, type: "COMBO", options: defType };
         }
-        return { type: "FLOAT", options: null };
+        if (defType === "INT") return { connected: true, type: "INT", options: null };
+        if (defType === "FLOAT") return { connected: true, type: "FLOAT", options: null };
     }
 
-    return { type: "STRING", options: null };
+    return { connected: true, type: "STRING", options: null };
 }
 
-// ---------------------------------------------------------------------------
-// Worker widget creation
-// ---------------------------------------------------------------------------
+function normalizeNumber(value, fallback) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+}
 
-function removeWorkerWidgets(node) {
-    for (let i = node.widgets.length - 1; i >= 0; i--) {
-        if (node.widgets[i].name.startsWith(WORKER_WIDGET_PREFIX)) {
-            node.widgets.splice(i, 1);
+function getDefaultInitialValue(node, inputType, comboOptions) {
+    const rawDefault = getRawDefaultWidget(node);
+    const current = rawDefault?.value;
+
+    if (inputType === "INT") {
+        return Math.trunc(normalizeNumber(current, 0));
+    }
+    if (inputType === "FLOAT") {
+        return normalizeNumber(current, 0);
+    }
+    if (inputType === "COMBO" && Array.isArray(comboOptions) && comboOptions.length) {
+        const currentText = current == null ? "" : String(current);
+        return comboOptions.includes(currentText) ? currentText : comboOptions[0];
+    }
+    return current == null ? "" : String(current);
+}
+
+function setRawDefaultValue(node, value) {
+    const rawDefault = getRawDefaultWidget(node);
+    if (!rawDefault) return;
+    rawDefault.value = value;
+}
+
+function serializeWorkerStoreFromWidgets(node, inputType, comboOptions) {
+    const nextStore = { _type: inputType };
+    if (inputType === "COMBO" && Array.isArray(comboOptions)) {
+        nextStore._options = comboOptions;
+    }
+
+    for (const widget of getDynamicWorkerWidgets(node)) {
+        const key = widget.name.slice(DYNAMIC_WORKER_WIDGET_PREFIX.length);
+        if (widget.value !== "" && widget.value !== null && widget.value !== undefined) {
+            nextStore[key] = String(widget.value);
         }
     }
+
+    writeWorkerStore(node, nextStore);
+}
+
+function updateWorkerStoreTypeMetadata(node, inputType, comboOptions) {
+    const store = readWorkerStore(node);
+    store._type = inputType;
+    if (inputType === "COMBO" && Array.isArray(comboOptions)) {
+        store._options = comboOptions;
+    } else {
+        delete store._options;
+    }
+    writeWorkerStore(node, store);
+}
+
+function createDynamicDefaultWidget(node, inputType, comboOptions) {
+    removeDynamicDefaultWidget(node);
+    const initial = getDefaultInitialValue(node, inputType, comboOptions);
+    let widget;
+
+    if (inputType === "COMBO" && Array.isArray(comboOptions) && comboOptions.length) {
+        widget = node.addWidget(
+            "combo",
+            DYNAMIC_DEFAULT_WIDGET,
+            initial,
+            (value) => {
+                widget.value = value;
+                setRawDefaultValue(node, String(value));
+            },
+            { values: comboOptions }
+        );
+    } else if (inputType === "INT") {
+        widget = node.addWidget(
+            "number",
+            DYNAMIC_DEFAULT_WIDGET,
+            initial,
+            (value) => {
+                widget.value = Math.trunc(normalizeNumber(value, 0));
+                setRawDefaultValue(node, widget.value);
+            },
+            { min: -Infinity, max: Infinity, step: 1, precision: 0 }
+        );
+    } else if (inputType === "FLOAT") {
+        widget = node.addWidget(
+            "number",
+            DYNAMIC_DEFAULT_WIDGET,
+            initial,
+            (value) => {
+                widget.value = normalizeNumber(value, 0);
+                setRawDefaultValue(node, widget.value);
+            },
+            { min: -Infinity, max: Infinity, step: 0.1, precision: 3 }
+        );
+    } else {
+        widget = node.addWidget(
+            "string",
+            DYNAMIC_DEFAULT_WIDGET,
+            initial,
+            (value) => {
+                widget.value = value ?? "";
+                setRawDefaultValue(node, widget.value);
+            },
+            {}
+        );
+    }
+
+    widget.label = "default_value";
+}
+
+function getWorkerInitialValue(store, key, inputType, comboOptions) {
+    const saved = store[key];
+    if (saved == null) {
+        if (inputType === "INT" || inputType === "FLOAT") return 0;
+        if (inputType === "COMBO" && Array.isArray(comboOptions) && comboOptions.length) {
+            return comboOptions[0];
+        }
+        return "";
+    }
+
+    if (inputType === "INT") return Math.trunc(normalizeNumber(saved, 0));
+    if (inputType === "FLOAT") return normalizeNumber(saved, 0);
+    if (inputType === "COMBO" && Array.isArray(comboOptions) && comboOptions.length) {
+        const savedText = String(saved);
+        return comboOptions.includes(savedText) ? savedText : comboOptions[0];
+    }
+    return String(saved);
 }
 
 function createWorkerWidgets(node, workers, inputType, comboOptions) {
-    removeWorkerWidgets(node);
-
-    const store = readStore(node);
+    removeDynamicWorkerWidgets(node);
+    const store = readWorkerStore(node);
 
     for (let i = 0; i < workers.length; i++) {
-        const worker = workers[i];
         const key = String(i + 1);
-        const widgetName = `${WORKER_WIDGET_PREFIX}${key}`;
+        const worker = workers[i];
         const label = worker.name || worker.id || `Worker ${key}`;
-        const savedValue = store[key] || "";
-
+        const widgetName = `${DYNAMIC_WORKER_WIDGET_PREFIX}${key}`;
+        const initial = getWorkerInitialValue(store, key, inputType, comboOptions);
         let widget;
-        if (inputType === "COMBO" && Array.isArray(comboOptions) && comboOptions.length > 0) {
+
+        if (inputType === "COMBO" && Array.isArray(comboOptions) && comboOptions.length) {
             widget = node.addWidget(
                 "combo",
                 widgetName,
-                savedValue || comboOptions[0],
+                initial,
                 (value) => {
                     widget.value = value;
-                    serializeWorkerValues(node);
+                    serializeWorkerStoreFromWidgets(node, inputType, comboOptions);
                 },
                 { values: comboOptions }
             );
@@ -196,10 +323,10 @@ function createWorkerWidgets(node, workers, inputType, comboOptions) {
             widget = node.addWidget(
                 "number",
                 widgetName,
-                savedValue ? Number(savedValue) : 0,
+                initial,
                 (value) => {
-                    widget.value = value;
-                    serializeWorkerValues(node);
+                    widget.value = Math.trunc(normalizeNumber(value, 0));
+                    serializeWorkerStoreFromWidgets(node, inputType, comboOptions);
                 },
                 { min: -Infinity, max: Infinity, step: 1, precision: 0 }
             );
@@ -207,56 +334,53 @@ function createWorkerWidgets(node, workers, inputType, comboOptions) {
             widget = node.addWidget(
                 "number",
                 widgetName,
-                savedValue ? Number(savedValue) : 0.0,
+                initial,
                 (value) => {
-                    widget.value = value;
-                    serializeWorkerValues(node);
+                    widget.value = normalizeNumber(value, 0);
+                    serializeWorkerStoreFromWidgets(node, inputType, comboOptions);
                 },
                 { min: -Infinity, max: Infinity, step: 0.1, precision: 3 }
             );
         } else {
-            // STRING (default)
             widget = node.addWidget(
                 "string",
                 widgetName,
-                savedValue,
+                initial,
                 (value) => {
-                    widget.value = value;
-                    serializeWorkerValues(node);
+                    widget.value = value ?? "";
+                    serializeWorkerStoreFromWidgets(node, inputType, comboOptions);
                 },
                 {}
             );
         }
+
         widget.label = label;
     }
 
-    // Persist type metadata
-    const patch = { _type: inputType };
-    if (comboOptions) patch._options = comboOptions;
-    writeStore(node, patch);
+    serializeWorkerStoreFromWidgets(node, inputType, comboOptions);
+}
 
-    // Re-serialize worker values after creating widgets
-    serializeWorkerValues(node);
+function rebuildWidgets(node) {
+    hideRawWidgets(node);
+    const workers = node._dvWorkers || [];
+    const store = readWorkerStore(node);
+    const detected = detectTargetType(node);
+    const inputType = detected.connected ? detected.type : (store._type || "STRING");
+    const comboOptions = detected.connected ? detected.options : normalizeComboOptions(store._options);
 
-    // Resize node to fit
+    createDynamicDefaultWidget(node, inputType, comboOptions);
+    if (workers.length > 0) {
+        createWorkerWidgets(node, workers, inputType, comboOptions);
+    } else {
+        removeDynamicWorkerWidgets(node);
+        updateWorkerStoreTypeMetadata(node, inputType, comboOptions);
+    }
+
     const size = node.computeSize();
     size[0] = Math.max(size[0], node.size?.[0] || 0);
     node.setSize(size);
     if (node.setDirtyCanvas) node.setDirtyCanvas(true, true);
 }
-
-// ---------------------------------------------------------------------------
-// Rebuild widgets based on current connection
-// ---------------------------------------------------------------------------
-
-function rebuildWidgets(node, workers) {
-    const { type, options } = detectTargetType(node);
-    createWorkerWidgets(node, workers, type, options);
-}
-
-// ---------------------------------------------------------------------------
-// Extension registration
-// ---------------------------------------------------------------------------
 
 app.registerExtension({
     name: "Distributed.DistributedValue",
@@ -264,49 +388,23 @@ app.registerExtension({
         if (node.comfyClass !== NODE_CLASS) return;
 
         try {
-            const workers = await fetchWorkers();
-            node._dvWorkers = workers;
+            node._dvWorkers = await fetchWorkers();
+            rebuildWidgets(node);
 
-            // Hide the raw worker_values widget
-            hideRawWidget(node);
-
-            // Read stored type or detect from connection
-            const store = readStore(node);
-            const storedType = store._type || "STRING";
-            const storedOptions = store._options || null;
-
-            if (workers.length > 0) {
-                createWorkerWidgets(node, workers, storedType, storedOptions);
-            }
-
-            // Listen for connection changes to adapt widget type
             const originalOnConnectionsChange = node.onConnectionsChange;
-            node.onConnectionsChange = function (side, slotIndex, connected, linkInfo, ioSlot) {
+            node.onConnectionsChange = function (type, index, connected, linkInfo, ioSlot) {
                 if (originalOnConnectionsChange) {
-                    originalOnConnectionsChange.call(this, side, slotIndex, connected, linkInfo, ioSlot);
+                    originalOnConnectionsChange.call(this, type, index, connected, linkInfo, ioSlot);
                 }
-                // side 2 = output; slot 0 = our "value" output
-                if (slotIndex === 0 && this._dvWorkers?.length > 0) {
-                    // Small delay to let litegraph finish link setup
-                    setTimeout(() => rebuildWidgets(this, this._dvWorkers), 50);
+                if (type === 2 && index === 0) {
+                    setTimeout(() => rebuildWidgets(this), 20);
                 }
             };
 
-            // Override configure for workflow load
             const originalConfigure = node.configure;
             node.configure = function (data) {
-                const result = originalConfigure
-                    ? originalConfigure.call(this, data)
-                    : undefined;
-
-                setTimeout(() => {
-                    hideRawWidget(this);
-                    if (this._dvWorkers?.length > 0) {
-                        const s = readStore(this);
-                        createWorkerWidgets(this, this._dvWorkers, s._type || "STRING", s._options || null);
-                    }
-                }, 100);
-
+                const result = originalConfigure ? originalConfigure.call(this, data) : undefined;
+                setTimeout(() => rebuildWidgets(this), 20);
                 return result;
             };
         } catch (error) {
