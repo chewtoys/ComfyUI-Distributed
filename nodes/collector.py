@@ -118,8 +118,12 @@ class DistributedCollectorNode:
                 debug_log(f"Worker - Full error details: URL={url}")
                 raise  # Re-raise to handle at caller level
 
-    def _combine_audio(self, master_audio, worker_audio, empty_audio):
-        """Combine audio from master and workers into a single audio output."""
+    def _combine_audio(self, master_audio, worker_audio, empty_audio, worker_order=None):
+        """Combine audio from master and workers into a single audio output.
+
+        Ordering: master first, then workers in `worker_order` (if provided),
+        then any unexpected worker ids in sorted order.
+        """
         audio_pieces = []
         sample_rate = 44100
 
@@ -130,14 +134,29 @@ class DistributedCollectorNode:
                 audio_pieces.append(waveform)
                 sample_rate = master_audio.get("sample_rate", 44100)
 
-        # Add worker audio in sorted order
-        for worker_id_str in sorted(worker_audio.keys()):
-            w_audio = worker_audio[worker_id_str]
+        # Add worker audio in configured enabled-worker order first.
+        ordered_worker_ids = [str(worker_id) for worker_id in (worker_order or [])]
+        seen = set()
+        for worker_id_str in ordered_worker_ids:
+            seen.add(worker_id_str)
+            w_audio = worker_audio.get(worker_id_str)
             if w_audio is not None:
                 waveform = w_audio.get("waveform")
                 if waveform is not None and waveform.numel() > 0:
                     audio_pieces.append(waveform)
                     # Use first available sample rate
+                    if sample_rate == 44100:
+                        sample_rate = w_audio.get("sample_rate", 44100)
+
+        # Append any audio from unexpected worker ids deterministically.
+        for worker_id_str in sorted(worker_audio.keys()):
+            if worker_id_str in seen:
+                continue
+            w_audio = worker_audio[worker_id_str]
+            if w_audio is not None:
+                waveform = w_audio.get("waveform")
+                if waveform is not None and waveform.numel() > 0:
+                    audio_pieces.append(waveform)
                     if sample_rate == 44100:
                         sample_rate = w_audio.get("sample_rate", 44100)
 
@@ -174,17 +193,31 @@ class DistributedCollectorNode:
     def _reorder_and_combine_tensors(
         self,
         worker_images: dict,
+        worker_order: list,
         master_batch_size: int,
         images_on_cpu,
         delegate_mode: bool,
         fallback_images,
     ) -> torch.Tensor:
-        """Assemble final tensor: master images first, then workers sorted by ID and index."""
+        """Assemble final tensor: master first, then workers in enabled order."""
         ordered_tensors = []
         if not delegate_mode and images_on_cpu is not None:
             for i in range(master_batch_size):
                 ordered_tensors.append(images_on_cpu[i:i+1])
+
+        ordered_worker_ids = [str(worker_id) for worker_id in (worker_order or [])]
+        seen = set()
+        for worker_id_str in ordered_worker_ids:
+            seen.add(worker_id_str)
+            if worker_id_str not in worker_images:
+                continue
+            for idx in sorted(worker_images[worker_id_str].keys()):
+                ordered_tensors.append(worker_images[worker_id_str][idx])
+
+        # Append any unexpected worker ids deterministically.
         for worker_id_str in sorted(worker_images.keys()):
+            if worker_id_str in seen:
+                continue
             for idx in sorted(worker_images[worker_id_str].keys()):
                 ordered_tensors.append(worker_images[worker_id_str][idx])
 
@@ -211,8 +244,16 @@ class DistributedCollectorNode:
         else:
             delegate_mode = delegate_only or is_master_delegate_only()
             # Master mode: collect images and audio from workers
-            enabled_workers = json.loads(enabled_worker_ids)
-            expected_workers = {str(worker_id) for worker_id in enabled_workers}
+            enabled_workers_raw = json.loads(enabled_worker_ids)
+            enabled_workers = []
+            seen_enabled = set()
+            for worker_id in enabled_workers_raw:
+                worker_id_str = str(worker_id)
+                if worker_id_str in seen_enabled:
+                    continue
+                seen_enabled.add(worker_id_str)
+                enabled_workers.append(worker_id_str)
+            expected_workers = set(enabled_workers)
             num_workers = len(expected_workers)
             if num_workers == 0:
                 return (images, audio if audio is not None else self.EMPTY_AUDIO)
@@ -413,13 +454,13 @@ class DistributedCollectorNode:
 
             try:
                 combined = self._reorder_and_combine_tensors(
-                    worker_images, master_batch_size, images_on_cpu, delegate_mode, images
+                    worker_images, enabled_workers, master_batch_size, images_on_cpu, delegate_mode, images
                 )
                 debug_log(f"Master - Job {multi_job_id} complete. Combined {combined.shape[0]} images total "
                           f"(master: {master_batch_size}, workers: {combined.shape[0] - master_batch_size})")
 
                 # Combine audio from master and workers
-                combined_audio = self._combine_audio(master_audio, worker_audio, self.EMPTY_AUDIO)
+                combined_audio = self._combine_audio(master_audio, worker_audio, self.EMPTY_AUDIO, enabled_workers)
 
                 return (combined, combined_audio)
             except Exception as e:
