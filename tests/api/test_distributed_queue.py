@@ -110,6 +110,40 @@ def _load_job_routes_module():
     image_module.ensure_contiguous = lambda tensor: tensor
     sys.modules[f"{package_name}.utils.image"] = image_module
 
+    audio_payload_module = types.ModuleType(f"{package_name}.utils.audio_payload")
+
+    def _decode_audio_payload(payload):
+        if payload is None:
+            return None
+        if not isinstance(payload, dict):
+            raise ValueError("Field 'audio' must be an object when provided.")
+
+        encoded = payload.get("data")
+        shape = payload.get("shape")
+        dtype = payload.get("dtype", "float32")
+        sample_rate = payload.get("sample_rate", 44100)
+        if not isinstance(encoded, str) or not encoded.strip():
+            raise ValueError("Field 'audio.data' must be a non-empty base64 string.")
+        if not isinstance(shape, list) or len(shape) != 3:
+            raise ValueError("Field 'audio.shape' must be a 3-item list.")
+        if dtype != "float32":
+            raise ValueError("Field 'audio.dtype' must be 'float32'.")
+        try:
+            shape_tuple = tuple(int(dim) for dim in shape)
+        except Exception as exc:
+            raise ValueError("Field 'audio.shape' must contain integers.") from exc
+
+        raw = base64.b64decode(encoded, validate=True)
+        expected_bytes = int(np.prod(shape_tuple, dtype=np.int64)) * 4
+        if len(raw) != expected_bytes:
+            raise ValueError("Field 'audio.data' byte size mismatch.")
+
+        waveform = torch.from_numpy(np.frombuffer(raw, dtype=np.float32).reshape(shape_tuple).copy())
+        return {"waveform": waveform, "sample_rate": int(sample_rate)}
+
+    audio_payload_module.decode_audio_payload = _decode_audio_payload
+    sys.modules[f"{package_name}.utils.audio_payload"] = audio_payload_module
+
     network_module = types.ModuleType(f"{package_name}.utils.network")
 
     async def _handle_api_error(_request, error, status=500):
@@ -275,6 +309,16 @@ class JobCompleteAudioPayloadTests(unittest.IsolatedAsyncioTestCase):
         }
         with self.assertRaises(ValueError):
             job_routes._decode_audio_payload(bad)
+
+    def test_decode_audio_payload_rejects_bad_dtype(self):
+        payload = {
+            "sample_rate": 44100,
+            "shape": [1, 2, 4],
+            "dtype": "float16",
+            "data": base64.b64encode((np.zeros((1, 2, 4), dtype=np.float32)).tobytes()).decode("ascii"),
+        }
+        with self.assertRaises(ValueError):
+            job_routes._decode_audio_payload(payload)
 
 
 if __name__ == "__main__":

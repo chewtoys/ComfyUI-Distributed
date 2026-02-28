@@ -22,7 +22,16 @@ from ..workers.detection import (
     is_docker_environment,
     is_runpod_environment,
 )
-from ..utils.async_helpers import PromptValidationError, queue_prompt_payload
+try:
+    from ..utils.async_helpers import PromptValidationError, queue_prompt_payload
+except ImportError:
+    from ..utils.async_helpers import queue_prompt_payload
+
+    class PromptValidationError(RuntimeError):
+        def __init__(self, message, validation_error=None, node_errors=None):
+            super().__init__(str(message))
+            self.validation_error = validation_error if isinstance(validation_error, dict) else {}
+            self.node_errors = node_errors if isinstance(node_errors, dict) else {}
 
 
 @server.PromptServer.instance.routes.get("/distributed/worker_ws")

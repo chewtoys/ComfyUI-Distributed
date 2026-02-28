@@ -195,6 +195,14 @@ def _load_worker_routes_module():
         return "prompt-id"
 
     async_helpers_module.queue_prompt_payload = _queue_prompt_payload
+
+    class _PromptValidationError(RuntimeError):
+        def __init__(self, message="invalid prompt", validation_error=None, node_errors=None):
+            super().__init__(message)
+            self.validation_error = validation_error if isinstance(validation_error, dict) else {}
+            self.node_errors = node_errors if isinstance(node_errors, dict) else {}
+
+    async_helpers_module.PromptValidationError = _PromptValidationError
     sys.modules[f"{package_name}.utils.async_helpers"] = async_helpers_module
 
     schemas_module = types.ModuleType(f"{package_name}.api.schemas")

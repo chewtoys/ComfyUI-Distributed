@@ -9,7 +9,6 @@ import time
 from aiohttp import web
 import server
 import torch
-import numpy as np
 from PIL import Image
 
 from ..utils.logging import debug_log
@@ -135,51 +134,9 @@ def _decode_canonical_png_tensor(image_payload):
 
 def _decode_audio_payload(audio_payload):
     """Decode canonical audio payload into an AUDIO dict."""
-    if audio_payload is None:
-        return None
-    if not isinstance(audio_payload, dict):
-        raise ValueError("Field 'audio' must be an object when provided.")
+    from ..utils.audio_payload import decode_audio_payload
 
-    encoded = audio_payload.get("data")
-    shape = audio_payload.get("shape")
-    sample_rate = audio_payload.get("sample_rate", 44100)
-
-    if not isinstance(encoded, str) or not encoded.strip():
-        raise ValueError("Field 'audio.data' must be a non-empty base64 string.")
-    if not isinstance(shape, list) or len(shape) != 3:
-        raise ValueError("Field 'audio.shape' must be a 3-item list [batch, channels, samples].")
-
-    try:
-        shape_tuple = tuple(int(dim) for dim in shape)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Field 'audio.shape' must contain integers.") from exc
-    if any(dim < 0 for dim in shape_tuple):
-        raise ValueError("Field 'audio.shape' dimensions must be non-negative.")
-
-    try:
-        sample_rate = int(sample_rate)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Field 'audio.sample_rate' must be an integer.") from exc
-    if sample_rate <= 0:
-        raise ValueError("Field 'audio.sample_rate' must be positive.")
-
-    try:
-        raw = base64.b64decode(encoded, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise ValueError("Field 'audio.data' is not valid base64.") from exc
-
-    expected_bytes = int(np.prod(shape_tuple, dtype=np.int64)) * 4
-    if len(raw) != expected_bytes:
-        raise ValueError(
-            f"Field 'audio.data' byte size mismatch: expected {expected_bytes}, got {len(raw)}."
-        )
-
-    array = np.frombuffer(raw, dtype=np.float32).reshape(shape_tuple)
-    waveform = torch.from_numpy(array.copy())
-    return {
-        "waveform": ensure_contiguous(waveform),
-        "sample_rate": sample_rate,
-    }
+    return decode_audio_payload(audio_payload)
 
 
 @server.PromptServer.instance.routes.post("/distributed/prepare_job")
