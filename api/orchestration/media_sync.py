@@ -12,12 +12,13 @@ from ...utils.trace_logger import trace_debug, trace_info
 
 
 LIKELY_FILENAME_RE = re.compile(
-    r"\.(ckpt|safetensors|pt|pth|bin|yaml|json|png|jpg|jpeg|webp|gif|bmp|latent|txt|vae|lora|embedding)"
+    r"\.(ckpt|safetensors|pt|pth|bin|yaml|json|png|jpg|jpeg|webp|gif|bmp|mp4|avi|mov|mkv|webm|"
+    r"wav|mp3|flac|m4a|aac|ogg|opus|aiff|aif|wma|latent|txt|vae|lora|embedding)"
     r"(\s*\[\w+\])?$",
     re.IGNORECASE,
 )
-IMAGE_OR_VIDEO_RE = re.compile(
-    r"\.(png|jpg|jpeg|webp|gif|bmp|mp4|avi|mov|mkv|webm)(\s*\[\w+\])?$",
+MEDIA_FILE_RE = re.compile(
+    r"\.(png|jpg|jpeg|webp|gif|bmp|mp4|avi|mov|mkv|webm|wav|mp3|flac|m4a|aac|ogg|opus|aiff|aif|wma)(\s*\[\w+\])?$",
     re.IGNORECASE,
 )
 
@@ -39,7 +40,7 @@ def convert_paths_for_platform(obj, target_separator):
                     return trimmed
 
                 # Keep relative media-style paths in forward-slash form (Comfy-style annotated paths).
-                if not has_drive and not is_absolute and not has_protocol and IMAGE_OR_VIDEO_RE.search(trimmed):
+                if not has_drive and not is_absolute and not has_protocol and MEDIA_FILE_RE.search(trimmed):
                     return re.sub(r"[\\]+", "/", trimmed)
 
                 if target_separator == "\\":
@@ -56,17 +57,17 @@ def convert_paths_for_platform(obj, target_separator):
 
 
 def _find_media_references(prompt_obj):
-    """Find media file references in image/video inputs used by worker prompts."""
+    """Find media file references in image/video/audio inputs used by worker prompts."""
     media_refs = set()
     for node in prompt_obj.values():
         if not isinstance(node, dict):
             continue
         inputs = node.get("inputs", {})
-        for key in ("image", "video"):
+        for key in ("image", "video", "audio"):
             value = inputs.get(key)
             if isinstance(value, str):
                 cleaned = re.sub(r"\s*\[\w+\]$", "", value).strip().replace("\\", "/")
-                if IMAGE_OR_VIDEO_RE.search(cleaned):
+                if MEDIA_FILE_RE.search(cleaned):
                     media_refs.add(cleaned)
     return sorted(media_refs)
 

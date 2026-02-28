@@ -99,10 +99,15 @@ class ConvertPathsForPlatformTests(unittest.TestCase):
         self.assertNotIn("/", result["ckpt_name"])
 
     def test_relative_media_paths_always_stay_forward_slash(self):
-        """Relative image/video paths (Comfy annotated style) must not be backslash-ified."""
+        """Relative image/video/audio paths (Comfy annotated style) must not be backslash-ified."""
         obj = {"image": "subfolder/my_photo.png"}
         result = ms.convert_paths_for_platform(obj, "\\")
         self.assertEqual(result["image"], "subfolder/my_photo.png")
+
+    def test_relative_audio_paths_stay_forward_slash(self):
+        obj = {"audio": "subfolder/my_track.wav"}
+        result = ms.convert_paths_for_platform(obj, "\\")
+        self.assertEqual(result["audio"], "subfolder/my_track.wav")
 
     def test_annotated_relative_media_path_stays_forward_slash(self):
         obj = {"image": "input/frame.jpg [abc123]"}
@@ -169,6 +174,11 @@ class FindMediaReferencesTests(unittest.TestCase):
         refs = ms._find_media_references(prompt)
         self.assertIn("clip.mp4", refs)
 
+    def test_finds_audio_input(self):
+        prompt = {"1": {"class_type": "LoadAudio", "inputs": {"audio": "track.wav"}}}
+        refs = ms._find_media_references(prompt)
+        self.assertIn("track.wav", refs)
+
     def test_strips_annotation_suffix(self):
         prompt = {"1": {"class_type": "LoadImage", "inputs": {"image": "photo.jpg [abc123]"}}}
         refs = ms._find_media_references(prompt)
@@ -219,10 +229,12 @@ class FindMediaReferencesTests(unittest.TestCase):
         prompt = {
             "1": {"class_type": "LoadImage", "inputs": {"image": "frame.png"}},
             "2": {"class_type": "LoadVideo", "inputs": {"video": "clip.mp4"}},
+            "3": {"class_type": "LoadAudio", "inputs": {"audio": "track.wav"}},
         }
         refs = ms._find_media_references(prompt)
         self.assertIn("frame.png", refs)
         self.assertIn("clip.mp4", refs)
+        self.assertIn("track.wav", refs)
 
 
 if __name__ == "__main__":
