@@ -466,9 +466,13 @@ def crop_reference_latents(cond_dict, region, init_size, canvas_size, tile_size,
     x1_px, y1_px, x2_px, y2_px = region
 
     new_latents = []
-    for t in latents:  # (B,C,H_lat_in,W_lat_in)
+    for t in latents:  # (B,C,H_lat_in,W_lat_in) or (B,C,1,H_lat_in,W_lat_in)
+        has_5d = False
+        if t.ndim == 5:
+            has_5d = True
+            t = t.squeeze(2)
         if t.ndim != 4:
-            raise ValueError(f"expected BCHW, got {t.shape}")
+            raise ValueError(f"expected BCHW or BC1HW, got {t.shape}")
 
         # 1. Resize to canvas resolution in latent units only if needed
         if t.shape[-2:] != (H_can_lat, W_can_lat):
@@ -491,6 +495,8 @@ def crop_reference_latents(cond_dict, region, init_size, canvas_size, tile_size,
                                 mode="bilinear",
                                 align_corners=False)
 
+        if has_5d:
+            cropped = cropped.unsqueeze(2)
         new_latents.append(cropped)
 
     cond_dict["reference_latents"] = new_latents

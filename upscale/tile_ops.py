@@ -1,10 +1,12 @@
 import math, torch
+from contextlib import nullcontext
 from PIL import Image, ImageFilter, ImageDraw
 from typing import List, Tuple
 import comfy.samplers, comfy.model_management
 from ..utils.logging import debug_log, log
 from ..utils.image import tensor_to_pil, pil_to_tensor
 from ..utils.usdu_utils import crop_cond, get_crop_region, expand_crop
+from ..utils.crop_model_patch import crop_model_cond
 from .conditioning import clone_conditioning
 
 
@@ -37,8 +39,8 @@ class TileOpsMixin:
         Mirrors ComfyUI_UltimateSDUpscale processing:
         - Build a mask with a white rectangle at the tile rect
         - Compute crop_region via get_crop_region(mask, padding)
-        - If force_uniform_tiles: shrink/expand to target size of
-          round_to_multiple(tile + padding) for each dimension
+        - If force_uniform_tiles: expand by crop/aspect ratio, then resize to
+          fixed processing size of round_to_multiple(tile + padding)
         - Else: target is ceil(crop_size/8)*8 per dimension
         - Extract the crop and resize to target tile_size
         Returns the resized tensor and crop origin/size for blending.
@@ -51,11 +53,23 @@ class TileOpsMixin:
         draw.rectangle([x, y, x + tile_width, y + tile_height], fill=255)
         x1, y1, x2, y2 = get_crop_region(mask, padding)
 
-        # Determine target tile size (processing size)
+        # Determine crop + processing size
         if force_uniform_tiles:
-            target_w = self.round_to_multiple(tile_width + padding, 8)
-            target_h = self.round_to_multiple(tile_height + padding, 8)
-            (x1, y1, x2, y2), (target_w, target_h) = expand_crop((x1, y1, x2, y2), w, h, target_w, target_h)
+            process_w = self.round_to_multiple(tile_width + padding, 8)
+            process_h = self.round_to_multiple(tile_height + padding, 8)
+            crop_w = x2 - x1
+            crop_h = y2 - y1
+            crop_ratio = crop_w / crop_h if crop_h != 0 else 1.0
+            process_ratio = process_w / process_h if process_h != 0 else 1.0
+            if crop_ratio > process_ratio:
+                target_w = crop_w
+                target_h = round(crop_w / process_ratio) if process_ratio != 0 else crop_h
+            else:
+                target_w = round(crop_h * process_ratio)
+                target_h = crop_h
+            (x1, y1, x2, y2), _ = expand_crop((x1, y1, x2, y2), w, h, target_w, target_h)
+            target_w = process_w
+            target_h = process_h
         else:
             crop_w = x2 - x1
             crop_h = y2 - y1
@@ -96,11 +110,23 @@ class TileOpsMixin:
         draw.rectangle([x, y, x + tile_width, y + tile_height], fill=255)
         x1, y1, x2, y2 = get_crop_region(mask, padding)
 
-        # Determine target processing size
+        # Determine crop + processing size
         if force_uniform_tiles:
-            target_w = self.round_to_multiple(tile_width + padding, 8)
-            target_h = self.round_to_multiple(tile_height + padding, 8)
-            (x1, y1, x2, y2), (target_w, target_h) = expand_crop((x1, y1, x2, y2), w, h, target_w, target_h)
+            process_w = self.round_to_multiple(tile_width + padding, 8)
+            process_h = self.round_to_multiple(tile_height + padding, 8)
+            crop_w = x2 - x1
+            crop_h = y2 - y1
+            crop_ratio = crop_w / crop_h if crop_h != 0 else 1.0
+            process_ratio = process_w / process_h if process_h != 0 else 1.0
+            if crop_ratio > process_ratio:
+                target_w = crop_w
+                target_h = round(crop_w / process_ratio) if process_ratio != 0 else crop_h
+            else:
+                target_w = round(crop_h * process_ratio)
+                target_h = crop_h
+            (x1, y1, x2, y2), _ = expand_crop((x1, y1, x2, y2), w, h, target_w, target_h)
+            target_w = process_w
+            target_h = process_h
         else:
             crop_w = x2 - x1
             crop_h = y2 - y1
@@ -185,9 +211,22 @@ class TileOpsMixin:
         # Encode to latent (always non-tiled, matching original node)
         latent = VAEEncode().encode(vae, clean_tensor)[0]
         
-        # Sample
-        samples = common_ksampler(model, seed, steps, cfg, sampler_name, scheduler, 
-                                positive_cropped, negative_cropped, latent, denoise=denoise)[0]
+        # Sample with model patch cropping parity (ControlNet patch hints)
+        if region is not None and image_size is not None:
+            model_ctx = crop_model_cond(
+                model,
+                region,
+                image_size,
+                image_size,
+                (clean_tensor.shape[2], clean_tensor.shape[1]),
+            )
+        else:
+            model_ctx = nullcontext(model)
+        with model_ctx as model_for_sampling:
+            samples = common_ksampler(
+                model_for_sampling, seed, steps, cfg, sampler_name, scheduler,
+                positive_cropped, negative_cropped, latent, denoise=denoise
+            )[0]
         
         # Decode back to image
         if tiled_decode and tiled_vae_available:
@@ -235,8 +274,11 @@ class TileOpsMixin:
 
         # Encode -> Sample -> Decode
         latent = VAEEncode().encode(vae, clean)[0]
-        samples = common_ksampler(model, seed, steps, cfg, sampler_name, scheduler,
-                                  positive_cropped, negative_cropped, latent, denoise=denoise)[0]
+        with crop_model_cond(model, region, image_size, image_size, tile_size) as model_for_sampling:
+            samples = common_ksampler(
+                model_for_sampling, seed, steps, cfg, sampler_name, scheduler,
+                positive_cropped, negative_cropped, latent, denoise=denoise
+            )[0]
         if tiled_decode and tiled_vae_available:
             image = VAEDecodeTiled().decode(vae, samples, tile_size=512)[0]
         else:
@@ -385,8 +427,8 @@ class TileOpsMixin:
             upscaled_image[batch_idx:batch_idx+1], x, y, tile_width, tile_height, padding, force_uniform_tiles
         )
         
-        # Process tile through SD with unique seed
-        image_seed = seed + batch_idx * 1000
+        # Process tile through SD with the exact seed (USDU parity)
+        image_seed = seed
         processed_tile = self.process_tile(tile_tensor, model, positive_sliced, negative_sliced, vae,
                                          image_seed, steps, cfg, sampler_name,
                                          scheduler, denoise, tiled_decode, batch_idx=batch_idx,

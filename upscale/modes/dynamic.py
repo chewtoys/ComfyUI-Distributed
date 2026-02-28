@@ -74,14 +74,17 @@ class DynamicModeMixin:
                 # Process locally
                 single_tensor = upscaled_image[image_idx:image_idx+1]
                 local_image = result_images[image_idx]
-                image_seed = seed + image_idx * 1000
+                image_seed = seed
                 
                 # Pre-slice conditioning once per image (not per tile)
                 positive_sliced, negative_sliced = self._slice_conditioning(positive, negative, image_idx)
                 
                 for tile_idx, pos in enumerate(all_tiles):
+                    source_tensor = pil_to_tensor(local_image)
+                    if single_tensor.is_cuda:
+                        source_tensor = source_tensor.cuda()
                     local_image = self._process_and_blend_tile(
-                        tile_idx, pos, single_tensor, local_image,
+                        tile_idx, pos, source_tensor, local_image,
                         model, positive_sliced, negative_sliced, vae, image_seed, steps, cfg,
                         sampler_name, scheduler, denoise, tile_width, tile_height,
                         padding, mask_blur, width, height, force_uniform_tiles,
@@ -256,14 +259,17 @@ class DynamicModeMixin:
             local_image = tensor_to_pil(single_tensor, 0).copy()
 
             # Process all tiles for this image
-            image_seed = seed + image_idx * 1000
+            image_seed = seed
 
             # Pre-slice conditioning once per image (not per tile)
             positive_sliced, negative_sliced = self._slice_conditioning(positive, negative, image_idx)
 
             for tile_idx, pos in enumerate(all_tiles):
+                source_tensor = pil_to_tensor(local_image)
+                if single_tensor.is_cuda:
+                    source_tensor = source_tensor.cuda()
                 local_image = self._process_and_blend_tile(
-                    tile_idx, pos, single_tensor, local_image,
+                    tile_idx, pos, source_tensor, local_image,
                     model, positive_sliced, negative_sliced, vae, image_seed, steps, cfg,
                     sampler_name, scheduler, denoise, tile_width, tile_height,
                     padding, mask_blur, width, height, force_uniform_tiles,

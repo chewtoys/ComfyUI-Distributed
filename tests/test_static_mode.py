@@ -176,6 +176,13 @@ class _FakeStaticWorker(static_mode.StaticModeMixin):
         processed_batch = torch.zeros((batch_size, 2, 2, 3), dtype=torch.float32)
         return processed_batch, 0, 0, 2, 2
 
+    def create_tile_mask(self, *_args, **_kwargs):
+        from PIL import Image
+        return Image.new("L", (4, 4), 255)
+
+    def blend_tile(self, base_image, *_args, **_kwargs):
+        return base_image
+
 
 def _call_worker_static(fake_worker):
     image = torch.zeros((1, 4, 4, 3), dtype=torch.float32)

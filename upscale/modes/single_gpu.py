@@ -38,9 +38,14 @@ class SingleGpuModeMixin:
 
         # Process tiles batched across images
         for tile_idx, (tx, ty) in enumerate(all_tiles):
+            # Progressive state parity: extract each tile from the current updated image batch.
+            source_batch = torch.cat([pil_to_tensor(img) for img in result_images], dim=0)
+            if upscaled_image.is_cuda:
+                source_batch = source_batch.cuda()
+
             # Extract batched tile
             tile_batch, x1, y1, ew, eh = self.extract_batch_tile_with_padding(
-                upscaled_image, tx, ty, tile_width, tile_height, padding, force_uniform_tiles
+                source_batch, tx, ty, tile_width, tile_height, padding, force_uniform_tiles
             )
 
             # Process batch

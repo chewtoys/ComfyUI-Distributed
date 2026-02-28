@@ -148,8 +148,11 @@ class StaticModeMixin:
         height,
     ):
         """Process one tile_id across the batch and blend into result_images."""
+        source_batch = torch.cat([pil_to_tensor(img) for img in result_images], dim=0)
+        if upscaled_image.is_cuda:
+            source_batch = source_batch.cuda()
         processed_batch, x1, y1, ew, eh = self._extract_and_process_tile(
-            upscaled_image,
+            source_batch,
             tile_id,
             all_tiles,
             tile_width,
@@ -203,7 +206,13 @@ class StaticModeMixin:
         total_tiles = batch_size * num_tiles_per_image
         
         processed_tiles = []
-        sliced_conditioning_cache = {}
+        working_images = []
+        for b in range(batch_size):
+            image_pil = tensor_to_pil(upscaled_image[b:b+1], 0)
+            working_images.append(image_pil.copy())
+        tile_masks = []
+        for tx, ty in all_tiles:
+            tile_masks.append(self.create_tile_mask(width, height, tx, ty, tile_width, tile_height, mask_blur))
         
         # Dynamic queue mode (static processing): process batched-per-tile
         log(f"USDU Dist Worker[{worker_id[:8]}]: Canvas {width}x{height} | Tile {tile_width}x{tile_height} | Tiles/image {num_tiles_per_image} | Batch {batch_size}")
@@ -230,8 +239,11 @@ class StaticModeMixin:
             debug_log(f"Worker[{worker_id[:8]}] - Assigned tile_id {tile_idx}")
             processed_count += batch_size
             tile_id = tile_idx
+            source_batch = torch.cat([pil_to_tensor(img) for img in working_images], dim=0)
+            if upscaled_image.is_cuda:
+                source_batch = source_batch.cuda()
             processed_batch, x1, y1, ew, eh = self._extract_and_process_tile(
-                upscaled_image,
+                source_batch,
                 tile_id,
                 all_tiles,
                 tile_width,
@@ -254,6 +266,18 @@ class StaticModeMixin:
             )
             # Queue results
             for b in range(batch_size):
+                tile_pil = tensor_to_pil(processed_batch, b)
+                if tile_pil.size != (ew, eh):
+                    tile_pil = tile_pil.resize((ew, eh), Image.LANCZOS)
+                working_images[b] = self.blend_tile(
+                    working_images[b],
+                    tile_pil,
+                    x1,
+                    y1,
+                    (ew, eh),
+                    tile_masks[tile_id],
+                    padding,
+                )
                 processed_tiles.append({
                     'tile': processed_batch[b:b+1],
                     'tile_idx': tile_id,
@@ -360,7 +384,6 @@ class StaticModeMixin:
             image_pil = tensor_to_pil(upscaled_image[b:b+1], 0)
             result_images.append(image_pil.copy())
         
-        sliced_conditioning_cache = {}
         # Initialize queue: pending queue holds tile ids (batched per tile)
         log("USDU Dist: Using tile queue distribution")
         run_async_in_server_loop(
@@ -495,8 +518,14 @@ class StaticModeMixin:
                 timeout=5.0
             )
         
-        # Blend worker tiles synchronously
-        for global_idx, tile_data in collected_tasks.items():
+        # Blend worker tiles synchronously in deterministic tile order.
+        def _sort_key(item):
+            global_idx, tile_data = item
+            batch_idx = tile_data.get('batch_idx', global_idx // num_tiles_per_image)
+            tile_idx = tile_data.get('tile_idx', global_idx % num_tiles_per_image)
+            return (tile_idx, batch_idx, global_idx)
+
+        for global_idx, tile_data in sorted(collected_tasks.items(), key=_sort_key):
             # Skip tiles that don't have tensor data (already processed)
             if 'tensor' not in tile_data and 'image' not in tile_data:
                 continue
