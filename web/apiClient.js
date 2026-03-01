@@ -178,11 +178,32 @@ export function createApiClient(baseUrl) {
                     return { ok: false, status: response.status, queueRemaining: null };
                 }
 
-                const data = await response.json().catch(() => ({}));
+                let data;
+                try {
+                    data = await response.json();
+                } catch {
+                    return { ok: false, status: response.status, queueRemaining: null };
+                }
+
+                if (!data || typeof data !== "object" || Array.isArray(data)) {
+                    return { ok: false, status: response.status, queueRemaining: null };
+                }
+
+                const execInfo = data.exec_info;
+                if (!execInfo || typeof execInfo !== "object" || Array.isArray(execInfo)) {
+                    return { ok: false, status: response.status, queueRemaining: null };
+                }
+
+                const rawQueueRemaining = execInfo.queue_remaining;
+                const queueRemaining = Number(rawQueueRemaining);
+                if (!Number.isFinite(queueRemaining)) {
+                    return { ok: false, status: response.status, queueRemaining: null };
+                }
+
                 return {
                     ok: true,
                     status: response.status,
-                    queueRemaining: data.exec_info?.queue_remaining || 0,
+                    queueRemaining: Math.max(0, queueRemaining),
                 };
             } finally {
                 clearTimeout(timeoutId);
