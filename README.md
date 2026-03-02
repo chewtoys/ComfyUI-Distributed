@@ -34,16 +34,6 @@
 
 ---
 
-## Current Architecture
-
-- Workflow-level load balancing is controlled by **Distributed Collector** via the `load_balance` toggle.
-- There is **no Distributed Queue node** anymore.
-- With `load_balance=true`, orchestration selects one least-busy execution participant:
-  - If master participation is enabled, master is included as a candidate.
-  - If master is in orchestrator-only mode, only workers are considered.
-
----
-
 ## Worker Types
 
 <img width="200" align="right" alt="ComfyUI_temp_khvcc_00034_@0 25x" src="https://github.com/user-attachments/assets/651e4912-7c23-4e32-bd88-250f5175e129" />
@@ -246,6 +236,7 @@ If my custom nodes have added value to your workflow, consider fueling future de
 Your support helps keep this project thriving.
 
 Buy me a coffee at: https://buymeacoffee.com/robertvoy
+
 
 
 
