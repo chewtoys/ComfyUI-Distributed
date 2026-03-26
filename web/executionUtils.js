@@ -4,7 +4,7 @@ import { TIMEOUTS, NODE_CLASSES, generateUUID } from './constants.js';
 import { checkAllWorkerStatuses, getWorkerUrl } from './workerLifecycle.js';
 
 export function setupInterceptor(extension) {
-    api.queuePrompt = async (number, prompt) => {
+    api.queuePrompt = async (number, prompt, ...rest) => {
         if (extension.isEnabled) {
             const hasCollector = findNodesByClass(prompt.output, NODE_CLASSES.DISTRIBUTED_COLLECTOR).length > 0;
             const hasDistUpscale = findNodesByClass(prompt.output, NODE_CLASSES.UPSCALE_DISTRIBUTED).length > 0;
@@ -18,7 +18,7 @@ export function setupInterceptor(extension) {
                 return result;
             }
         }
-        return extension.originalQueuePrompt(number, prompt);
+        return extension.originalQueuePrompt(number, prompt, ...rest);
     };
 }
 
