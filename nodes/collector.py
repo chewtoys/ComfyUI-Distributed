@@ -22,6 +22,7 @@ prompt_server = _server.PromptServer.instance
 
 
 class DistributedCollectorNode:
+    INPUT_IS_LIST = True
     EMPTY_AUDIO = {"waveform": torch.zeros(1, 2, 1), "sample_rate": 44100}
 
     @classmethod
@@ -55,7 +56,65 @@ class DistributedCollectorNode:
     FUNCTION = "run"
     CATEGORY = "image"
     
+    @staticmethod
+    def _unwrap_list_input(value):
+        """Unwrap scalar inputs when ComfyUI passes them via INPUT_IS_LIST."""
+        if isinstance(value, (list, tuple)) and len(value) == 1:
+            return value[0]
+        return value
+
+    def _normalize_images_input(self, images):
+        """Collapse ComfyUI list IMAGE inputs into a normal batched IMAGE tensor."""
+        if isinstance(images, (list, tuple)):
+            if not images:
+                raise ValueError("Collector received an empty image list")
+            if not all(isinstance(image, torch.Tensor) for image in images):
+                raise TypeError("Collector expected IMAGE list items to be torch.Tensor instances")
+            if len(images) == 1:
+                return ensure_contiguous(images[0])
+            return ensure_contiguous(torch.cat([ensure_contiguous(image) for image in images], dim=0))
+        return ensure_contiguous(images)
+
+    def _normalize_audio_input(self, audio):
+        """Collapse ComfyUI list AUDIO inputs into a single AUDIO payload when present."""
+        if not isinstance(audio, (list, tuple)):
+            return audio
+
+        audio_items = [item for item in audio if item is not None]
+        if not audio_items:
+            return None
+        if len(audio_items) == 1:
+            return audio_items[0]
+
+        waveforms = []
+        sample_rate = 44100
+        for item in audio_items:
+            if not isinstance(item, dict):
+                raise TypeError("Collector expected AUDIO list items to be dictionaries")
+            waveform = item.get("waveform")
+            if waveform is None or waveform.numel() == 0:
+                continue
+            waveforms.append(waveform)
+            if sample_rate == 44100:
+                sample_rate = item.get("sample_rate", 44100)
+
+        if not waveforms:
+            return None
+        return {"waveform": torch.cat(waveforms, dim=-1), "sample_rate": sample_rate}
+
     def run(self, images, load_balance=False, audio=None, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", pass_through=False, delegate_only=False):
+        images = self._normalize_images_input(images)
+        audio = self._normalize_audio_input(audio)
+        load_balance = self._unwrap_list_input(load_balance)
+        multi_job_id = self._unwrap_list_input(multi_job_id)
+        is_worker = self._unwrap_list_input(is_worker)
+        master_url = self._unwrap_list_input(master_url)
+        enabled_worker_ids = self._unwrap_list_input(enabled_worker_ids)
+        worker_batch_size = self._unwrap_list_input(worker_batch_size)
+        worker_id = self._unwrap_list_input(worker_id)
+        pass_through = self._unwrap_list_input(pass_through)
+        delegate_only = self._unwrap_list_input(delegate_only)
+
         # Create empty audio if not provided
         empty_audio = {"waveform": torch.zeros(1, 2, 1), "sample_rate": 44100}
 
